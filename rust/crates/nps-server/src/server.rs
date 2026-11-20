@@ -61,6 +61,10 @@ struct ServerInner {
     acme: Option<Arc<crate::acme::AcmeService>>,
     /// 健康检查任务的取消信号（所有检查器共用一个）
     health_cancel: Option<tokio::sync::watch::Sender<bool>>,
+    /// 流量落盘的取消信号
+    flow_cancel: Option<tokio::sync::watch::Sender<bool>>,
+    /// 流量落盘任务句柄（关闭时等待它写完）
+    flow_task: Mutex<Option<JoinHandle<()>>>,
     /// SOCKS5 监听（配置里的 `socks5_listeners`）
     socks5: Vec<Arc<crate::socks5::Socks5Server>>,
     bridge_task: Mutex<Option<JoinHandle<()>>>,
@@ -109,6 +113,14 @@ impl Server {
             crate::limit::IpAllowList::new(&config.ip_limit)
                 .context("ip_limit 配置非法")?,
         );
+        let mut client_wraps: HashMap<i32, crate::crypt::StreamWrap> = HashMap::new();
+        for c in &config.clients {
+            let wrap = crate::crypt::StreamWrap::from_flags(c.crypt, c.compress);
+            if !wrap.is_plain() {
+                info!("客户端 {} 子流包装: {:?}", c.id, wrap);
+            }
+            client_wraps.insert(c.id, wrap);
+        }
         let mut client_rates: HashMap<i32, Arc<crate::limit::TokenBucket>> = HashMap::new();
         let mut client_flows: HashMap<i32, Arc<crate::limit::FlowCounter>> = HashMap::new();
         for c in &config.clients {
@@ -182,12 +194,17 @@ impl Server {
                     .get(&cfg.id)
                     .cloned()
                     .unwrap_or_else(|| Arc::new(crate::target::TargetPool::single(&cfg.target_addr)));
+                let wrap = client_wraps
+                    .get(&cfg.client_id)
+                    .copied()
+                    .unwrap_or(crate::crypt::StreamWrap::Plain);
                 Arc::new(Tunnel::with_controls(
                     cfg.clone(),
                     pool,
                     client_rates.get(&cfg.client_id).cloned(),
                     client_flows.get(&cfg.client_id).cloned(),
                     ip_allow.clone(),
+                    wrap,
                 ))
             })
             .collect();
@@ -366,6 +383,7 @@ impl Server {
                 tunnels.clone(),
                 udp_tunnels_shared.clone(),
                 http.clone(),
+                Arc::new(client_wraps.clone()),
                 verify,
                 listen_host,
                 config.conf_max_tunnels,
@@ -463,8 +481,63 @@ impl Server {
             .iter()
             .map(|c| (c.id, c.name.clone()))
             .collect();
+        // 在 drop(config) 之前取出流量持久化需要的两个值
+        let config_data_dir = config
+            .data_dir
+            .clone()
+            .unwrap_or_else(|| ".".to_owned());
+        let flow_store_interval = config.flow_store_interval;
         // config 在此释放：明文 vkey 不进入任何长期存活的服务器状态
         drop(config);
+
+        // ---- 流量持久化：读回旧值 + 启动定时落盘 ----
+        let data_dir = config_data_dir.clone();
+        let flow_store = crate::flow_store::FlowStore::new(
+            std::path::Path::new(&data_dir).join("flow.json"),
+        );
+        let restored = flow_store.load();
+        let mut restored_count = 0usize;
+        for t in &static_tunnels {
+            if let Some(rec) = restored.tunnels.get(&t.id()) {
+                t.restore_bytes(rec.bytes_to_client, rec.bytes_from_client);
+                restored_count += 1;
+            }
+        }
+        if restored_count > 0 {
+            info!(
+                "已从 {} 恢复 {} 条隧道的累计流量",
+                flow_store.path().display(),
+                restored_count
+            );
+        }
+
+        let (flow_cancel, flow_rx) = tokio::sync::watch::channel(false);
+        let flow_cancel = Some(flow_cancel);
+        let tunnels_for_flow = tunnels.clone();
+        let flow_task = {
+            let store = flow_store.clone();
+            tokio::spawn(crate::flow_store::run_flow_store_loop(
+                store,
+                flow_store_interval,
+                flow_rx,
+                move || {
+                    let mut snap = crate::flow_store::FlowSnapshot::default();
+                    if let Ok(list) = tunnels_for_flow.try_lock() {
+                        for t in list.iter() {
+                            let (to_c, from_c) = t.bytes();
+                            snap.tunnels.insert(
+                                t.id(),
+                                crate::flow_store::FlowRecord {
+                                    bytes_to_client: to_c,
+                                    bytes_from_client: from_c,
+                                },
+                            );
+                        }
+                    }
+                    snap
+                },
+            ))
+        };
 
         info!("Rust-nps 服务端启动完成，桥监听 {}", bridge_addr);
 
@@ -483,6 +556,8 @@ impl Server {
                 https_cancel,
                 acme,
                 health_cancel,
+                flow_cancel,
+                flow_task: Mutex::new(Some(flow_task)),
                 socks5: socks5_servers,
                 bridge_task: Mutex::new(Some(bridge_task)),
                 shutdown,
@@ -639,6 +714,19 @@ impl Server {
         // 停健康检查
         if let Some(cancel) = &self.inner.health_cancel {
             let _ = cancel.send(true);
+        }
+
+        // 停流量落盘（它会在退出前再写一次）
+        if let Some(cancel) = &self.inner.flow_cancel {
+            let _ = cancel.send(true);
+        }
+        let flow_task = self.inner.flow_task.lock().await.take();
+        if let Some(task) = flow_task {
+            match tokio::time::timeout(Duration::from_secs(5), task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("流量落盘任务 join 失败: {e}"),
+                Err(_) => warn!("流量落盘任务退出超时"),
+            }
         }
 
         // 停 SOCKS5 监听

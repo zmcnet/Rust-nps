@@ -24,6 +24,9 @@
 
 pub mod acme;
 mod conf;
+pub mod crypt;
+pub mod file_service;
+pub mod flow_store;
 pub mod config;
 mod http_site;
 mod limit;
@@ -64,3 +67,6 @@ pub use target::{
     DEFAULT_HEALTH_INTERVAL, DEFAULT_HEALTH_MAX_FAILED, DEFAULT_HEALTH_TIMEOUT,
 };
 pub use limit::{FlowCounter, IpAllowList, TokenBucket, BYTES_PER_KB};
+pub use file_service::{
+    target_health_details, FileChannelRegistry, FileTunnel, FileTunnelConfig, TargetHealthDetail,
+};

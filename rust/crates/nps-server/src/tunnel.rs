@@ -21,6 +21,7 @@
 //!   看到"已启用但无监听器"或反之的中间态。
 //! - 转发泵放在 [`Pump`] 里，父任务被 abort 时一并 abort，不留孤儿任务。
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,6 +96,144 @@ impl Drop for Pump {
     }
 }
 
+/// 把 mux 子流的两个半边合成一个 `AsyncRead + AsyncWrite`，
+/// 供 crypt/compress 包装层使用。
+///
+/// # 为什么不用「每次 poll 新建 future」
+///
+/// `recv_data` / `send_data` 是 async fn。如果每次 `poll_read` 都新建一个
+/// future 再 poll，waker 会注册在**临时** future 上；下次 poll 时旧 future
+/// 已被丢弃，注册的唤醒丢失 → 永久挂起（实测表现为传输超时）。
+///
+/// 这里的做法：把 in-flight future **存起来**，poll 时复用同一个；
+/// future 完成后再把 `send`/`recv` 取回。为避免借用冲突，用 `Option::take`。
+struct MuxDuplex {
+    send: Option<nps_legacy::mux::MuxSendHalf>,
+    recv: Option<nps_legacy::mux::MuxRecvHalf>,
+    /// 已从子流取出、尚未交给调用方的数据
+    pending: Vec<u8>,
+    pending_pos: usize,
+    read_fut: Option<std::pin::Pin<Box<dyn Future<Output = (nps_legacy::mux::MuxRecvHalf, Option<Vec<u8>>)> + Send>>>,
+    write_fut: Option<std::pin::Pin<Box<dyn Future<Output = (nps_legacy::mux::MuxSendHalf, std::io::Result<()>)> + Send>>>,
+}
+
+impl MuxDuplex {
+    fn new(send: nps_legacy::mux::MuxSendHalf, recv: nps_legacy::mux::MuxRecvHalf) -> Self {
+        Self {
+            send: Some(send),
+            recv: Some(recv),
+            pending: Vec::new(),
+            pending_pos: 0,
+            read_fut: None,
+            write_fut: None,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for MuxDuplex {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.pending_pos < self.pending.len() {
+            let n = (self.pending.len() - self.pending_pos).min(buf.remaining());
+            let start = self.pending_pos;
+            let end = start + n;
+            buf.put_slice(&self.pending[start..end]);
+            self.pending_pos = end;
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        if self.read_fut.is_none() {
+            let Some(mut recv) = self.recv.take() else {
+                // recv 已被永久取走（EOF 之后），视为流结束
+                return std::task::Poll::Ready(Ok(()));
+            };
+            self.read_fut = Some(Box::pin(async move {
+                let data = recv.recv_data().await;
+                (recv, data)
+            }));
+        }
+
+        let fut = self.read_fut.as_mut().expect("刚刚设置");
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready((recv, data)) => {
+                self.read_fut = None;
+                match data {
+                    None => {
+                        // EOF：不再放回 recv
+                        std::task::Poll::Ready(Ok(()))
+                    }
+                    Some(data) => {
+                        self.recv = Some(recv);
+                        let n = data.len().min(buf.remaining());
+                        buf.put_slice(&data[..n]);
+                        if n < data.len() {
+                            self.pending = data;
+                            self.pending_pos = n;
+                        }
+                        std::task::Poll::Ready(Ok(()))
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for MuxDuplex {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.write_fut.is_none() {
+            let Some(mut send) = self.send.take() else {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "mux send half closed",
+                )));
+            };
+            let owned = buf.to_vec();
+            self.write_fut = Some(Box::pin(async move {
+                let r = send.send_data(&owned).await;
+                (send, r)
+            }));
+        }
+
+        let fut = self.write_fut.as_mut().expect("刚刚设置");
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready((send, result)) => {
+                self.write_fut = None;
+                self.send = Some(send);
+                match result {
+                    Ok(()) => std::task::Poll::Ready(Ok(buf.len())),
+                    Err(e) => std::task::Poll::Ready(Err(e)),
+                }
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(send) = self.send.as_mut() {
+            send.close();
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 /// 运行中的监听任务
 struct TunnelRun {
     cancel_tx: watch::Sender<bool>,
@@ -121,6 +260,10 @@ pub(crate) struct Tunnel {
     flow: Option<Arc<crate::limit::FlowCounter>>,
     /// 来源 IP 白名单
     ip_allow: Arc<crate::limit::IpAllowList>,
+    /// crypt 用的 TLS 服务端（启用 crypt 时才有）
+    crypt_server: Option<Arc<crate::crypt::CryptServer>>,
+    /// 子流包装方式（从**客户端**配置继承，对应原版 `client.Cnf.Crypt/Compress`）
+    wrap: crate::crypt::StreamWrap,
 }
 
 impl Tunnel {
@@ -142,6 +285,8 @@ impl Tunnel {
             rate: None,
             flow: None,
             ip_allow: Arc::new(crate::limit::IpAllowList::default()),
+            crypt_server: None,
+            wrap: crate::crypt::StreamWrap::Plain,
         }
     }
 
@@ -152,6 +297,7 @@ impl Tunnel {
         rate: Option<Arc<crate::limit::TokenBucket>>,
         flow: Option<Arc<crate::limit::FlowCounter>>,
         ip_allow: Arc<crate::limit::IpAllowList>,
+        wrap: crate::crypt::StreamWrap,
     ) -> Self {
         Self {
             cfg,
@@ -165,6 +311,12 @@ impl Tunnel {
             rate,
             flow,
             ip_allow,
+            crypt_server: if matches!(wrap, crate::crypt::StreamWrap::Crypt) {
+                crate::crypt::CryptServer::new().ok()
+            } else {
+                None
+            },
+            wrap,
         }
     }
 
@@ -179,6 +331,22 @@ impl Tunnel {
 
     async fn clear_error(&self) {
         *self.last_error.lock().await = None;
+    }
+
+    /// 用持久化的累计流量初始化计数器（启动时调用，只应调用一次）。
+    ///
+    /// 计数器后续用 `fetch_add` 累加，恢复初值后新流量会自然叠加。
+    pub fn restore_bytes(&self, to_client: u64, from_client: u64) {
+        self.bytes_to_client.store(to_client, Ordering::Relaxed);
+        self.bytes_from_client.store(from_client, Ordering::Relaxed);
+    }
+
+    /// 当前累计流量 `(to_client, from_client)`，用于持久化。
+    pub fn bytes(&self) -> (u64, u64) {
+        (
+            self.bytes_to_client.load(Ordering::Relaxed),
+            self.bytes_from_client.load(Ordering::Relaxed),
+        )
     }
 
     pub(crate) async fn snapshot(&self) -> TunnelSnapshot {
@@ -417,6 +585,10 @@ impl Tunnel {
         };
         let mut link = nps_proto::Link::tcp(target, peer.to_string());
         link.option.timeout = TARGET_DIAL_TIMEOUT_NS;
+        // crypt 优先于 compress（对齐 Go GetConn 的 if/else if）
+        let wrap = self.wrap;
+        link.crypt = matches!(wrap, crate::crypt::StreamWrap::Crypt);
+        link.compress = matches!(wrap, crate::crypt::StreamWrap::Compress);
         let link_json = match serde_json::to_vec(&link) {
             Ok(v) => v,
             Err(e) => {
@@ -437,9 +609,43 @@ impl Tunnel {
 
         self.clear_error().await;
         debug!(
-            "隧道 {}: {} -> {} 已建立",
-            self.cfg.id, peer, self.cfg.target_addr
+            "隧道 {}: {} -> {} 已建立（wrap={:?}）",
+            self.cfg.id, peer, self.cfg.target_addr, wrap
         );
+
+        // ---- 子流包装 ----
+        //
+        // 顺序很重要：Link 首帧必须**以明文**发出（npc 先读 Link 再决定
+        // 是否建包装层），包装只作用于其后的业务数据。
+        match wrap {
+            crate::crypt::StreamWrap::Crypt => {
+                let Some(server) = &self.crypt_server else {
+                    self.set_error("crypt 已启用但 TLS 服务端不可用").await;
+                    warn!("隧道 {}: crypt 已启用但 TLS 服务端未初始化", self.cfg.id);
+                    send.close();
+                    return;
+                };
+                // 服务端是 TLS server，npc 是 TLS client
+                debug!("隧道 {}: 开始 crypt TLS 握手", self.cfg.id);
+                let tls = match server.accept(MuxDuplex::new(send, recv)).await {
+                    Ok(tls) => tls,
+                    Err(e) => {
+                        self.set_error(format!("crypt 握手失败: {e:#}")).await;
+                        warn!("隧道 {}: crypt 握手失败: {e:#}", self.cfg.id);
+                        return;
+                    }
+                };
+                debug!("隧道 {}: crypt 握手完成，开始转发", self.cfg.id);
+                self.run_wrapped(stream, tls, cancel).await;
+                return;
+            }
+            crate::crypt::StreamWrap::Compress => {
+                let io = crate::crypt::SnappyStream::new(MuxDuplex::new(send, recv));
+                self.run_wrapped(stream, io, cancel).await;
+                return;
+            }
+            crate::crypt::StreamWrap::Plain => {}
+        }
 
         let (ext_r, ext_w) = stream.into_split();
         // 两个方向各自独立任务推进，避免全双工会死锁。
@@ -483,6 +689,99 @@ impl Tunnel {
             let _ = (&mut up.task).await;
         }
         debug!("隧道 {}: {} 连接结束", self.cfg.id, peer);
+    }
+
+    /// 在已包装的子流上跑双向转发。
+    ///
+    /// 与明文路径的区别：明文路径用 `MuxSendHalf`/`MuxRecvHalf` 分别驱动两个泵，
+    /// 这里因为包装层（TLS / snappy）需要一个统一的读写对象，改为：
+    /// - 读方向：外部 -> 包装流（`AsyncWrite`）
+    /// - 写方向：包装流（`AsyncRead`）-> 外部
+    async fn run_wrapped<W>(
+        self: Arc<Self>,
+        stream: TcpStream,
+        wrapped: W,
+        mut cancel: watch::Receiver<bool>,
+    ) where
+        W: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (ext_r, mut ext_w) = stream.into_split();
+        let (wrap_r, wrap_w) = tokio::io::split(wrapped);
+
+        // 上行：外部 -> 包装流
+        let up_tunnel = self.clone();
+        let mut up_cancel = cancel.clone();
+        let mut up_r = ext_r;
+        let mut up_w = wrap_w;
+        let up = tokio::spawn(async move {
+            let mut buf = vec![0u8; COPY_BUF];
+            loop {
+                let n = tokio::select! {
+                    _ = up_cancel.changed() => break,
+                    r = up_r.read(&mut buf) => match r {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    },
+                };
+                if let Some(rate) = &up_tunnel.rate {
+                    tokio::select! {
+                        _ = up_cancel.changed() => break,
+                        _ = rate.acquire(n) => {}
+                    }
+                }
+                if up_w.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+                up_tunnel.bytes_to_client.fetch_add(n as u64, Ordering::Relaxed);
+                if let Some(flow) = &up_tunnel.flow {
+                    flow.add(n as u64, 0);
+                }
+            }
+            let _ = up_w.shutdown().await;
+        });
+
+        // 下行：包装流 -> 外部
+        let down_tunnel = self.clone();
+        let mut down_r = wrap_r;
+        let down = tokio::spawn(async move {
+            let mut buf = vec![0u8; COPY_BUF];
+            loop {
+                let n = tokio::select! {
+                    _ = cancel.changed() => break,
+                    r = down_r.read(&mut buf) => match r {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    },
+                };
+                if let Some(rate) = &down_tunnel.rate {
+                    tokio::select! {
+                        _ = cancel.changed() => break,
+                        _ = rate.acquire(n) => {}
+                    }
+                }
+                if ext_w.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+                down_tunnel.bytes_from_client.fetch_add(n as u64, Ordering::Relaxed);
+                if let Some(flow) = &down_tunnel.flow {
+                    flow.add(0, n as u64);
+                }
+                let _ = ext_w.flush().await;
+            }
+            let _ = ext_w.shutdown().await;
+        });
+
+        let mut up = Pump::new(up);
+        let mut down = Pump::new(down);
+        tokio::select! {
+            _ = &mut up.task => {}
+            _ = &mut down.task => {}
+        }
+        drop(up);
+        drop(down);
+        debug!("隧道 {}: 包装连接结束", self.cfg.id);
     }
 
     /// 外部 -> mux（计入 `bytes_to_client`）

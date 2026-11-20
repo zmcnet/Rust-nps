@@ -46,3 +46,7 @@ Thumbs.db
 
 # 老系统客户端二进制（16MB，作为 GitHub Release 附件分发）
 /tools/interop/legacy/*.exe
+
+# 运行时产物：流量持久化文件
+**/flow.json
+flow.json

@@ -76,6 +76,8 @@ struct Inner {
     udp_tunnels: Arc<Mutex<Vec<Arc<crate::udp::UdpTunnel>>>>,
     /// HTTP 域名代理（conf 的 host 帧 upsert 到这里）；None = 域名代理未启用
     http: Option<Arc<crate::http_site::HttpSiteServer>>,
+    /// 各客户端的子流包装方式（来自 ClientConfig 的 crypt/compress）
+    client_wraps: Arc<std::collections::HashMap<i32, crate::crypt::StreamWrap>>,
     /// md5(vkey) -> client id，仅用于 `stus` 帧校验归属（不写日志、不进快照）
     verify: Arc<std::collections::HashMap<String, i32>>,
     /// 注册隧道的监听 IP（客户端只上报端口）
@@ -97,6 +99,7 @@ impl ConfRegistry {
         tunnels: Arc<Mutex<Vec<Arc<Tunnel>>>>,
         udp_tunnels: Arc<Mutex<Vec<Arc<crate::udp::UdpTunnel>>>>,
         http: Option<Arc<crate::http_site::HttpSiteServer>>,
+        client_wraps: Arc<std::collections::HashMap<i32, crate::crypt::StreamWrap>>,
         verify: Arc<std::collections::HashMap<String, i32>>,
         listen_host: IpAddr,
         max_tunnels: usize,
@@ -108,6 +111,7 @@ impl ConfRegistry {
                 tunnels,
                 udp_tunnels,
                 http,
+                client_wraps,
                 verify,
                 listen_host,
                 max_tunnels,
@@ -573,16 +577,33 @@ impl ConfRegistry {
             .next_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
             .map_err(|_| "隧道 id 已耗尽".to_owned())?;
-        let tunnel = Arc::new(Tunnel::new(TcpTunnelConfig {
-            id,
-            name: name.clone(),
-            client_id,
-            listen_addr: listen.to_string(),
-            target_addr: target.clone(),
-            enabled: true,
-            target_addrs: Vec::new(),
-            health_check: None,
-        }));
+        let wrap = self
+            .inner
+            .client_wraps
+            .get(&client_id)
+            .copied()
+            .unwrap_or(crate::crypt::StreamWrap::Plain);
+        let spec = target.clone();
+        let tunnel = Arc::new(Tunnel::with_controls(
+            TcpTunnelConfig {
+                id,
+                name: name.clone(),
+                client_id,
+                listen_addr: listen.to_string(),
+                target_addr: target.clone(),
+                enabled: true,
+                target_addrs: Vec::new(),
+                health_check: None,
+            },
+            Arc::new(
+                crate::target::TargetPool::parse(&spec)
+                    .unwrap_or_else(|_| crate::target::TargetPool::single(&spec)),
+            ),
+            None,
+            None,
+            Arc::new(crate::limit::IpAllowList::default()),
+            wrap,
+        ));
         {
             let _guard = tunnel.lock_op().await;
             tunnel

@@ -30,6 +30,8 @@ fn config(conf_register: bool, max_tunnels: usize) -> ServerConfig {
             vkey: VKEY.into(),
             rate_limit: 0,
             flow_limit: 0,
+            crypt: false,
+            compress: false,
         }],
         tunnels: Vec::new(),
         conf_register,

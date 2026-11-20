@@ -31,6 +31,8 @@ fn config(listen_addr: &str) -> ServerConfig {
             vkey: VKEY.into(),
             rate_limit: 0,
             flow_limit: 0,
+            crypt: false,
+            compress: false,
         }],
         tunnels: vec![TcpTunnelConfig {
             id: 1,

@@ -35,6 +35,7 @@ x509-parser = "0.18"
 webpki-roots = "1"
 # 证书指纹（SHA-256）。ring 已经是 rustls 的后端，这里只是直接引用它的 digest
 ring = "0.17"
+snap = "1.1.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

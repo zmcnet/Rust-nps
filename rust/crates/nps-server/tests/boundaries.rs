@@ -16,6 +16,8 @@ fn config(enabled: bool) -> ServerConfig {
             vkey: "integration-test-key".into(),
             rate_limit: 0,
             flow_limit: 0,
+            crypt: false,
+            compress: false,
         }],
         tunnels: vec![TcpTunnelConfig {
             id: 1,
@@ -135,6 +137,8 @@ async fn start_rejects_duplicate_client_vkey() {
         vkey: "integration-test-key".into(),
             rate_limit: 0,
             flow_limit: 0,
+            crypt: false,
+            compress: false,
         });
     assert!(Server::start(cfg).await.is_err());
 }

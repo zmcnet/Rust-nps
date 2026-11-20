@@ -108,6 +108,9 @@ pub struct ServerConfig {
     /// 来源 IP 白名单（单 IP 或 CIDR）。空 = 全部允许。对应原版 `ip_limit`。
     #[serde(default)]
     pub ip_limit: Vec<String>,
+    /// 累计流量落盘间隔（分钟）。0 = 不落盘。对应原版 `flow_store_interval`。
+    #[serde(default = "default_flow_store_interval")]
+    pub flow_store_interval: u64,
     /// SOCKS5 代理监听（对应 Go 版 `mode=socks5`）
     #[serde(default)]
     pub socks5_listeners: Vec<Socks5Config>,
@@ -123,6 +126,10 @@ fn default_web_addr() -> String {
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_flow_store_interval() -> u64 {
+    crate::flow_store::DEFAULT_FLOW_STORE_INTERVAL_MIN
 }
 
 fn default_conf_max_tunnels() -> usize {
@@ -151,6 +158,7 @@ impl Default for ServerConfig {
             acme: Default::default(),
             data_dir: None,
             ip_limit: Vec::new(),
+            flow_store_interval: default_flow_store_interval(),
             socks5_listeners: Vec::new(),
         }
     }
@@ -314,6 +322,15 @@ pub struct ClientConfig {
     /// 该客户端的总流量上限（KB）。0 = 不限。对应原版 `flow_limit`。
     #[serde(default)]
     pub flow_limit: u64,
+    /// 是否加密子流（自签 TLS）。对应原版 `client.Cnf.Crypt`。
+    ///
+    /// **crypt 优先于 compress**：两者同时为 true 时只做 crypt（与原版
+    /// `GetConn` 的 `if cpt { } else if snappy { }` 一致）。
+    #[serde(default)]
+    pub crypt: bool,
+    /// 是否压缩子流（snappy framed）。对应原版 `client.Cnf.Compress`。
+    #[serde(default)]
+    pub compress: bool,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -637,6 +654,8 @@ mod tests {
             vkey: vkey.into(),
             rate_limit: 0,
             flow_limit: 0,
+            crypt: false,
+            compress: false,
         }
     }
 
