@@ -751,6 +751,13 @@ async fn http01_end_to_end_with_pebble() {
         .exists());
     assert!(dir.join("data/acme/account.key").exists());
     assert!(dir.join("data/acme/account.json").exists());
+    // 账户必须记录自己属于哪个 CA：切换 provider 时不能拿旧凭据去签新 CA
+    assert_eq!(
+        std::fs::read_to_string(dir.join("data/acme/account.ca"))
+            .expect("account.ca")
+            .trim(),
+        pebble.directory_url()
+    );
     assert!(audit.count() > 0);
     println!("ACME 网络请求数: {}（账户注册 + 订单 + 挑战 + 签发）", audit.count());
 

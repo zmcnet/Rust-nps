@@ -56,6 +56,8 @@ struct ServerInner {
     certs: Option<Arc<crate::tls::CertificateStore>>,
     /// HTTPS accept 循环的取消信号
     https_cancel: Option<tokio::sync::watch::Sender<bool>>,
+    /// ACME 服务。**只构造不申请** —— 申请必须由管理端显式触发。
+    acme: Option<Arc<crate::acme::AcmeService>>,
     /// SOCKS5 监听（配置里的 `socks5_listeners`）
     socks5: Vec<Arc<crate::socks5::Socks5Server>>,
     bridge_task: Mutex<Option<JoinHandle<()>>>,
@@ -173,6 +175,32 @@ impl Server {
                     (Some(server), Some(cancel_tx))
                 }
                 None => (Some(server), None),
+            }
+        };
+
+        // ---- 3.4 ACME 服务：只构造，绝不申请 ----
+        //
+        // 构造只建目录、初始化挑战表，**零网络请求**。
+        // 真正申请必须由管理端调用 ，
+        // 这是「程序绝不擅自申请证书」的落点。
+        let acme = {
+            let data_dir = config
+                .data_dir
+                .clone()
+                .unwrap_or_else(|| ".".to_owned());
+            let acme_cfg = config.acme.to_config(&data_dir);
+            match crate::acme::AcmeService::new(acme_cfg) {
+                Ok(service) => {
+                    info!(
+                        "ACME 服务已初始化（不自动申请；证书目录 {}）",
+                        service.client().certs_dir().display()
+                    );
+                    Some(Arc::new(service))
+                }
+                Err(e) => {
+                    warn!("ACME 服务初始化失败，证书申请功能不可用: {e}");
+                    None
+                }
             }
         };
 
@@ -370,6 +398,7 @@ impl Server {
                 https_tls,
                 certs,
                 https_cancel,
+                acme,
                 socks5: socks5_servers,
                 bridge_task: Mutex::new(Some(bridge_task)),
                 shutdown,
@@ -559,6 +588,14 @@ impl Server {
     /// HTTPS 监听器（用于读取握手统计）。未启用时为 None。
     pub fn https_listener(&self) -> Option<Arc<crate::tls::TlsListener>> {
         self.inner.https_tls.clone()
+    }
+
+    /// ACME 服务（管理端用来触发申请/查询待办）。
+    ///
+    /// **拿到它不会产生任何网络请求**；只有显式调用
+    /// `request_certificate` 才会联系 CA。
+    pub fn acme(&self) -> Option<Arc<crate::acme::AcmeService>> {
+        self.inner.acme.clone()
     }
 
     pub fn is_shutdown(&self) -> bool {

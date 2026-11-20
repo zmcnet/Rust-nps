@@ -39,9 +39,9 @@ pub use config::{
 };
 pub use acme::{
     AcmeClient, AcmeConfig, AcmeError, AcmeErrorKind, AcmeEvent, AcmeEvents, AcmeProvider,
-    AcmeService, AcmeStage, CertificateRequest, ChallengeKind, ChallengeStore, DnsProvider,
-    DnsRecord, Http01Responder, IssuedCertificate, NetworkAudit, RenewalPolicy, RenewalTarget,
-    RequestSource, TlsAlpnResponder, CHALLENGE_PATH_PREFIX,
+    AcmeService, AcmeSettings, AcmeStage, CertificateRequest, ChallengeKind, ChallengeStore,
+    DnsProvider, DnsProviderKind, DnsRecord, Http01Responder, IssuedCertificate, NetworkAudit,
+    RenewalPolicy, RenewalTarget, RequestSource, TlsAlpnResponder, CHALLENGE_PATH_PREFIX,
 };
 pub use http_site::{
     HttpProxyConfig, HttpSite, HttpSiteRouter, HttpSiteServer, ResolvedSite, SiteGuard,

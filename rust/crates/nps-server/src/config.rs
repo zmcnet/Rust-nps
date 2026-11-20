@@ -98,6 +98,13 @@ pub struct ServerConfig {
     /// 证书根目录。默认 `<配置目录>/certs`。
     #[serde(default)]
     pub cert_dir: Option<String>,
+    /// ACME 设置。**存在不代表会自动申请** —— 只有用户在管理端显式
+    /// 点击申请才会联系 CA；`auto_renew=false` 时程序绝不主动连网。
+    #[serde(default)]
+    pub acme: crate::acme::AcmeSettings,
+    /// 数据根目录（ACME 账户密钥、证书落盘位置）。默认当前目录。
+    #[serde(default)]
+    pub data_dir: Option<String>,
     /// SOCKS5 代理监听（对应 Go 版 `mode=socks5`）
     #[serde(default)]
     pub socks5_listeners: Vec<Socks5Config>,
@@ -138,6 +145,8 @@ impl Default for ServerConfig {
             http_listen_addr: None,
             https_listen_addr: None,
             cert_dir: None,
+            acme: Default::default(),
+            data_dir: None,
             socks5_listeners: Vec::new(),
         }
     }

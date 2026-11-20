@@ -105,6 +105,8 @@ pub const ACME_DIR: &str = "acme";
 pub const ACCOUNT_KEY_FILE: &str = "account.key";
 /// 账户凭据文件名（ACME account URL 等）
 pub const ACCOUNT_CREDENTIALS_FILE: &str = "account.json";
+/// 账户所属 CA 的标记文件（切换 provider 时用来判断凭据能否复用）
+pub const ACCOUNT_PROVIDER_FILE: &str = "account.ca";
 /// 证书落盘子目录
 pub const CERTS_DIR: &str = "certs";
 /// 自动续期默认提前量：到期前 30 天
@@ -253,16 +255,19 @@ impl std::error::Error for AcmeError {}
 /// `"letsencrypt"` / `"letsencrypt-staging"` / `"zerossl"` /
 /// `{"custom": "https://ca.example/dir"}`。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum AcmeProvider {
     /// Let's Encrypt 生产环境（默认）
     #[default]
+    #[serde(rename = "letsencrypt")]
     LetsEncrypt,
     /// Let's Encrypt 测试环境（staging，配额宽松）
+    #[serde(rename = "letsencrypt-staging")]
     LetsEncryptStaging,
     /// ZeroSSL
+    #[serde(rename = "zerossl")]
     ZeroSsl,
     /// 自定义 directory URL（如 Pebble：`https://localhost:14000/dir`）
+    #[serde(rename = "custom")]
     Custom(String),
 }
 
@@ -310,14 +315,16 @@ impl fmt::Display for AcmeProvider {
 
 /// 挑战类型
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum ChallengeKind {
     /// HTTP-01：`/.well-known/acme-challenge/<token>`（默认、最通用）
     #[default]
+    #[serde(rename = "http-01")]
     Http01,
     /// TLS-ALPN-01：ALPN `acme-tls/1`
+    #[serde(rename = "tls-alpn-01")]
     TlsAlpn01,
     /// DNS-01：`_acme-challenge.<domain>` TXT（通配符证书必须用它）
+    #[serde(rename = "dns-01")]
     Dns01,
 }
 
@@ -802,7 +809,6 @@ impl AcmeConfig {
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub struct AcmeSettings {
     /// CA
     #[serde(default)]
@@ -1322,6 +1328,11 @@ impl AccountStore {
         self.dir.join(ACCOUNT_CREDENTIALS_FILE)
     }
 
+    /// 记录该账户属于哪个 CA。切换 provider 时用它判断凭据能否复用。
+    fn provider_path(&self) -> PathBuf {
+        self.dir.join(ACCOUNT_PROVIDER_FILE)
+    }
+
     /// 建目录并收紧权限（acme/ 0700、文件 0600）
     fn ensure_dir(&self) -> Result<(), AcmeError> {
         fs::create_dir_all(&self.dir)
@@ -1330,7 +1341,17 @@ impl AccountStore {
         Ok(())
     }
 
-    fn load_credentials(&self) -> Option<AccountCredentials> {
+    /// 读取账户凭据。`directory_url` 必须与落盘时一致，否则视为不可复用：
+    /// 换 CA 后不能拿旧 CA 的账户去签新 CA 的单。
+    fn load_credentials(&self, directory_url: &str) -> Option<AccountCredentials> {
+        let recorded = fs::read_to_string(self.provider_path()).ok()?;
+        if recorded.trim() != directory_url {
+            warn!(
+                "ACME 账户属于 {}，当前配置的是 {directory_url}；将用同一把密钥在新 CA 注册",
+                recorded.trim()
+            );
+            return None;
+        }
         let raw = fs::read(self.credentials_path()).ok()?;
         match serde_json::from_slice(&raw) {
             Ok(c) => Some(c),
@@ -1341,10 +1362,12 @@ impl AccountStore {
         }
     }
 
-    fn save_credentials(&self, creds: &AccountCredentials) -> Result<(), AcmeError> {
+    fn save_credentials(&self, creds: &AccountCredentials, directory_url: &str) -> Result<(), AcmeError> {
         self.ensure_dir()?;
         write_private_json(&self.credentials_path(), creds)
-            .map_err(|e| AcmeError::io(AcmeStage::Account, &e, "写入 ACME 账户凭据"))
+            .map_err(|e| AcmeError::io(AcmeStage::Account, &e, "写入 ACME 账户凭据"))?;
+        write_atomic(self.provider_path().as_path(), directory_url.as_bytes(), true)
+            .map_err(|e| AcmeError::io(AcmeStage::Account, &e, "写入账户 CA 标记"))
     }
 
     /// 读账户私钥（PKCS#8 PEM），没有就生成一个。
@@ -1836,6 +1859,14 @@ impl Drop for TlsAlpnResponder {
 // DNS-01 provider
 // ---------------------------------------------------------------------------
 
+/// dns-01 的记录名：`*.example.com` / `example.com` → `_acme-challenge.example.com`
+pub fn dns01_record_name(domain: &str) -> String {
+    format!(
+        "_acme-challenge.{}",
+        domain.strip_prefix("*.").unwrap_or(domain)
+    )
+}
+
 /// 一条待发布的 TXT 记录
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsRecord {
@@ -2234,7 +2265,7 @@ impl AcmeClient {
         let directory_url = self.cfg.provider.directory_url().to_string();
 
         // 1) 已有账户凭据：直接复用（只会发一次 directory GET）
-        if let Some(creds) = store.load_credentials() {
+        if let Some(creds) = store.load_credentials(&directory_url) {
             match Account::builder_with_http(Box::new(self.http.clone()))
                 .from_credentials(creds)
                 .await
@@ -2255,7 +2286,7 @@ impl AcmeClient {
         if store.key_path().exists() {
             let (key, pkcs8) = store.load_or_create_key()?;
             let (account, creds) = Account::builder_with_http(Box::new(self.http.clone()))
-                .create_from_key((key, pkcs8), directory_url)
+                .create_from_key((key, pkcs8), directory_url.clone())
                 .await
                 .map_err(|e| {
                     AcmeError::protocol(
@@ -2266,7 +2297,7 @@ impl AcmeClient {
                         ),
                     )
                 })?;
-            store.save_credentials(&creds)?;
+            store.save_credentials(&creds, &directory_url)?;
             info!("ACME 账户已就绪（复用本地密钥）：{}", account.id());
             *slot = Some(account.clone());
             return Ok(account);
@@ -2287,7 +2318,7 @@ impl AcmeClient {
             only_return_existing: false,
         };
         let (account, creds) = Account::builder_with_http(Box::new(self.http.clone()))
-            .create(&new_account, directory_url, None)
+            .create(&new_account, directory_url.clone(), None)
             .await
             .map_err(|e| {
                 AcmeError::protocol(
@@ -2303,7 +2334,7 @@ impl AcmeClient {
             creds.private_key().secret_pkcs8_der(),
         )
         .map_err(|e| AcmeError::io(AcmeStage::Account, &e, "写入账户私钥"))?;
-        store.save_credentials(&creds)?;
+        store.save_credentials(&creds, &directory_url)?;
         info!("ACME 账户已注册：{}", account.id());
         *slot = Some(account.clone());
         Ok(account)
@@ -2332,7 +2363,7 @@ impl AcmeClient {
             ChallengeKind::Dns01 => {
                 let provider = self.dns_provider()?;
                 let record = DnsRecord {
-                    fqdn: format!("_acme-challenge.{}", domain.trim_start_matches("*.")),
+                    fqdn: dns01_record_name(domain),
                     value: key_auth.dns_value(),
                 };
                 let handle = provider.present(&record).await?;
@@ -2974,6 +3005,89 @@ mod tests {
         assert!(validate_domain("example.com:8443", ChallengeKind::Http01).is_err());
         assert!(validate_domain("exa mple.com", ChallengeKind::Http01).is_err());
         assert!(validate_domain("a..b.com", ChallengeKind::Http01).is_err());
+    }
+
+    #[test]
+    fn dns01_record_names() {
+        assert_eq!(dns01_record_name("example.com"), "_acme-challenge.example.com");
+        assert_eq!(
+            dns01_record_name("*.example.com"),
+            "_acme-challenge.example.com"
+        );
+        assert_eq!(
+            dns01_record_name("a.b.example.com"),
+            "_acme-challenge.a.b.example.com"
+        );
+    }
+
+    #[test]
+    fn acme_settings_json_roundtrip() {
+        // 父代理只需在 ServerConfig 里加一个 #[serde(default)] 的 AcmeSettings 字段
+        let json = r#"{
+            "provider": "letsencrypt-staging",
+            "contact_email": "ops@example.com",
+            "challenge": "tls-alpn-01",
+            "auto_renew": false,
+            "renew_before_days": 21,
+            "public_ip": "203.0.113.7",
+            "http_bind": "0.0.0.0:8080",
+            "public_http_port": 8080,
+            "tls_bind": "0.0.0.0:8443",
+            "public_tls_port": 8443,
+            "manage_http_responder": false,
+            "dns_provider": "cloudflare",
+            "dns_propagation_secs": 5,
+            "use_public_roots": false,
+            "extra_trust_roots": ["/etc/pebble-root.pem"]
+        }"#;
+        let settings: AcmeSettings = serde_json::from_str(json).expect("parse");
+        assert_eq!(settings.provider, AcmeProvider::LetsEncryptStaging);
+        assert!(!settings.auto_renew);
+        assert_eq!(settings.renew_before_days, 21);
+        assert_eq!(settings.challenge, ChallengeKind::TlsAlpn01);
+        assert_eq!(settings.dns_provider, Some(DnsProviderKind::Cloudflare));
+
+        let cfg = settings.to_config("/tmp/data");
+        assert!(!cfg.renewal.enabled, "auto_renew=false 必须落到 RenewalPolicy");
+        assert_eq!(cfg.renewal.renew_before, Duration::from_secs(21 * 86_400));
+        assert_eq!(cfg.public_http_port, 8080);
+        assert!(!cfg.manage_http_responder);
+        assert_eq!(cfg.dns_propagation_delay, Duration::from_secs(5));
+        assert_eq!(cfg.extra_trust_roots.len(), 1);
+        assert_eq!(cfg.data_dir, PathBuf::from("/tmp/data"));
+
+        // 空对象也能解析：全部取保守默认值，且默认就是"用户没主动关闭续期"
+        let empty: AcmeSettings = serde_json::from_str("{}").expect("parse empty");
+        assert_eq!(empty, AcmeSettings::default());
+        assert_eq!(empty.provider, AcmeProvider::LetsEncrypt);
+        assert_eq!(empty.challenge, ChallengeKind::Http01);
+        assert!(empty.auto_renew);
+
+        // 自定义 directory URL
+        let custom: AcmeSettings = serde_json::from_str(
+            r#"{"provider":{"custom":"https://localhost:14000/dir"}}"#,
+        )
+        .expect("parse custom");
+        assert_eq!(
+            custom.provider.directory_url(),
+            "https://localhost:14000/dir"
+        );
+    }
+
+    #[test]
+    fn auto_renew_off_maps_to_no_attempts() {
+        let settings = AcmeSettings {
+            auto_renew: false,
+            ..AcmeSettings::default()
+        };
+        let cfg = settings.to_config("/tmp/x");
+        let not_after = SystemTime::now() + Duration::from_secs(86_400);
+        assert!(
+            cfg.renewal
+                .next_attempt(SystemTime::now(), not_after, 0)
+                .is_none(),
+            "auto_renew=false 时续期策略必须永不再触发"
+        );
     }
 
     #[test]
