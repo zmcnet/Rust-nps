@@ -240,6 +240,104 @@ fn validate(name: &str) -> Result<&str> {
     Ok(name)
 }
 
+// ---------------------------------------------------------------------------
+// 纯函数：命令构造（不执行任何命令，便于穷尽测试）
+// ---------------------------------------------------------------------------
+//
+// 这些函数把「拼命令行」与「执行命令」彻底分开。执行路径一律调用它们，
+// 不存在第二份拼装逻辑——否则测了纯函数也没意义。
+//
+// 安全约束（全部体现在这些函数里）：
+// - 路径必须是**绝对路径**并**总是加引号**（自启时工作目录不可控）
+// - 命令行**绝不包含 vkey**（vkey 只在实例配置文件里）
+
+/// 计划任务名 / 注册表值名：`rnpc-<name>`。
+pub fn item_name_of(instance: &str) -> String {
+    item_name(instance)
+}
+
+/// 服务名（≥ [`MAX_SERVICE_NAME_LEN`] 时截断并加哈希保持唯一）。
+pub fn service_name_of(instance: &str) -> String {
+    service_name(instance)
+}
+
+/// 构造 `schtasks /create` 的参数（**不含** `schtasks.exe` 本身）。
+///
+/// 只接受 [`Channel::TaskStart`] / [`Channel::TaskLogon`]；其它通道返回错误，
+/// 避免误把服务/注册表通道交给 schtasks。
+pub fn task_create_args(channel: Channel, name: &str, exe: &Path) -> Result<Vec<String>> {
+    validate(name)?;
+    if !matches!(channel, Channel::TaskStart | Channel::TaskLogon) {
+        bail!(
+            "task_create_args 只接受 task-start / task-logon，收到 {}",
+            channel.as_str()
+        );
+    }
+    let exe = absolute_exe(exe)?;
+    Ok(vec![
+        "/create".to_owned(),
+        "/tn".to_owned(),
+        item_name(name),
+        "/tr".to_owned(),
+        run_command(&exe, name),
+        "/sc".to_owned(),
+        task_schedule_kind(channel).to_owned(),
+        "/f".to_owned(),
+    ])
+}
+
+/// 构造 `schtasks /query` 的参数（XML 输出，标签名不随系统语言变化）。
+pub fn task_query_args(name: &str) -> Result<Vec<String>> {
+    validate(name)?;
+    Ok(vec![
+        "/query".to_owned(),
+        "/tn".to_owned(),
+        item_name(name),
+        "/xml".to_owned(),
+        "ONE".to_owned(),
+    ])
+}
+
+/// 构造 `schtasks /delete` 的参数。
+pub fn task_delete_args(name: &str) -> Result<Vec<String>> {
+    validate(name)?;
+    Ok(vec![
+        "/delete".to_owned(),
+        "/tn".to_owned(),
+        item_name(name),
+        "/f".to_owned(),
+    ])
+}
+
+/// 注册表 Run 键的值：`"<绝对路径>" run --name <name>`。
+pub fn run_key_value(exe: &Path, name: &str) -> Result<String> {
+    validate(name)?;
+    let exe = absolute_exe(exe)?;
+    Ok(run_command(&exe, name))
+}
+
+/// 服务的 binPath：`"<绝对路径>" service-host --name <name>`。
+pub fn service_bin_path(exe: &Path, name: &str) -> Result<String> {
+    validate(name)?;
+    let exe = absolute_exe(exe)?;
+    Ok(service_command(&exe, name))
+}
+
+/// `schtasks` 的 `/sc` 取值（`onstart` / `onlogon`）。
+///
+/// 非任务通道返回 `None`，由调用方决定如何报错。
+pub fn task_schedule_kind_of(channel: Channel) -> Option<&'static str> {
+    match channel {
+        Channel::TaskStart => Some("onstart"),
+        Channel::TaskLogon => Some("onlogon"),
+        _ => None,
+    }
+}
+
+fn task_schedule_kind(channel: Channel) -> &'static str {
+    task_schedule_kind_of(channel).unwrap_or("onlogon")
+}
+
 /// 校验可执行文件路径：必须绝对、不含双引号，并去掉末尾多余分隔符。
 fn absolute_exe(exe: &Path) -> Result<String> {
     if !exe.is_absolute() {
@@ -819,20 +917,21 @@ mod win {
 
     // -- task-start / task-logon -----------------------------------------
 
-    fn schedule_kind(channel: Channel) -> &'static str {
-        match channel {
-            Channel::TaskStart => "onstart",
-            _ => "onlogon",
-        }
-    }
-
     /// 读取任务 XML 里的 `<Command>` + `<Arguments>`。
     ///
     /// 用 XML 而不是 `/fo list`：后者的字段名会被系统语言本地化（中文系统是
     /// 「要运行的任务」），XML 的标签名恒为英文。
     fn task_registered_command(channel: Channel, task: &str) -> Result<Option<String>> {
+        // 纯函数只接受实例名；这里已把实例名转成任务名，故直接按任务名构造参数。
+        let args = vec![
+            "/query".to_owned(),
+            "/tn".to_owned(),
+            task.to_owned(),
+            "/xml".to_owned(),
+            "ONE".to_owned(),
+        ];
         let output = hidden_command("schtasks.exe")
-            .args(["/query", "/tn", task, "/xml", "ONE"])
+            .args(&args)
             .output()
             .context("无法执行 schtasks.exe")?;
         let text = output_text(&output);
@@ -881,17 +980,11 @@ mod win {
         let task = item_name(name);
         let command = run_command(exe, name);
 
+        // 参数由纯函数构造（已含 /f 幂等、/tr 引号、无 vkey），这里只负责执行。
+        let args = crate::autostart::task_create_args(channel, name, std::path::Path::new(exe))
+            .context("构造 schtasks 参数失败")?;
         let output = hidden_command("schtasks.exe")
-            .args([
-                "/create",
-                "/tn",
-                &task,
-                "/tr",
-                &command,
-                "/sc",
-                schedule_kind(channel),
-                "/f",
-            ])
+            .args(&args)
             .output()
             .context("无法执行 schtasks.exe")?;
         let text = output_text(&output);
@@ -920,8 +1013,14 @@ mod win {
         if !owned_by_instance(&stored, name) {
             bail!("拒绝删除计划任务 {task}：现有内容 {stored:?} 不是本程序为实例 {name:?} 创建的");
         }
+        let args = vec![
+            "/delete".to_owned(),
+            "/tn".to_owned(),
+            task.clone(),
+            "/f".to_owned(),
+        ];
         let output = hidden_command("schtasks.exe")
-            .args(["/delete", "/tn", &task, "/f"])
+            .args(&args)
             .output()
             .context("无法执行 schtasks.exe")?;
         let text = output_text(&output);

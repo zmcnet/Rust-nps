@@ -41,11 +41,10 @@ Rust-nps 客户端 rnpc
   rnpc run -server <host:port> -vkey <密钥> [-type tcp] [-log_level <级别>]
   rnpc run -s <host> -p <端口> [-vkey <密钥>] [-type tcp]
   rnpc run -config <配置文件> [-log_level <级别>]
+  rnpc run --name <实例名>                         # 按已安装实例运行
   rnpc -server <host:port> -vkey <密钥>            # 省略 run 等价于 run
   rnpc help
   rnpc version
-  rnpc --help
-  rnpc --version
 
 选项:
   -s, -server    服务端桥接地址。可写成 host:port，也可只给主机（端口由 -p 决定）
@@ -53,29 +52,42 @@ Rust-nps 客户端 rnpc
   -vkey          客户端认证密钥；日志与错误信息中不会回显。
                  直连模式下省略时走注册流程，由服务端分配密钥
   -config        JSON 配置文件路径（结构对齐原版 npc.conf）
-  -type          连接类型，本阶段只支持 tcp（默认 tcp）
+  --name         实例名（配合 run/install/change/stop/start 等子命令）
+  -type          连接类型（默认 tcp）
   -log_level     日志级别：trace|debug|info|warn|error 或 0~7（默认 info）
                  RUST_LOG 环境变量优先于 -log_level
 
 子命令:
   run            运行客户端（默认；未指定子命令时按 run 处理）
+  install        安装实例：写配置 + 注册自启 + 注册 PATH
+  uninstall      卸载实例：移除自启、PATH 与配置
+  change         修改实例配置（不动自启与 PATH）；--restart 可重启
+  update         检查并应用二进制更新 + 同步配置
+                 更新源用 --feed <本地目录>，或环境变量 RNPC_UPDATE_FEED
+  list           列出所有实例及运行状态
+  status         单实例详情（不显示 vkey）
+  start / stop / restart
+                 控制已安装实例；--timeout <秒> 指定优雅停止超时（默认 10）
+  logs           查看实例日志；--lines <N>（默认 50）、--follow 跟随
+  path           add | remove | status：管理用户级 PATH 注册
+  channel        list | install | remove：管理自启通道
+                 通道：service | task-start | task-logon | run-key
+                 （前两个需要管理员权限；run-key 不需要）
+  doctor         环境自检
   help / version 显示帮助 / 版本
-  install / uninstall / update / change / list / status / start / stop
-                 已识别但尚未实现（退出码 2）
+  service-host   **内部使用**：仅供 Windows SCM 拉起服务进程，请勿手工调用
 
 退出码:
-  0  正常退出（Ctrl+C）
-  2  参数非法 / 子命令尚未实现
-  3  首次连接服务端失败（不可达 / 超时 / 连接被拒）
-  4  服务端拒绝 vkey（或注册后服务端仍不认密钥）
-  5  -type 本阶段不支持
-  6  握手或协议帧非法
-  7  服务端拒绝注册流程
-  8  配置文件不可读 / 超过 1 MiB / JSON 语法错误
+  0  正常退出 / 命令成功
+  1  运行时失败（连接断开、进程操作失败等）
+  2  参数非法 / 未知子命令
+  3  权限不足（指定了需要管理员的通道）
+  4  实例不存在 / 未安装
+  7  配置冲突（实例名非法等）
 
 说明:
-  本阶段只建立 TCP 隧道；UDP、SOCKS5、HTTP 域名代理、KCP、P2P、
-  加密、压缩暂未实现。配置文件中的非 tcp 隧道会明确提示「暂不支持」并跳过。
+  客户端支持原版全部子流类型：tcp、udp、http、udp5（SOCKS5）。
+  KCP 与 P2P 客户端侧尚未实现（服务端的 p2p 会合信令已实现）。
   Ctrl+C 会关闭全部子流并退出。
 ";
 
@@ -175,6 +187,8 @@ pub enum Command {
         /// stop/restart 的优雅超时（秒）
         timeout: u64,
     },
+    /// `service-host`：**内部使用**，仅供 Windows SCM 拉起服务进程。
+    ServiceHost { name: String },
     /// `doctor`
     Doctor,
     /// `logs`
@@ -329,6 +343,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, C
         Some("list") => return Ok(Command::List),
         Some("status") => return parse_status(args),
         Some("doctor") => return Ok(Command::Doctor),
+        Some("service-host") => return parse_service_host(args),
         Some("path") => return parse_path(args),
         Some("start") => return parse_process(args, ProcessAction::Start),
         Some("stop") => return parse_process(args, ProcessAction::Stop),
@@ -621,6 +636,18 @@ fn parse_update(args: Vec<OsString>) -> Result<Command, CliError> {
         feed,
         check_only,
     }))
+}
+
+fn parse_service_host(args: Vec<OsString>) -> Result<Command, CliError> {
+    let mut name = "default".to_owned();
+    let mut iter = args.into_iter();
+    while let Some((opt, inline)) = next_option(&mut iter)? {
+        match opt.as_str() {
+            "name" => name = take_value(&mut iter, &opt, inline)?,
+            other => return Err(CliError::UnknownOption(format!("-{other}"))),
+        }
+    }
+    Ok(Command::ServiceHost { name })
 }
 
 fn parse_process(args: Vec<OsString>, action: ProcessAction) -> Result<Command, CliError> {

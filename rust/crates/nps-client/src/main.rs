@@ -264,6 +264,16 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        Command::ServiceHost { name } => {
+            // 仅供 SCM 调用。这里不打印任何"使用提示"——服务没有交互终端。
+            match nps_client::service_host::run(name) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("rnpc service-host: {e:#}");
+                    ExitCode::from(nps_client::commands::EXIT_RUNTIME)
+                }
+            }
+        }
         Command::Doctor => {
             let root = nps_client::instance::data_root();
             print!("{}", nps_client::commands::cmd_doctor(&root));

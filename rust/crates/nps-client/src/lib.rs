@@ -35,6 +35,7 @@ pub mod tunnel;
 pub mod udp;
 pub mod update_feed;
 pub mod process;
+pub mod service_host;
 
 pub use autostart::{Channel, ChannelStatus};
 pub use cli::{

@@ -453,3 +453,205 @@ impl Drop for TaskCleanup {
             .status();
     }
 }
+
+// ---------------------------------------------------------------------------
+// 纯函数：命令构造（不执行任何外部命令）
+// ---------------------------------------------------------------------------
+
+fn win_path(s: &str) -> PathBuf {
+    PathBuf::from(s)
+}
+
+#[test]
+fn task_create_args_uses_correct_schedule_kind() {
+    let exe = win_path(r"C:\rnpc\rnpc.exe");
+
+    let start = nps_client::autostart::task_create_args(
+        nps_client::autostart::Channel::TaskStart,
+        "web",
+        &exe,
+    )
+    .unwrap();
+    let idx = start.iter().position(|a| a == "/sc").expect("/sc 必须存在");
+    assert_eq!(start[idx + 1], "onstart", "task-start 应为 onstart");
+
+    let logon = nps_client::autostart::task_create_args(
+        nps_client::autostart::Channel::TaskLogon,
+        "web",
+        &exe,
+    )
+    .unwrap();
+    let idx = logon.iter().position(|a| a == "/sc").expect("/sc 必须存在");
+    assert_eq!(logon[idx + 1], "onlogon", "task-logon 应为 onlogon");
+}
+
+#[test]
+fn task_create_args_rejects_non_task_channels() {
+    let exe = win_path(r"C:\rnpc\rnpc.exe");
+    for channel in [
+        nps_client::autostart::Channel::Service,
+        nps_client::autostart::Channel::RunKey,
+    ] {
+        let err = nps_client::autostart::task_create_args(channel, "web", &exe).unwrap_err();
+        assert!(
+            err.to_string().contains("只接受"),
+            "{} 应被拒绝：{err}",
+            channel.as_str()
+        );
+    }
+}
+
+#[test]
+fn task_create_args_is_idempotent_via_force_flag() {
+    let args = nps_client::autostart::task_create_args(
+        nps_client::autostart::Channel::TaskStart,
+        "web",
+        &win_path(r"C:\rnpc\rnpc.exe"),
+    )
+    .unwrap();
+    assert!(args.iter().any(|a| a == "/f"), "必须有 /f 保证重复安装幂等");
+}
+
+#[test]
+fn task_args_use_task_name_prefix() {
+    let args = nps_client::autostart::task_query_args("web").unwrap();
+    let idx = args.iter().position(|a| a == "/tn").expect("/tn");
+    assert_eq!(args[idx + 1], "rnpc-web");
+
+    let del = nps_client::autostart::task_delete_args("db").unwrap();
+    let idx = del.iter().position(|a| a == "/tn").expect("/tn");
+    assert_eq!(del[idx + 1], "rnpc-db");
+    assert!(del.iter().any(|a| a == "/f"), "删除也应带 /f");
+}
+
+#[test]
+fn paths_with_spaces_are_quoted() {
+    let exe = win_path(r"C:\Program Files\rnpc\bin\rnpc.exe");
+    let value = nps_client::autostart::run_key_value(&exe, "web").unwrap();
+    assert!(
+        value.starts_with('"') && value.contains(r"C:\Program Files\rnpc\bin\rnpc.exe"),
+        "含空格路径必须加引号：{value}"
+    );
+
+    let bin = nps_client::autostart::service_bin_path(&exe, "web").unwrap();
+    assert!(bin.starts_with('"'), "binPath 必须加引号：{bin}");
+}
+
+#[test]
+fn paths_without_spaces_are_still_quoted() {
+    // 统一加引号，避免"有时加有时不加"的判断错误
+    let value =
+        nps_client::autostart::run_key_value(&win_path(r"C:\rnpc\rnpc.exe"), "web").unwrap();
+    assert!(value.starts_with('"'), "一律加引号更安全：{value}");
+    assert_eq!(
+        value,
+        r#""C:\rnpc\rnpc.exe" run --name web"#,
+        "命令行必须精确匹配 run 子命令格式"
+    );
+}
+
+#[test]
+fn service_bin_path_uses_service_host_entry() {
+    let bin = nps_client::autostart::service_bin_path(&win_path(r"C:\rnpc\rnpc.exe"), "web")
+        .unwrap();
+    assert!(
+        bin.contains("service-host --name web"),
+        "服务入口必须是 service-host：{bin}"
+    );
+}
+
+#[test]
+fn relative_executable_is_rejected() {
+    let rel = win_path(r"rnpc.exe");
+    for result in [
+        nps_client::autostart::run_key_value(&rel, "web").map(|_| ()),
+        nps_client::autostart::service_bin_path(&rel, "web").map(|_| ()),
+        nps_client::autostart::task_create_args(
+            nps_client::autostart::Channel::TaskStart,
+            "web",
+            &rel,
+        )
+        .map(|_| ()),
+    ] {
+        let err = result.expect_err("相对路径必须被拒绝（服务工作目录是 System32）");
+        assert!(
+            err.to_string().contains("绝对路径"),
+            "错误信息应说明需要绝对路径：{err}"
+        );
+    }
+}
+
+#[test]
+fn command_lines_never_contain_vkey() {
+    let exe = win_path(r"C:\rnpc\rnpc.exe");
+    let mut all = Vec::new();
+    all.extend(nps_client::autostart::task_create_args(
+        nps_client::autostart::Channel::TaskStart,
+        "web",
+        &exe,
+    )
+    .unwrap());
+    all.extend(nps_client::autostart::task_query_args("web").unwrap());
+    all.extend(nps_client::autostart::task_delete_args("web").unwrap());
+    all.push(nps_client::autostart::run_key_value(&exe, "web").unwrap());
+    all.push(nps_client::autostart::service_bin_path(&exe, "web").unwrap());
+
+    let joined = all.join(" ");
+    let lower = joined.to_ascii_lowercase();
+    for forbidden in ["vkey", "verifykey", "password", "-p ", "secret"] {
+        assert!(
+            !lower.contains(forbidden),
+            "自启命令行绝不能包含 {forbidden:?}：{joined}"
+        );
+    }
+}
+
+#[test]
+fn service_name_is_bounded_and_unique_for_long_instances() {
+    // 常规实例名
+    assert_eq!(nps_client::autostart::service_name_of("web"), "rnpc-web");
+
+    // 规格允许的最长实例名（32 字符）
+    let longest = "a".repeat(32);
+    let name = nps_client::autostart::service_name_of(&longest);
+    assert!(name.len() <= 64, "服务名应受限：{name}（{}）", name.len());
+
+    // 两个不同的超长实例名必须产生不同结果（哈希防碰撞）
+    let other = "b".repeat(32);
+    let name2 = nps_client::autostart::service_name_of(&other);
+    assert_ne!(name, name2, "不同超长实例名必须产生不同服务名");
+
+    // 只含合法字符
+    for ch in name.chars() {
+        assert!(
+            ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.',
+            "服务名含非法字符 {ch:?}: {name}"
+        );
+    }
+}
+
+#[test]
+fn item_names_are_prefixed() {
+    assert_eq!(nps_client::autostart::item_name_of("web"), "rnpc-web");
+    assert_eq!(nps_client::autostart::item_name_of("db-1"), "rnpc-db-1");
+}
+
+#[test]
+fn invalid_instance_names_are_rejected_by_pure_functions() {
+    let exe = win_path(r"C:\rnpc\rnpc.exe");
+    for bad in ["", "..", "a/b", "A", "all", "rnpc"] {
+        assert!(
+            nps_client::autostart::run_key_value(&exe, bad).is_err(),
+            "{bad:?} 应被拒绝"
+        );
+        assert!(
+            nps_client::autostart::task_create_args(
+                nps_client::autostart::Channel::TaskStart,
+                bad,
+                &exe
+            )
+            .is_err(),
+            "{bad:?} 应被拒绝（task）"
+        );
+    }
+}
