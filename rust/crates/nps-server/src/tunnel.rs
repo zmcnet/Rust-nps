@@ -622,6 +622,8 @@ mod tests {
             listen_addr: "127.0.0.1:0".into(),
             target_addr: "127.0.0.1:22".into(),
             enabled: true,
+            target_addrs: Vec::new(),
+            health_check: None,
         }
     }
 

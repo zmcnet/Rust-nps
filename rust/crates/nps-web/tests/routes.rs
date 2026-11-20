@@ -10,7 +10,7 @@ use axum::Router;
 use http_body_util::BodyExt;
 use nps_server::{ClientSnapshot, ServerSnapshot, TunnelSnapshot};
 use nps_web::{
-    AcmeIssueResult, AcmeSummary, CertView, ListenerView, SiteInput, SiteRouteView, SiteView,
+    AcmeIssueResult, AcmeSummary, CertView, ListenerView, SiteInput, SiteView,
 };
 use nps_web::{router_with_backend, AdminBackend};
 use serde_json::Value;

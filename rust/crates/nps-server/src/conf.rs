@@ -580,6 +580,8 @@ impl ConfRegistry {
             listen_addr: listen.to_string(),
             target_addr: target.clone(),
             enabled: true,
+            target_addrs: Vec::new(),
+            health_check: None,
         }));
         {
             let _guard = tunnel.lock_op().await;

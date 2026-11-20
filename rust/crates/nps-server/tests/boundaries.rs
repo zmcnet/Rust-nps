@@ -24,6 +24,8 @@ fn config(enabled: bool) -> ServerConfig {
             listen_addr: "127.0.0.1:0".into(),
             target_addr: "127.0.0.1:22".into(),
             enabled,
+            target_addrs: Vec::new(),
+            health_check: None,
         }],
         conf_register: false,
         conf_max_tunnels: 32,

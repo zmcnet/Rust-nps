@@ -59,6 +59,8 @@ struct ServerInner {
     https_cancel: Option<tokio::sync::watch::Sender<bool>>,
     /// ACME 服务。**只构造不申请** —— 申请必须由管理端显式触发。
     acme: Option<Arc<crate::acme::AcmeService>>,
+    /// 健康检查任务的取消信号（所有检查器共用一个）
+    health_cancel: Option<tokio::sync::watch::Sender<bool>>,
     /// SOCKS5 监听（配置里的 `socks5_listeners`）
     socks5: Vec<Arc<crate::socks5::Socks5Server>>,
     bridge_task: Mutex<Option<JoinHandle<()>>>,
@@ -127,13 +129,59 @@ impl Server {
             info!("来源 IP 白名单已启用（{} 条）", config.ip_limit.len());
         }
 
+        // ---- 目标池 + 健康检查 ----
+        //
+        // 关键：每个隧道**只有一个** TargetPool，健康检查与转发共用它。
+        // 若各自建池，健康检查摘除的目标对转发不可见（曾经的 bug）。
+        let (health_cancel, target_pools) = {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let mut pools: HashMap<u32, Arc<crate::target::TargetPool>> = HashMap::new();
+
+            for cfg in &config.tunnels {
+                // 多目标优先：target_addrs 非空时忽略单目标 target_addr
+                let spec = if cfg.target_addrs.is_empty() {
+                    cfg.target_addr.clone()
+                } else {
+                    cfg.target_addrs.join("
+")
+                };
+                let pool = crate::target::TargetPool::parse(&spec)
+                    .map(Arc::new)
+                    .unwrap_or_else(|_| Arc::new(crate::target::TargetPool::single(&spec)));
+                pools.insert(cfg.id, pool);
+            }
+
+            // 健康检查：检查器与隧道共用同一个池实例
+            for cfg in &config.tunnels {
+                let Some(hc) = &cfg.health_check else { continue };
+                let Some(pool) = pools.get(&cfg.id).cloned() else {
+                    continue;
+                };
+                let hc_cfg = crate::target::HealthCheckConfig {
+                    timeout: std::time::Duration::from_secs(hc.timeout_secs),
+                    max_failed: hc.max_failed,
+                    interval: std::time::Duration::from_secs(hc.interval_secs),
+                    kind: crate::target::HealthCheckKind::from_config(&hc.kind, &hc.http_url),
+                };
+                let checker = Arc::new(crate::target::HealthChecker::new(pool, hc_cfg));
+                let rx = rx.clone();
+                tokio::spawn(async move { checker.run(rx).await });
+                info!(
+                    "隧道 {} 健康检查已启用：间隔 {}s，失败 {} 次摘除",
+                    cfg.id, hc.interval_secs, hc.max_failed
+                );
+            }
+            (Some(tx), pools)
+        };
+
         let static_tunnels: Vec<Arc<Tunnel>> = config
             .tunnels
             .iter()
             .map(|cfg| {
-                let pool = crate::target::TargetPool::parse(&cfg.target_addr)
-                    .map(Arc::new)
-                    .unwrap_or_else(|_| Arc::new(crate::target::TargetPool::single(&cfg.target_addr)));
+                let pool = target_pools
+                    .get(&cfg.id)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(crate::target::TargetPool::single(&cfg.target_addr)));
                 Arc::new(Tunnel::with_controls(
                     cfg.clone(),
                     pool,
@@ -434,6 +482,7 @@ impl Server {
                 certs,
                 https_cancel,
                 acme,
+                health_cancel,
                 socks5: socks5_servers,
                 bridge_task: Mutex::new(Some(bridge_task)),
                 shutdown,
@@ -584,6 +633,11 @@ impl Server {
 
         // 停 HTTPS 域名代理
         if let Some(cancel) = &self.inner.https_cancel {
+            let _ = cancel.send(true);
+        }
+
+        // 停健康检查
+        if let Some(cancel) = &self.inner.health_cancel {
             let _ = cancel.send(true);
         }
 

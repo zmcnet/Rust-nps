@@ -255,6 +255,7 @@
         render();
         refreshSites();
         refreshCerts();
+        refreshAcmeSummary();
       })
       .catch(function (error) {
         if (error instanceof AuthError) {
@@ -629,6 +630,8 @@
       var domain = (siteDom.domain.value || '').trim();
       var target = (siteDom.target.value || '').trim();
       var clientId = parseInt(siteDom.client.value, 10);
+      // 先清空上一次的状态，避免提交失败时仍显示上一次的"已保存"
+      setFormStatus(siteDom.status, '', '');
       if (!domain || !target || !isFinite(clientId)) {
         setFormStatus(siteDom.status, 'err', '域名、客户端 ID、目标地址都必填');
         return;
@@ -791,8 +794,19 @@
           setFormStatus(certDom.acmeStatus, 'err', '请填域名');
           return;
         }
-        if (!acmeState || !acmeState.available) {
-          setFormStatus(certDom.acmeStatus, 'err', 'ACME 服务不可用，请检查服务端配置');
+        if (!acmeState) {
+          // 摘要还没拿到（可能是网络慢），先拉一次再让用户重试，
+          // 不要误导用户去查服务端配置
+          setFormStatus(certDom.acmeStatus, 'busy', '正在获取 ACME 状态，请稍后重试…');
+          refreshAcmeSummary();
+          return;
+        }
+        if (!acmeState.available) {
+          setFormStatus(
+            certDom.acmeStatus,
+            'err',
+            'ACME 服务不可用（服务端未初始化），请查看服务端日志'
+          );
           return;
         }
         setFormStatus(certDom.acmeStatus, 'busy', '正在申请…');
@@ -827,23 +841,35 @@
       });
     }
 
+    // 注意：这里**不**发 /api/acme 请求。
+    // bindCerts() 在登录前就执行，此时没有令牌，请求会 401 且被静默吞掉，
+    // 导致 acmeState 永远为 null、ACME 申请入口 100% 不可用。
+    // 改为登录成功后由 refreshAcmeSummary() 拉取。
+  }
+
+  /// 拉取 ACME 摘要并填充面板提示（必须已有令牌）。
+  function refreshAcmeSummary() {
+    if (!state.token || !certDom.acmeWarn) return;
     request('/api/acme')
       .then(function (summary) {
         acmeState = summary;
-        if (certDom.acmeWarn) {
-          if (!summary.available) {
-            certDom.acmeWarn.textContent = 'ACME 服务不可用。';
-          } else if (!summary.contact_email_set) {
-            certDom.acmeWarn.textContent =
-              '尚未配置联系邮箱（acme.contact_email），部分 CA 会拒绝申请。';
-          } else {
-            certDom.acmeWarn.textContent =
-              'CA：' + summary.provider + '　验证方式：' + summary.challenge +
-              '　自动续期：' + (summary.auto_renew ? '开启' : '关闭');
-          }
+        if (!summary.available) {
+          certDom.acmeWarn.textContent =
+            'ACME 服务不可用（服务端未初始化）。请检查服务端日志。';
+        } else if (!summary.contact_email_set) {
+          certDom.acmeWarn.textContent =
+            'CA：' + summary.provider + '　验证方式：' + summary.challenge +
+            '　自动续期：' + (summary.auto_renew ? '开启' : '关闭') +
+            '　（尚未配置联系邮箱 acme.contact_email，部分 CA 会拒绝申请）';
+        } else {
+          certDom.acmeWarn.textContent =
+            'CA：' + summary.provider + '　验证方式：' + summary.challenge +
+            '　自动续期：' + (summary.auto_renew ? '开启' : '关闭');
         }
       })
-      .catch(function () {});
+      .catch(function (error) {
+        certDom.acmeWarn.textContent = '无法获取 ACME 状态：' + describeError(error);
+      });
   }
 
   function switchCertMode() {

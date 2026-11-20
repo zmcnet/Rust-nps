@@ -222,6 +222,23 @@ pub struct HttpSiteConfig {
     pub force_https: bool,
 }
 
+/// 健康检查设置（对应原版 `health_check_*` 六个字段）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthCheckSettings {
+    /// 单次探测超时（秒）
+    pub timeout_secs: u64,
+    /// 连续失败多少次才摘除
+    pub max_failed: u32,
+    /// 检查间隔（秒）
+    pub interval_secs: u64,
+    /// `tcp` 或 `http`（缺省按 http，与原版一致）
+    #[serde(default)]
+    pub kind: String,
+    /// http 检查的路径，缺省 `/`
+    #[serde(default)]
+    pub http_url: String,
+}
+
 /// 一条路径前缀路由
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpRoute {
@@ -323,6 +340,12 @@ pub struct TcpTunnelConfig {
     /// 是否随 server 启动而监听；默认 true
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// 多目标（优先于 `target_addr`）。为空时沿用 `target_addr` 单目标。
+    #[serde(default)]
+    pub target_addrs: Vec<String>,
+    /// 健康检查（None = 不检查）
+    #[serde(default)]
+    pub health_check: Option<HealthCheckSettings>,
 }
 
 impl ServerConfig {
@@ -383,6 +406,25 @@ impl ServerConfig {
             if t.enabled && listen.port() != 0 {
                 if let Some(other) = listen_addrs.insert(listen, t.id) {
                     bail!("隧道 {} 与隧道 {} 监听了同一地址 {}", t.id, other, listen);
+                }
+            }
+            for addr in &t.target_addrs {
+                validate_host_port(addr).with_context(|| {
+                    format!("隧道 {} 的 target_addrs 条目非法: {addr:?}", t.id)
+                })?;
+            }
+            if let Some(hc) = &t.health_check {
+                if hc.timeout_secs == 0 || hc.interval_secs == 0 || hc.max_failed == 0 {
+                    bail!(
+                        "隧道 {} 的 health_check 要求 timeout_secs / interval_secs / max_failed 均 > 0",
+                        t.id
+                    );
+                }
+                if !hc.kind.is_empty()
+                    && !hc.kind.eq_ignore_ascii_case("tcp")
+                    && !hc.kind.eq_ignore_ascii_case("http")
+                {
+                    bail!("隧道 {} 的 health_check.kind 只能是 tcp 或 http", t.id);
                 }
             }
         }
@@ -606,6 +648,8 @@ mod tests {
             listen_addr: listen.into(),
             target_addr: "127.0.0.1:22".into(),
             enabled: true,
+            target_addrs: Vec::new(),
+            health_check: None,
         }
     }
 

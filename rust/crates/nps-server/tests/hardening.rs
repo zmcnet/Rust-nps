@@ -39,6 +39,8 @@ fn config(listen_addr: &str) -> ServerConfig {
             listen_addr: listen_addr.into(),
             target_addr: "127.0.0.1:2222".into(),
             enabled: true,
+            target_addrs: Vec::new(),
+            health_check: None,
         }],
         conf_register: false,
         conf_max_tunnels: 32,
