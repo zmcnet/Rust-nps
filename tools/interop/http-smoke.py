@@ -275,6 +275,31 @@ def close_quietly(sock):
         pass
 
 
+def expect_continue_post(checks, addr, host, body: bytes, name: str):
+    """`Expect: 100-continue`：先收 100，再发 body，最后读最终响应。"""
+    sock = socket.create_connection(addr, timeout=15)
+    sock.settimeout(15)
+    head = (
+        f"POST /echo HTTP/1.1\r\nHost: {host}\r\nContent-Length: {len(body)}\r\n"
+        f"Expect: 100-continue\r\nConnection: keep-alive\r\n\r\n"
+    )
+    sock.sendall(head.encode())
+    interim = b""
+    while b"\r\n\r\n" not in interim:
+        interim += sock.recv(256)
+    if not interim.startswith(b"HTTP/1.1 100 Continue"):
+        checks.fail(name, f"未收到 100 Continue: {interim[:80]!r}")
+        close_quietly(sock)
+        return
+    sock.sendall(body)
+    raw_head, headers, rest = read_head(sock)
+    status = int(raw_head.split(b" ")[1])
+    data = read_body(sock, headers, rest)
+    close_quietly(sock)
+    checks.check(status == 200 and data == body, name,
+                 f"100 Continue -> status={status} len={len(data)}")
+
+
 class Checks:
     def __init__(self):
         self.items = []
@@ -560,6 +585,10 @@ def main() -> int:
                                path="/echo", method="POST", body=chunked_body, chunked=True)
         checks.check(status == 200 and body == chunked_body,
                      "chunked 请求体原样转发", f"status={status} len={len(body)}")
+
+        # 4b) Expect: 100-continue（客户端等到 100 才发 body）
+        expect_continue_post(checks, http_endpoint, args.domain,
+                             b"expect-body-" * 1000, "Expect: 100-continue 不挂起")
 
         # 5) 大响应（2 MiB）
         sock, status, headers, body = request(

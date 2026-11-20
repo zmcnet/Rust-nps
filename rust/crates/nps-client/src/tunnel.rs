@@ -11,7 +11,8 @@
 //!   - `"udp"`  → `net.DialTimeout("udp", Host)` + 双向拷贝，见 [`crate::udp`]
 //!   - `"http"` → 拨 TCP 到 Host，读一个完整 HTTP 请求再双向拷贝，见 [`crate::http_proxy`]
 //!   - `"udp5"` → 绑定本地 UDP 端口，子流内传 SOCKS5 UDP 数据报，见 [`crate::socks5`]
-//!     其它类型（含 KCP/P2P 等新协议 flag）统一下降级为「关闭子流 + 日志」。
+//!
+//!   其它类型（含 KCP/P2P 等新协议 flag）统一下降级为「关闭子流 + 日志」。
 //!
 //! 资源防护：Link 帧长度上限、拨号超时上下界、HTTP 头部缓冲上限、
 //! 单连接累计缓冲上限（[`MAX_RELAY_BUFFER`]）与非 TCP 子流的空闲超时
