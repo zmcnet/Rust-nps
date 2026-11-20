@@ -226,8 +226,9 @@ async fn require_admin<B: AdminBackend>(
     }
 
     // 鉴权：先比超级管理员 token，再查会话令牌
-    let principal = match resolve_principal(request.headers(), &state) {
-        Some(p) => p,
+    // 鉴权通过即可；具体主体在各 handler 里按需重新解析（避免跨层传递）
+    match resolve_principal(request.headers(), &state) {
+        Some(_) => {}
         None => {
             let mut response =
                 error_response(StatusCode::UNAUTHORIZED, "未授权：缺少或无效的凭证");
@@ -240,7 +241,7 @@ async fn require_admin<B: AdminBackend>(
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static(API_CACHE));
             return response;
         }
-    };
+    }
 
     let mut response = next.run(request).await;
     response
@@ -288,19 +289,6 @@ fn resolve_principal<B>(
     }
     // 2) 会话令牌
     state.sessions.verify(provided)
-}
-
-fn authorized(headers: &HeaderMap, expected: &str) -> bool {
-    let Some(value) = headers.get(header::AUTHORIZATION) else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    let Some(provided) = bearer_credentials(value) else {
-        return false;
-    };
-    constant_time_eq(provided.as_bytes(), expected.as_bytes())
 }
 
 fn bearer_credentials(value: &str) -> Option<&str> {

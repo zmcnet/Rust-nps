@@ -147,10 +147,65 @@ pub enum Command {
     Run(RunConfig),
     Help,
     Version,
+    /// `install`
+    Install(InstallArgs),
+    /// `uninstall`
+    Uninstall { name: String, keep_config: bool },
+    /// `change`
+    Change(ChangeArgs),
+    /// `update`
+    Update(UpdateArgs),
+    /// `list`
+    List,
+    /// `status`
+    Status { name: String },
+    /// `doctor`
+    Doctor,
+    /// `path add|remove|status`
+    Path { action: PathAction },
     /// 扩展预留：已识别但本阶段不实现的子命令。
     UnsupportedSubcommand(String),
     /// 扩展预留：无法识别的子命令。
     UnknownSubcommand(String),
+}
+
+/// `install` 的参数
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallArgs {
+    pub name: String,
+    pub server: String,
+    pub port: u16,
+    pub vkey: Option<String>,
+    pub channel: String,
+    pub no_autostart: bool,
+    pub no_path: bool,
+    pub npc_alias: bool,
+}
+
+/// `change` 的参数
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeArgs {
+    pub name: String,
+    pub server: Option<String>,
+    pub port: Option<u16>,
+    pub vkey: Option<String>,
+    pub restart: bool,
+}
+
+/// `update` 的参数
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateArgs {
+    pub name: String,
+    pub feed: Option<String>,
+    pub check_only: bool,
+}
+
+/// `path` 子命令动作
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathAction {
+    Add,
+    Remove,
+    Status,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -223,6 +278,14 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, C
         Some("run") => {}
         Some("help") => return Ok(Command::Help),
         Some("version") => return Ok(Command::Version),
+        Some("install") => return parse_install(args),
+        Some("uninstall") => return parse_uninstall(args),
+        Some("change") => return parse_change(args),
+        Some("update") => return parse_update(args),
+        Some("list") => return Ok(Command::List),
+        Some("status") => return parse_status(args),
+        Some("doctor") => return Ok(Command::Doctor),
+        Some("path") => return parse_path(args),
         Some(name) if RESERVED_SUBCOMMANDS.contains(&name) => {
             return Ok(Command::UnsupportedSubcommand(name.to_owned()));
         }
@@ -333,6 +396,200 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, C
         log_level,
     }))
 }
+
+/// 从参数列表里取一个通用选项值（支持 `-k v` 与 `-k=v` 与 `--k=v`）
+fn take_value(
+    iter: &mut std::vec::IntoIter<OsString>,
+    name: &str,
+    inline: Option<String>,
+) -> Result<String, CliError> {
+    match inline {
+        Some(v) => Ok(v),
+        None => {
+            let next = iter
+                .next()
+                .ok_or_else(|| CliError::MissingValue(format!("-{name}")))?;
+            next.into_string().map_err(|_| CliError::NonUtf8)
+        }
+    }
+}
+
+/// 统一的选项扫描：把 `-k v` / `-k=v` 拆成 (name, Option<inline_value>)
+fn next_option(
+    iter: &mut std::vec::IntoIter<OsString>,
+) -> Result<Option<(String, Option<String>)>, CliError> {
+    let Some(raw) = iter.next() else {
+        return Ok(None);
+    };
+    let argument = raw.to_str().ok_or(CliError::NonUtf8)?.to_owned();
+    if !argument.starts_with('-') {
+        return Err(CliError::InvalidArgument(
+            "子命令选项必须以 - 或 -- 开头",
+        ));
+    }
+    let (name, inline) = match argument.split_once('=') {
+        Some((n, v)) => (n.to_owned(), Some(v.to_owned())),
+        None => (argument, None),
+    };
+    let name = name.trim_start_matches('-').to_owned();
+    if name.is_empty() {
+        return Err(CliError::InvalidArgument("选项名不能为空"));
+    }
+    Ok(Some((name, inline)))
+}
+
+fn parse_install(args: Vec<OsString>) -> Result<Command, CliError> {
+    let mut name = "default".to_owned();
+    let mut server: Option<String> = None;
+    let mut port: Option<u16> = None;
+    let mut vkey: Option<String> = None;
+    let mut channel = "auto".to_owned();
+    let mut no_autostart = false;
+    let mut no_path = false;
+    let mut npc_alias = false;
+
+    let mut iter = args.into_iter();
+    while let Some((opt, inline)) = next_option(&mut iter)? {
+        match opt.as_str() {
+            "s" | "server" => server = Some(take_value(&mut iter, &opt, inline)?),
+            "p" | "port" => port = Some(parse_port(&take_value(&mut iter, &opt, inline)?)?),
+            "vkey" => vkey = Some(normalize_vkey(take_value(&mut iter, &opt, inline)?)?),
+            "name" => name = take_value(&mut iter, &opt, inline)?,
+            "channel" => channel = take_value(&mut iter, &opt, inline)?,
+            "no-autostart" => no_autostart = true,
+            "no-path" => no_path = true,
+            "npc-alias" => npc_alias = true,
+            other => return Err(CliError::UnknownOption(format!("-{other}"))),
+        }
+    }
+
+    let server = server
+        .filter(|v| !v.trim().is_empty())
+        .ok_or(CliError::MissingOption("-server"))?;
+    let (has_port, host) = normalize_server(&server, port)?;
+    if has_port && port.is_some() {
+        return Err(CliError::ConflictingPort);
+    }
+    let port = port.unwrap_or(8024);
+    // host 可能是 "host:port" 形式，需要拆开
+    let (host_only, final_port) = split_host_port(&host).unwrap_or((host.clone(), port));
+
+    Ok(Command::Install(InstallArgs {
+        name,
+        server: host_only,
+        port: final_port,
+        vkey,
+        channel,
+        no_autostart,
+        no_path,
+        npc_alias,
+    }))
+}
+
+/// 把 `host:port` 拆成 (host, port)；无端口返回 None
+fn split_host_port(addr: &str) -> Option<(String, u16)> {
+    if let Some(rest) = addr.strip_prefix('[') {
+        let (host, rest) = rest.split_once(']')?;
+        let port = rest.strip_prefix(':')?.parse().ok()?;
+        return Some((host.to_owned(), port));
+    }
+    let (host, port) = addr.rsplit_once(':')?;
+    if host.contains(':') {
+        return None; // 裸 IPv6
+    }
+    Some((host.to_owned(), port.parse().ok()?))
+}
+
+fn parse_uninstall(args: Vec<OsString>) -> Result<Command, CliError> {
+    let mut name = "default".to_owned();
+    let mut keep_config = false;
+    let mut iter = args.into_iter();
+    while let Some((opt, inline)) = next_option(&mut iter)? {
+        match opt.as_str() {
+            "name" => name = take_value(&mut iter, &opt, inline)?,
+            "keep-config" => keep_config = true,
+            other => return Err(CliError::UnknownOption(format!("-{other}"))),
+        }
+    }
+    Ok(Command::Uninstall { name, keep_config })
+}
+
+fn parse_change(args: Vec<OsString>) -> Result<Command, CliError> {
+    let mut name = "default".to_owned();
+    let mut server = None;
+    let mut port = None;
+    let mut vkey = None;
+    let mut restart = false;
+    let mut iter = args.into_iter();
+    while let Some((opt, inline)) = next_option(&mut iter)? {
+        match opt.as_str() {
+            "s" | "server" => server = Some(take_value(&mut iter, &opt, inline)?),
+            "p" | "port" => port = Some(parse_port(&take_value(&mut iter, &opt, inline)?)?),
+            "vkey" => vkey = Some(normalize_vkey(take_value(&mut iter, &opt, inline)?)?),
+            "name" => name = take_value(&mut iter, &opt, inline)?,
+            "restart" => restart = true,
+            other => return Err(CliError::UnknownOption(format!("-{other}"))),
+        }
+    }
+    Ok(Command::Change(ChangeArgs {
+        name,
+        server,
+        port,
+        vkey,
+        restart,
+    }))
+}
+
+fn parse_update(args: Vec<OsString>) -> Result<Command, CliError> {
+    let mut name = "default".to_owned();
+    let mut feed = None;
+    let mut check_only = false;
+    let mut iter = args.into_iter();
+    while let Some((opt, inline)) = next_option(&mut iter)? {
+        match opt.as_str() {
+            "name" => name = take_value(&mut iter, &opt, inline)?,
+            "feed" => feed = Some(take_value(&mut iter, &opt, inline)?),
+            "check-only" => check_only = true,
+            other => return Err(CliError::UnknownOption(format!("-{other}"))),
+        }
+    }
+    Ok(Command::Update(UpdateArgs {
+        name,
+        feed,
+        check_only,
+    }))
+}
+
+fn parse_status(args: Vec<OsString>) -> Result<Command, CliError> {
+    let mut name = "default".to_owned();
+    let mut iter = args.into_iter();
+    while let Some((opt, inline)) = next_option(&mut iter)? {
+        match opt.as_str() {
+            "name" => name = take_value(&mut iter, &opt, inline)?,
+            other => return Err(CliError::UnknownOption(format!("-{other}"))),
+        }
+    }
+    Ok(Command::Status { name })
+}
+
+fn parse_path(args: Vec<OsString>) -> Result<Command, CliError> {
+    let mut iter = args.into_iter();
+    let Some(raw) = iter.next() else {
+        return Err(CliError::MissingOption("path add|remove|status"));
+    };
+    let action = match raw.to_str().ok_or(CliError::NonUtf8)? {
+        "add" => PathAction::Add,
+        "remove" => PathAction::Remove,
+        "status" => PathAction::Status,
+        _ => {
+            return Err(CliError::InvalidArgument(
+                "path 只支持 add / remove / status",
+            ))
+        }
+    };
+    Ok(Command::Path { action })
+}
+
 
 fn parse_port(value: &str) -> Result<u16, CliError> {
     match value.trim().parse::<u16>() {
@@ -659,20 +916,82 @@ mod tests {
     }
 
     #[test]
-    fn reserved_subcommands_are_unsupported_not_silently_run() {
-        for name in RESERVED_SUBCOMMANDS {
-            let command = parse(&[name]).expect("应被识别为子命令");
+    fn reserved_subcommands_are_recognized_not_silently_run() {
+        // 已实现的子命令必须解析成具体变体，绝不能当成运行参数
+        assert!(matches!(
+            parse(&["install", "-server=127.0.0.1:8024"]).unwrap(),
+            Command::Install(_)
+        ));
+        assert!(matches!(parse(&["list"]).unwrap(), Command::List));
+        assert!(matches!(parse(&["doctor"]).unwrap(), Command::Doctor));
+        assert!(matches!(
+            parse(&["status", "--name", "web"]).unwrap(),
+            Command::Status { .. }
+        ));
+        assert!(matches!(
+            parse(&["uninstall", "--name", "web"]).unwrap(),
+            Command::Uninstall { .. }
+        ));
+        assert!(matches!(
+            parse(&["change", "-s", "1.2.3.4"]).unwrap(),
+            Command::Change(_)
+        ));
+        assert!(matches!(
+            parse(&["update", "--check-only"]).unwrap(),
+            Command::Update(_)
+        ));
+        assert!(matches!(
+            parse(&["path", "status"]).unwrap(),
+            Command::Path { .. }
+        ));
+
+        // 仍未实现的子命令保持 UnsupportedSubcommand
+        for name in ["start", "stop"] {
             assert_eq!(
-                command,
+                parse(&[name]).unwrap(),
                 Command::UnsupportedSubcommand((*name).to_owned()),
                 "subcommand={name}"
             );
         }
-        // 带参数也仍然是「尚未实现」，不能当成运行参数
-        assert_eq!(
-            parse(&["install", "-server=127.0.0.1:8024"]).unwrap(),
-            Command::UnsupportedSubcommand("install".into())
-        );
+    }
+
+    #[test]
+    fn install_parses_aliases_and_defaults() {
+        // -s + -p 拆分形式
+        match parse(&["install", "-s", "10.0.0.1", "-p", "9000", "--name", "web"]).unwrap() {
+            Command::Install(a) => {
+                assert_eq!(a.server, "10.0.0.1");
+                assert_eq!(a.port, 9000);
+                assert_eq!(a.name, "web");
+                assert_eq!(a.channel, "auto");
+            }
+            other => panic!("期望 Install，实际 {other:?}"),
+        }
+        // host:port 合并形式
+        match parse(&["install", "-server=10.0.0.1:9001"]).unwrap() {
+            Command::Install(a) => {
+                assert_eq!(a.server, "10.0.0.1");
+                assert_eq!(a.port, 9001);
+                assert_eq!(a.name, "default");
+            }
+            other => panic!("期望 Install，实际 {other:?}"),
+        }
+        // 缺省端口 8024
+        match parse(&["install", "-s", "h"]).unwrap() {
+            Command::Install(a) => assert_eq!(a.port, 8024),
+            other => panic!("期望 Install，实际 {other:?}"),
+        }
+        // 冲突：host:port 又给 -p
+        assert!(parse(&["install", "-server=1.2.3.4:9000", "-p", "9001"]).is_err());
+        // 开关
+        match parse(&["install", "-s", "h", "--no-autostart", "--no-path", "--npc-alias"])
+            .unwrap()
+        {
+            Command::Install(a) => {
+                assert!(a.no_autostart && a.no_path && a.npc_alias);
+            }
+            other => panic!("期望 Install，实际 {other:?}"),
+        }
     }
 
     #[test]

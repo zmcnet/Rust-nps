@@ -21,6 +21,10 @@
 //! 迁移期结束后，本 crate 与 `nps-legacy` 一并删除。
 
 pub mod cli;
+pub mod commands;
+pub mod autostart;
+pub mod path_env;
+pub mod instance;
 pub mod client;
 pub mod config;
 pub mod handshake;
@@ -30,6 +34,7 @@ pub mod socks5;
 pub mod tunnel;
 pub mod udp;
 
+pub use autostart::{Channel, ChannelStatus};
 pub use cli::{
     parse_args, CliError, Command, ConnType, RunConfig, Target, EXIT_CONFIG, EXIT_CONFIG_FILE,
     EXIT_OK, EXIT_PROTOCOL, EXIT_REGISTER_DENIED, EXIT_UNREACHABLE, EXIT_UNSUPPORTED,

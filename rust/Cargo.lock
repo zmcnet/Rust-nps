@@ -705,6 +705,7 @@ dependencies = [
 name = "nps-client"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "nps-legacy",
  "nps-proto",
  "serde",
