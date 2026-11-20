@@ -113,6 +113,17 @@ pub trait FileChannelHandler: Send + Sync {
     fn handle(&self, client_id: i32, mux: std::sync::Arc<crate::mux::MuxSession>);
 }
 
+/// `secret`（WORK_SECRET）通道处理器。
+///
+/// 原版 `bridge.go` 的 `WORK_SECRET` 分支：读 32 字节 md5(password)，
+/// 投到 `SecretChan`，由上层按 md5 查任务并 `DealClient`。
+/// 这里把「已读完 md5 的连接」交给上层，避免 legacy 层依赖任务表。
+pub trait SecretHandler: Send + Sync {
+    /// `password_md5` 是客户端发来的 32 字节 md5 十六进制字符串。
+    fn handle(&self, client_id: i32, password_md5: String, stream: tokio::net::TcpStream)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+}
+
 /// signal（main）连接的一代
 struct SignalState {
     gen: u64,
@@ -167,6 +178,8 @@ struct BridgeShared {
     /// 默认未设置：收到 `conf` 连接直接关闭（该能力默认不对外开放）。
     /// `file` 通道处理器（文件服务用）。未设置时收到 `file` 连接直接关闭。
     file_handler: std::sync::OnceLock<std::sync::Arc<dyn FileChannelHandler>>,
+    /// `secret` 通道处理器（加密隧道用）。未设置时收到 `sert` 连接直接关闭。
+    secret_handler: std::sync::OnceLock<std::sync::Arc<dyn SecretHandler>>,
     /// 只在启动阶段由上层设置一次，因此用 `OnceLock` 而不是 `Mutex`。
     conf_handler: OnceLock<Arc<dyn ConfSessionHandler>>,
     /// 常驻接收端。
@@ -199,6 +212,7 @@ impl Bridge {
                 close_tx,
                 conf_handler: OnceLock::new(),
                 file_handler: OnceLock::new(),
+                secret_handler: OnceLock::new(),
                 _close_keepalive: close_keepalive,
             }),
         }
@@ -221,6 +235,13 @@ impl Bridge {
     }
 
     /// 是否已安装 `conf` 会话处理器
+    /// 设置 `secret` 通道处理器（加密隧道用）。只允许设置一次。
+    pub fn set_secret_handler(&self, handler: Arc<dyn SecretHandler>) {
+        if self.shared.secret_handler.set(handler).is_err() {
+            tracing::warn!("secret 通道处理器已设置，忽略重复设置");
+        }
+    }
+
     /// 设置 `file` 通道处理器（文件服务用）。只允许设置一次。
     pub fn set_file_handler(&self, handler: Arc<dyn FileChannelHandler>) {
         if self.shared.file_handler.set(handler).is_err() {
@@ -300,7 +321,34 @@ impl Bridge {
                     let _ = stream.shutdown().await;
                 }
             },
-            b"rgst" | b"sert" | b"p2pm" => {
+            b"sert" => match self.shared.secret_handler.get() {
+                Some(handler) => {
+                    // 原版：客户端紧接着发 32 字节 md5(password)（无长度前缀）
+                    let mut digest = [0u8; 32];
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut digest),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            let password_md5 = String::from_utf8_lossy(&digest).to_string();
+                            handler.handle(client_id, password_md5, stream).await;
+                        }
+                        Ok(Err(e)) => {
+                            debug!("secret 通道读取密码失败 (clientId {client_id}): {e}");
+                        }
+                        Err(_) => {
+                            debug!("secret 通道读取密码超时 (clientId {client_id})");
+                        }
+                    }
+                }
+                None => {
+                    debug!("secret 通道未启用，关闭连接 (clientId {client_id} from {peer})");
+                    let _ = stream.shutdown().await;
+                }
+            },
+            b"rgst" | b"p2pm" => {
                 warn!("连接类型 {conn_type:?} P0 暂未支持 (clientId {client_id})");
             }
             other => {

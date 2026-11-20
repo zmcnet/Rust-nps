@@ -24,6 +24,9 @@
 
 pub mod acme;
 mod conf;
+pub mod p2p;
+pub mod transparent;
+pub mod secret;
 pub mod crypt;
 pub mod file_service;
 pub mod flow_store;

@@ -114,6 +114,12 @@ pub struct ServerConfig {
     /// 文件服务隧道（对应原版 `mode=file`）
     #[serde(default)]
     pub file_tunnels: Vec<crate::file_service::FileTunnelConfig>,
+    /// secret 隧道（对应原版 `mode=secret`）
+    #[serde(default)]
+    pub secret_tunnels: Vec<SecretTunnelConfig>,
+    /// p2p 会合服务监听地址（对应原版 p2p_ip:p2p_port）。默认 None（不监听）。
+    #[serde(default)]
+    pub p2p_listen_addr: Option<String>,
     /// SOCKS5 代理监听（对应 Go 版 `mode=socks5`）
     #[serde(default)]
     pub socks5_listeners: Vec<Socks5Config>,
@@ -162,6 +168,8 @@ impl Default for ServerConfig {
             data_dir: None,
             ip_limit: Vec::new(),
             file_tunnels: Vec::new(),
+            secret_tunnels: Vec::new(),
+            p2p_listen_addr: None,
             flow_store_interval: default_flow_store_interval(),
             socks5_listeners: Vec::new(),
         }
@@ -232,6 +240,36 @@ pub struct HttpSiteConfig {
     /// 是否把 HTTP 请求 301 跳到 HTTPS（仅 tls_mode != off 时有意义）
     #[serde(default = "default_enabled")]
     pub force_https: bool,
+}
+
+/// 一条 secret 隧道（对应原版 `mode=secret`）
+///
+/// 拓扑与普通隧道**相反**：客户端在本地监听端口，服务端只按
+/// `md5(password)` 配对。因此这里没有 `listen_addr`。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretTunnelConfig {
+    pub id: u32,
+    pub name: String,
+    pub client_id: i32,
+    /// 配对密码（明文；服务端只用 md5 建索引，不写日志）
+    pub password: String,
+    /// 服务端侧拨号目标（位于客户端所在网络）
+    pub target_addr: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+impl std::fmt::Debug for SecretTunnelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretTunnelConfig")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("client_id", &self.client_id)
+            .field("password", &"<redacted>")
+            .field("target_addr", &self.target_addr)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
 }
 
 /// 健康检查设置（对应原版 `health_check_*` 六个字段）
@@ -471,9 +509,42 @@ impl ServerConfig {
         }
 
         self.validate_file_tunnels(&client_ids, &tunnel_ids, &mut listen_addrs)?;
+        self.validate_secret_tunnels(&client_ids)?;
+        if let Some(addr) = self.p2p_listen_addr.as_deref() {
+            parse_addr(addr.trim())
+                .with_context(|| format!("p2p_listen_addr 非法: {addr:?}"))?;
+        }
         self.validate_udp_tunnels(&client_ids)?;
         self.validate_http_sites(&client_ids)?;
         self.validate_socks5(&client_ids)?;
+        Ok(())
+    }
+
+    /// 校验 secret 隧道
+    fn validate_secret_tunnels(&self, client_ids: &HashSet<i32>) -> Result<()> {
+        let mut ids = HashSet::new();
+        let mut passwords = HashSet::new();
+        for t in &self.secret_tunnels {
+            if !ids.insert(t.id) {
+                bail!("secret 隧道 id 重复: {}", t.id);
+            }
+            if !client_ids.contains(&t.client_id) {
+                bail!("secret 隧道 {} 引用了不存在的客户端 {}", t.id, t.client_id);
+            }
+            if t.name.trim().is_empty() {
+                bail!("secret 隧道 {} 的 name 不能为空", t.id);
+            }
+            if t.password.is_empty() {
+                bail!("secret 隧道 {} 的 password 不能为空", t.id);
+            }
+            // 密码摘要必须唯一：否则无法确定配到哪条隧道
+            if !passwords.insert(t.password.clone()) {
+                bail!("secret 隧道 {} 的 password 与其他隧道重复", t.id);
+            }
+            validate_host_port(&t.target_addr).with_context(|| {
+                format!("secret 隧道 {} 的 target_addr 非法: {:?}", t.id, t.target_addr)
+            })?;
+        }
         Ok(())
     }
 

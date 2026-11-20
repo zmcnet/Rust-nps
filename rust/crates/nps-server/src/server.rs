@@ -69,6 +69,12 @@ struct ServerInner {
     file: Arc<Mutex<Vec<Arc<crate::file_service::FileTunnel>>>>,
     /// file 通道登记表（bridge 收到的 file mux 存这里）
     file_channels: Arc<crate::file_service::FileChannelRegistry>,
+    /// secret 隧道注册表（md5(password) -> 隧道）
+    secrets: Arc<crate::secret::SecretRegistry>,
+    /// p2p 会合服务；None = 未配置
+    p2p: Option<Arc<crate::p2p::P2pRendezvous>>,
+    /// p2p 取消信号
+    p2p_cancel: Option<tokio::sync::watch::Sender<bool>>,
     /// SOCKS5 监听（配置里的 `socks5_listeners`）
     socks5: Vec<Arc<crate::socks5::Socks5Server>>,
     bridge_task: Mutex<Option<JoinHandle<()>>>,
@@ -95,6 +101,16 @@ pub struct ListenerStats {
     pub http_served_requests: u64,
     pub socks5_listeners: usize,
     pub socks5_active_connections: u64,
+    /// secret 隧道数量（客户端本地监听，服务端只配对）
+    pub secret_tunnels: usize,
+    /// secret 配对成功/被拒累计次数
+    pub secret_matched: u64,
+    pub secret_rejected: u64,
+    /// 文件服务隧道数量
+    pub file_tunnels: usize,
+    /// p2p 会合服务是否启用 / 配对成功次数
+    pub p2p_enabled: bool,
+    pub p2p_paired: u64,
 }
 
 impl Server {
@@ -256,6 +272,49 @@ impl Server {
         bridge.set_file_handler(Arc::new(FileChannelSink {
             registry: file_channels.clone(),
         }));
+
+        // ---- secret 隧道注册表（md5(password) -> 隧道）----
+        let secrets = Arc::new(crate::secret::SecretRegistry::from_passwords(
+            config
+                .secret_tunnels
+                .iter()
+                .filter(|t| t.enabled)
+                .map(|t| {
+                    (
+                        t.password.clone(),
+                        crate::secret::SecretTarget {
+                            id: t.id,
+                            name: t.name.clone(),
+                            client_id: t.client_id,
+                            target_addr: t.target_addr.clone(),
+                        },
+                    )
+                }),
+        ));
+        if !secrets.is_empty() {
+            info!("secret 隧道已启用 {} 条（客户端本地监听，服务端按密码配对）", secrets.len());
+        }
+        bridge.set_secret_handler(Arc::new(SecretSink {
+            bridge: bridge.clone(),
+            registry: secrets.clone(),
+        }));
+
+        // ---- p2p 会合服务（仅信令）----
+        let (p2p, p2p_cancel) = match config.p2p_listen_addr.as_deref() {
+            Some(addr) => {
+                let listen: SocketAddr = addr
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("p2p_listen_addr 非法: {addr}"))?;
+                let svc = Arc::new(crate::p2p::P2pRendezvous::new(listen));
+                let socket = Arc::new(svc.bind().await?);
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                let s = svc.clone();
+                tokio::spawn(async move { s.serve(socket, rx).await });
+                (Some(svc), Some(tx))
+            }
+            None => (None, None),
+        };
 
         // ---- 3. HTTP 域名代理（先于 conf 创建：conf 的 host 帧要 upsert 进来）----
         //
@@ -604,6 +663,9 @@ impl Server {
                 flow_task: Mutex::new(Some(flow_task)),
                 file: file_tunnels_shared,
                 file_channels,
+                secrets,
+                p2p,
+                p2p_cancel,
                 socks5: socks5_servers,
                 bridge_task: Mutex::new(Some(bridge_task)),
                 shutdown,
@@ -641,6 +703,12 @@ impl Server {
                 .as_ref()
                 .map(|h| h.served_requests())
                 .unwrap_or(0),
+            secret_tunnels: self.inner.secrets.len(),
+            secret_matched: self.inner.secrets.matched(),
+            secret_rejected: self.inner.secrets.rejected(),
+            file_tunnels: self.inner.file.try_lock().map(|v| v.len()).unwrap_or(0),
+            p2p_enabled: self.inner.p2p.is_some(),
+            p2p_paired: self.inner.p2p.as_ref().map(|p| p.paired()).unwrap_or(0),
             socks5_listeners: self.inner.socks5.len(),
             socks5_active_connections: self
                 .inner
@@ -767,6 +835,11 @@ impl Server {
             let _ = cancel.send(true);
         }
 
+        // 停 p2p 会合服务
+        if let Some(cancel) = &self.inner.p2p_cancel {
+            let _ = cancel.send(true);
+        }
+
         // 停流量落盘（它会在退出前再写一次）
         if let Some(cancel) = &self.inner.flow_cancel {
             let _ = cancel.send(true);
@@ -877,5 +950,33 @@ struct FileChannelSink {
 impl nps_legacy::bridge::FileChannelHandler for FileChannelSink {
     fn handle(&self, client_id: i32, mux: Arc<nps_legacy::mux::MuxSession>) {
         self.registry.register_and_watch(client_id, mux);
+    }
+}
+
+/// 把桥收到的 `sert` 连接交给 secret 隧道处理。
+struct SecretSink {
+    bridge: Bridge,
+    registry: Arc<crate::secret::SecretRegistry>,
+}
+
+impl nps_legacy::bridge::SecretHandler for SecretSink {
+    fn handle(
+        &self,
+        client_id: i32,
+        password_md5: String,
+        stream: tokio::net::TcpStream,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let bridge = self.bridge.clone();
+        let registry = self.registry.clone();
+        Box::pin(async move {
+            crate::secret::handle_secret_connection(
+                bridge,
+                registry,
+                client_id,
+                password_md5,
+                stream,
+            )
+            .await;
+        })
     }
 }
