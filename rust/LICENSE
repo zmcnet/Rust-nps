@@ -19,18 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-## Third-party notice
-
-Rust-nps is an independent Rust implementation that is wire-compatible with
-the legacy NPS bridge protocol.
-
-It gratefully acknowledges **ehang-io/nps** (https://github.com/ehang-io/nps),
-licensed under the GNU General Public License v3.0. That project inspired this
-work and served as a behavioural reference for interoperability.
-
-No source code from ehang-io/nps is included in this repository. The original
-Go sources are kept outside the build tree, are never compiled into the
-shipped binaries, and are used only as a protocol reference.

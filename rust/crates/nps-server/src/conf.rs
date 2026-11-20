@@ -40,6 +40,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use nps_legacy::bridge::{ConfSession, ConfSessionHandler};
 use nps_legacy::Bridge;
@@ -55,6 +56,9 @@ use crate::tunnel::Tunnel;
 
 /// 单个 `conf` 帧（JSON）的长度上限，对齐 Go `common.BufPoolMax`（64 KiB）。
 const MAX_CONF_FRAME: usize = 64 * 1024;
+/// 单次读取的空闲上限：原版 npc 注册完就关闭 conf 连接，超过该时间没有任何
+/// 帧说明对端异常，直接关闭以回收任务/内存（不无限挂起）。
+const CONF_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// 单个任务最多接受的端口数（多端口本阶段不支持，仅用于拒绝前的粗校验）
 const MAX_TASK_PORTS: usize = 16;
 /// 注册隧道名（remark）的最大长度，避免异常客户端把日志/UI 撑爆
@@ -110,6 +114,15 @@ impl ConfRegistry {
     /// 当前活跃的 conf 会话数
     pub(crate) fn active_sessions(&self) -> usize {
         self.inner.active_sessions.load(Ordering::Acquire)
+    }
+
+    /// 取得注册串行锁。
+    ///
+    /// 关闭流程必须拿它：否则「注册已通过上限/端口检查 → 关闭流程取完隧道列表
+    /// → 注册才 push」会让一条新隧道在 shutdown 之后仍然监听。持有该锁期间
+    /// 关闭标志先置位，注册路径会看到标志并放弃，两者不会交错。
+    pub(crate) async fn lock_register(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.register_op.lock().await
     }
 
     /// 处理一个 `conf` 会话（握手与 vkey 鉴权已在桥内完成）。

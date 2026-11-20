@@ -1,0 +1,23 @@
+# NOTICE
+
+Rust-nps is an independent Rust implementation that is wire-compatible with
+the legacy NPS bridge protocol.
+
+It gratefully acknowledges **ehang-io/nps** (https://github.com/ehang-io/nps),
+licensed under the GNU General Public License v3.0. That project inspired this
+work and served as a behavioural reference for interoperability.
+
+No source code from ehang-io/nps is included in this repository. The original
+Go sources are kept outside the build tree (see `.gitignore`, `/resources/`),
+are never compiled into the shipped binaries, and are used only as a protocol
+reference.
+
+Protocol facts — frame layouts, handshake byte sequences, multiplexing window
+arithmetic and connection state machines — are functional specifications rather
+than copyrightable expression. All Rust code in this repository was written
+independently against those specifications and against black-box behaviour of
+real clients and servers.
+
+## Upstream project
+
+- ehang-io/nps — https://github.com/ehang-io/nps — GPL-3.0

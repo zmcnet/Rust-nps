@@ -256,12 +256,20 @@ impl Server {
         // 先置"关闭中"标志：此后 `set_tunnel_enabled` 会在 op 锁内被拒绝
         self.inner.shutdown.store(true, Ordering::Release);
 
-        // 先停隧道（关闭监听器与现存连接）；快照式遍历，注册路径看到关闭标志会自行退出
+        // 与 conf 注册串行：避免"注册刚 push、关闭已取完列表"导致 shutdown 返回后
+        // 仍留下一条监听器。持锁期间注册路径会看到关闭标志并放弃。
+        let _register_guard = match &self.inner.conf {
+            Some(conf) => Some(conf.lock_register().await),
+            None => None,
+        };
+
+        // 先停隧道（关闭监听器与现存连接）
         let list = self.inner.tunnels.lock().await.clone();
         for t in &list {
             let _guard = t.lock_op().await;
             t.disable().await;
         }
+        drop(_register_guard);
 
         // 再关桥（同时通过 closing 广播让 conf 注册会话退出）
         self.inner.bridge.shutdown().await;
