@@ -2,7 +2,7 @@
 
 延续 NPS 的自部署体验和可视化管理，用 Rust 逐步替换内核。面向个人和小团队：一个服务端程序，内嵌网页管理端，使用自己的 VPS、NAS 或内网设备。
 
-当前状态：**原版 8 个协议模式已在服务端实现（`tcpTrans` 仅有探测层），与真实原版 Go npc 0.26.10 / nps 0.26.10 双向完成端到端联调验证**。逐项证据见 [docs/PHASE2-ACCEPTANCE.md](docs/PHASE2-ACCEPTANCE.md)。
+当前状态：**原版 8 个协议模式已在服务端全部实现（`tcpTrans` 仅 Linux，与原版一致），与真实原版 Go npc 0.26.10 / nps 0.26.10 双向完成端到端联调验证**。逐项证据见 [docs/PHASE2-ACCEPTANCE.md](docs/PHASE2-ACCEPTANCE.md)。
 
 已用真实客户端实测通过的项（`../tools/interop/smoke.py`，24/24）：
 
@@ -16,14 +16,14 @@
 
 ## 能力范围
 
-- 原版 8 个 mode：tcp / udp / socks5 / httpProxy（域名代理）/ file / secret / p2p（会合信令）/ tcpTrans（探测层，**未接线**）。逐项证据见 [docs/PHASE2-ACCEPTANCE.md](docs/PHASE2-ACCEPTANCE.md)。
+- 原版 8 个 mode：tcp / udp / socks5 / httpProxy（域名代理）/ file / secret / p2p（会合信令）/ tcpTrans（透明代理，**仅 Linux**：目标由 `SO_ORIGINAL_DST` 反查，需 iptables REDIRECT 指入；原版 Windows 同样是空实现）。逐项证据见 [docs/PHASE2-ACCEPTANCE.md](docs/PHASE2-ACCEPTANCE.md)。
 - JSON 配置定义客户端与 tcp / udp / http 站点 / socks5 / secret / file 隧道；老 npc 也可用 `-config` 动态注册 task（tcp/udp/file）与 host 站点。
 - 网页管理：客户端/隧道/连接数/流量总览、隧道启停、站点 CRUD、证书上传/自签/ACME；多用户登录（管理员账号 + 客户端账号 + 超级令牌），权限在服务端强制，不只是前端隐藏。
 - 管理 API 使用独立管理令牌。客户端 vkey 和管理令牌分别设置。
 - 网页资源编入二进制，运行时不需要 Node、CDN 或独立静态目录。
 - 客户端 `rnpc`：直接参数、配置文件或 `--name` 实例模式；install/change/update/list/status 等持久化命令与自启通道见 [docs/rnpc-cli-spec.md](docs/rnpc-cli-spec.md)。
 
-已知边界：网页启停仅改变当前进程状态，重启后按配置恢复；conf 动态注册的隧道不持久化；TCP 流量累计每 5 分钟落盘（`flow_store_interval`），进程被 kill -9 会丢最后一段；限速/流量上限/IP 白名单目前只作用于 TCP 隧道转发路径。
+已知边界：网页启停仅改变当前进程状态，重启后按配置恢复；conf 动态注册的隧道不持久化；TCP 流量累计每 5 分钟落盘（`flow_store_interval`），进程被 kill -9 会丢最后一段；流量上限（`flow_limit`）的已用量不落盘，重启后重新从零计数。限速 / 流量上限 / IP 白名单按客户端生效，覆盖全部转发路径（TCP / conf 注册 / UDP / SOCKS5 / HTTP(S) 站点 / file / secret）；SOCKS5 / UDP / HTTP / secret 子流的 Link 帧未携带客户端 crypt/compress 标志，这些路径按明文转发。
 
 ## 构建
 

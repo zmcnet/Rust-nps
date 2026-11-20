@@ -1,14 +1,12 @@
-# Rust-nps 交接文档（第三版）
+# Rust-nps 交接文档（第四版）
 
-> 生成时间：2026-11-21（第三版：整份替换第二版。更新到当前真实状态，并补充
-> 本轮「目标攻坚」全部侦察结论——限速全路径接线图、tcpTrans 接线设计、
-> 中断现场。旧版内容凡仍然准确的均已保留，凡过时的均已改写）
-> 状态：**开发已全部停止，本文档就是交接物**（2026-11-21 用户两次叫停："你别干了，
-> 生成交接文档" → "你不需要继续干了，把东西全部写好交接文档，我要交给下一个
-> Agent 干"）。已提交基线：**617 测试全绿**（提交 `54d90db`）。
-> **当前工作树有 2 处未提交半成品**：nps-legacy 防爆破（**编译已修复**、实测
-> 78/82，4 个测试待修——诊断已到行号级，见 0.2a）；nps-web UI 重设计（CSS 已
-> 重写、子代理自评风格达标，但未核对 app.js、未验证，见 0.2b）。
+> 生成时间：2026-11-21（第四版：第三版记录的「目标攻坚」6 项任务**已全部完成**。
+> 中断现场的半成品已处理：防爆破 4 个失败测试修复（82/82）、UI 重设计核对验证
+> （68/68 + 浏览器截图验收）；限速/流量/白名单全路径覆盖、tcpTrans 接线、
+> 示例配置重生成均已实现并带测试；文档口径同步。本版仅改写头部与第〇部分、
+> 二十三/二十四/二十八/二十九/三十二节及附录 A 收尾，其余章节凡仍然准确的保留）
+> 状态：**本轮计划内开发全部完成**。测试基线：**642 项全绿**（617 基线 + 25 项
+> 新增）；真实 Go npc 黑盒联调 **149 项检查全部通过**。**工作树无未提交半成品**。
 
 ## 目录
 
@@ -30,150 +28,69 @@
 
 ---
 
-# 第〇部分：中断现场（2026-11-21）
+# 第〇部分：本轮目标攻坚结果（2026-11-21，第四版）
 
-## 0.1 已提交基线
+> 第三版记录的中断现场与 0.4 攻坚清单已全部处理完毕。设计细节（防爆破实现、
+> 二十四.5 的接线方案、二十四.6 的 tcpTrans 设计）仍然准确，可作为实现说明阅读；
+> 下列小节为完成情况与证据。
 
-| 项 | 值 |
-| --- | --- |
-| 分支 | `claude/workspace-root-project-overview-59b549`（git worktree：`D:\Developing\NPS\.claude\worktrees\workspace-root-project-overview-59b549`） |
-| 最新提交 | `54d90db docs: 文档对齐当前真实状态（617 基线 / tcpTrans 未接线 / cargo.ps1 弃用）` |
-| 该提交内容 | 11 个文件、+1612/−98：根/rust README、PHASE2-ACCEPTANCE、packaging/README、HANDOVER.md（worktree 版）、nps-server 模块注释、conf.rs 注释、nps-web app.js 注释、interop 工具口径、verify_modes.py 过时断言 |
-| 测试基线 | `cargo test --workspace` **617 项全绿**（在提交前验证过） |
-| 主检出 | `D:\Developing\NPS\`——**注意**：主检出的 HANDOVER.md 是旧第二版（tcpTrans 口径未同步），本文档（工作树版）才是最新；主检出受 worktree 隔离 hook 保护，**不能从会话里直接编辑** |
+## 0.1 已完成（对照第三版 0.4 清单）
 
-## 0.2 未提交改动（中断时子代理留下的半成品）
-
-### (a) nps-legacy：桥端口 vkey 防爆破 —— 编译已修复，实测 78/82，4 个测试待修
-
-```
-M  rust/crates/nps-legacy/src/bridge.rs   (+290 行)
-M  rust/crates/nps-legacy/src/lib.rs      (+3 行：mod ip_guard 声明)
-?? rust/crates/nps-legacy/src/ip_guard.rs  (新文件，未跟踪)
-```
-
-设计（子代理实现；主会话修复编译后实测）：按来源 IP 记握手失败（vkey 错/超时/
-协议错），滑动窗口 10 次/10 分钟达阈值后冷却拒绝，成功登录清零，IP 表上限
-10000 最旧淘汰，日志不含 vkey/md5 值。`Bridge::new` 签名不变，防护默认开启。
-
-**编译错误已修复**（原 bridge.rs:334-346）：`MutexGuard` 活到了
-`stream.shutdown().await`——rustc 对 async 生成器的存活分析按类型整体判非
-Send，**即使 await 前已显式 drop 也不行**。修法是「锁出块、决策留块外」：
-
-```rust
-if let Some(ip) = &peer_ip {
-    // 账本锁只在同步决策的内层块里存活：rustc 对 async 生成器的存活
-    // 分析在「guard 作用域覆盖 await 点」时按类型整体判非 Send——
-    // 即使 await 前已显式 drop 也不行。锁出块、await 留在块外。
-    let blocked = {
-        let mut g = self.guard();
-        if !g.is_blocked(Instant::now(), ip) {
-            false
-        } else {
-            if matches!(
-                g.record_failure(Instant::now(), ip),
-                FailureOutcome::CooldownExtended
-            ) {
-                debug!("来源 {ip} 冷却期内重试，直接关闭并顺延冷却期");
-            }
-            true
-        }
-    };
-    if blocked {
-        let _ = stream.shutdown().await;
-        return;
-    }
-}
-```
-
-其余 `guard()` 使用点（约 363 / 385 / 400 行附近）作用域内没有 await，无需改。
-**由此固化一条硬规则（已录入三十节与记忆）**：std MutexGuard 不得跨 await。
-
-**当前实测**（`cd rust && CARGO_TARGET_DIR="C:\Users\kybll\.cargo-target\nps-overview-wt" cargo test -p nps-legacy --offline`）：
-**78 通过 / 4 失败**。4 个失败全部在子代理新写的测试里，是代码逻辑 bug（不是
-编译问题）。诊断如下（前 3 个疑似同一处 sweep/窗口 bug；第 4 个子代理死前留下
-了强假设，未验证）：
-
-| 失败测试 | 位置 | 症状 | 诊断 |
+| # | 任务 | 结果 | 证据 |
 | --- | --- | --- | --- |
-| `window_slides_old_failures_expire` | ip_guard.rs:334 | 期望 `Counted`，实际 `CooldownStarted` | 过期窗口的失败没被滑出就触发了冷却——记账时只看总次数，没按窗口过期重算 |
-| `sweep_removes_expired_records_and_keeps_cooling_ones` | ip_guard.rs:393 | 过期记录没被清掉 | sweep 的过期判定与时间戳口径不一致 |
-| `full_map_sweeps_expired_first_before_evicting` | 同上 | 表满时没先清过期再淘汰 | 同一 sweep bug 的满表分支 |
-| `successful_handshake_clears_failure_record` | bridge.rs:953 | 读到 UnexpectedEof | **强假设**：测试驱动 `npc_handshake_to_verify` 模拟的客户端读到 "sucs" 后直接断开、不发 conn_type；若 `server_handshake` 把「读 conn_type」也算进握手，则 vkey 校验虽成功、握手却以 Err 结束，`clear()` 走不到 → 失败记录残留 → 第 3 次失败触发冷却 → 第 4 条连接被闸门直接关闭（EOF 恰在读 digest 处）。**下一步：读 handshake.rs 确认 verify 回调调用点与错误映射，再决定改测试驱动还是改 clear 时机** |
+| 1 | Goal 细化入库 + tcpTrans 接线点侦察 | ✅ | 记忆 + 二十四.6 |
+| 2 | tcpTrans 接线 | ✅ `tcp_trans_tunnels` 配置 + 监听 + `SO_ORIGINAL_DST` 转发 + 快照/流控；非 Linux 明确降级（warn + last_error） | `tests/tcp_trans.rs` 3 项全绿；Linux 真机 iptables E2E 仍待环境（见 24.2） |
+| 3 | 限速/流量/IP 白名单全路径覆盖 | ✅ `ClientControls` 一张 per-client 表，接进 UDP / SOCKS5（CONNECT+UDP ASSOCIATE）/ HTTP(S) 站点（含 body 逐段）/ file / secret / conf 注册 | `tests/controls.rs` 5 项全绿（UDP 白名单丢包、HTTP 403/503、SOCKS5 静默关闭、conf 继承白名单、TCP↔HTTP 跨路径共享流量上限） |
+| 4 | 桥端口 vkey 防爆破 | ✅ 4 个失败测试修复：ip_guard.rs 三处 `saturating_duration_since` 方向写反（front↔now）；bridge 清零时机提前到 verify 回调（vkey 校验通过即清零，不再等 conn_type 读毕） | `cargo test -p nps-legacy` **82/82** |
+| 5 | 管理页 UI 去 AI 风 | ✅ class/id/data-state 双向核对无缺失（仅删 1 条死样式）；`cargo test -p nps-web` **68/68**；真实预览环境浏览器截图验收（登录页/总览/隧道/证书，中性灰底+钢蓝单强调色+直角表格，无渐变/emoji/CDN） | 子代理核对报告 + 截图 |
+| 6 | 全量回归 + 文档同步 | ✅ `cargo test --workspace` **642 全绿 0 失败**；黑盒联调 smoke 24 / udp 7 / http 19 / https 8 / socks5 29 / secret 6 / p2p 6 / target 4 / crypt 4 / rate-limit 3 / rust-client 39 全过；README / PHASE2-ACCEPTANCE / 本文档口径同步 | 本节 |
 
-修完 4 个测试后验收：`cargo test -p nps-legacy --offline` 全绿 +
-`cargo test --workspace --offline` 全绿（防爆破是当前唯一已知未过项）。
+顺手完成的：`nps.example.json` 从 4 个字段重写为全字段示例（含 `_notes` 说明），
+并新增防漂移测试 `tests/example_config.rs`（4 项，反序列化 + validate 双断言）；
+`rust-client-smoke.py` 的「不可解析主机名」退出码期望由 2 改为 3（与实现一致：
+DNS 失败归「服务端不可达」，与关闭端口同类，`client.rs::exit_code` 有单测锁定）。
 
-### (b) nps-web：管理页 UI 去 AI 风重设计 —— CSS 已重写（子代理自评风格达标），未验证
+## 0.2 新增/修改的关键文件
 
-```
-M rust/crates/nps-web/static/app.css      (754 行 diff，整份重写)
-M rust/crates/nps-web/static/favicon.svg  (改动)
-```
-
-index.html / app.js **未动**。子代理被停止前的最后状态：CSS 已重写且自评
-「风格基本达标（中性灰、钢蓝、直角、无阴影）」；**下一步（未做）**：核对
-app.js 动态创建/引用的 class、id、data-state 是否都被新 CSS 覆盖，然后
-`cargo test -p nps-web` 全绿 + 浏览器实测（工具见 0.4 第 5 项简报）。
-
-处理选项：a) 接着完成（先做 class/id 核对）；b) 不要了就
-`git checkout -- rust/crates/nps-web/static/` 还原。
-
-### (c) 其余
-
-无。主会话（限速全路径覆盖，即 0.4 的第 3 项）**只完成了侦察、零代码改动**
-（刚确认完 lib.rs 导出清单就被叫停，没有写下任何实现代码）；侦察结论完整
-保留在二十四.5，接手可直接照着写。
+| 文件 | 改动 |
+| --- | --- |
+| `crates/nps-server/src/limit.rs` | 新增 `ClientControls`（per-client rate/flow/ip_allow 打包）与 `Throttle`（单方向节流视图：gate/count） |
+| `crates/nps-server/src/server.rs` | `controls_map` 组装 + 全模块接线；tcpTrans 隧道并入统一 Tunnel 表 |
+| `crates/nps-server/src/{udp,socks5,http_site,secret,conf}.rs` | 各转发路径接入 controls（白名单/超限判定 + 泵内 throttle） |
+| `crates/nps-server/src/tunnel.rs` | 新增 `transparent` 模式（目标来自 SO_ORIGINAL_DST）与 `with_transparent` 构造 |
+| `crates/nps-server/src/config.rs` | 新增 `TcpTransTunnelConfig` + `tcp_trans_tunnels` 字段 + 校验（id/客户端/地址冲突） |
+| `crates/nps-server/src/transparent.rs` | 新增 `original_dst_tokio`（tokio 流直接取 fd，避免 into_std 换所有权） |
+| `crates/nps-legacy/src/{ip_guard,bridge}.rs` | 防爆破修复（见 0.1 第 4 行） |
+| `crates/nps-web/static/*` | UI 收尾（仅 app.css 删 1 条死样式） |
+| `rust/nps.example.json` + `tests/example_config.rs` | 示例配置重生成 + 防漂移 |
+| `rust/README.md`、`docs/PHASE2-ACCEPTANCE.md`、本文档 | 口径同步（8/8 mode、全路径流控、642 基线） |
 
 ## 0.3 当前能否构建 / 测试
 
-**能构建**。nps-legacy 编译错误已修复（见 0.2a），实测 `cargo test -p
-nps-legacy --offline` **78 通过 / 4 失败**（4 个全是防爆破新测试的逻辑 bug，
-诊断见上表）。其余 crate（nps-server / nps-web / nps-app）在此状态**未复跑过**：
-上一全绿点是 617 基线（提交 `54d90db`）；工作树对它们的改动只有 nps-web 的
-static 资源（CSS/favicon，不涉及测试逻辑），但**不要默认它必然全绿**——接手后
-先跑一遍全量再动工：
+**能，且全绿**：
 
 ```bash
 cd rust   # 注意：Cargo.toml 在 rust/ 子目录，从仓库根跑会报 "could not find Cargo.toml"
-CARGO_TARGET_DIR="C:\Users\kybll\.cargo-target\nps-overview-wt" cargo test --workspace --offline
+CARGO_TARGET_DIR="C:/Users/kybll/.cargo-target/nps-overview-wt" cargo test --workspace --offline
+# 642 passed, 0 failed；cargo check --workspace --all-targets 0 warning
 ```
 
-## 0.4 被中断的任务（Goal 攻坚清单）
+黑盒联调（真实 Go npc，`tools/interop/`）：
 
-本轮 Goal（2026-11-21 用户 /goal 指令，见 A.11.8）：**媲美原版 NPS 的功能；
-外观尽量不要使用 AI 风格；验收标准 = 能够直接替代原版 NPS 且能够兼容旧版的
-NPS 客户端**。旧客户端兼容已达成并持续保持（真实 Go npc 全套 smoke）。
-按此排出的缺口与执行状态：
+```bash
+SERVER=C:/Users/kybll/.cargo-target/nps-overview-wt/debug/rnps.exe
+NPC=D:/Developing/NPS/tools/interop/bin/npc.exe   # npc.exe 不进 git，在主检出的 bin/ 下
+python -I tools/interop/smoke.py --server-bin "$SERVER" --npc-bin "$NPC"
+```
 
-| # | 任务 | 状态 |
-| --- | --- | --- |
-| 1 | Goal 细化入库 + 摸清 tcpTrans 接线点 | ✅ 完成（记忆文件 + 二十四.6） |
-| 2 | tcpTrans 接线：配置 + 监听器 + 转发 + 测试 | ⏸ 未动工（设计已就绪，见二十四.6） |
-| 3 | 限速/流量/IP 白名单覆盖全部转发路径 | ⏸ **侦察完成、零代码**（完整接线图见二十四.5，照着写即可） |
-| 4 | 桥端口 vkey 防爆破 | ⚠️ **编译已修复**；78/82，4 个测试待修（诊断到行号，见 0.2a） |
-| 5 | 管理页 UI 去 AI 风重设计 | ⚠️ CSS 已重写（子代理自评风格达标）；app.js 核对 + 验证未做（见 0.2b） |
-| 6 | 全量回归 + 验收表/交接文档同步 | ⏸ 未动 |
+UI 预览环境：`python -I tools/interop/smoke.py --server-bin "$SERVER" --npc-bin "$NPC" --preview-seconds 600`，
+登录信息在该次运行的 `logs/run-<时间戳>/ui-session.json`（web_addr + admin_token）。
 
-### 子代理任务简报存档（重派时可直接复用）
+## 0.4 仍然开放的事项（更新后的下一步）
 
-**第 4 项简报（vkey 防爆破）要点**：只动 `nps-legacy`；不引新依赖（--offline
-构建）；握手字节层与原版 0.26.10 完全兼容（先通读 bridge.rs/handshake.rs 注释与
-测试）；失败记账 → 滑动窗口阈值（建议 10 次/10 分钟，NAT 出口共享 IP 场景别太紧）
-→ 冷却期内新连接直接关闭；成功清零；IP 上限 10000 最旧淘汰；日志不得出现
-vkey/md5 值；`Bridge::new` 签名不变；单测覆盖计数/阈值/冷却放行/清零/淘汰/过期。
-**教训补充**：多写一条「guard 不跨 await」的检查（本次就栽在这，见 0.2a）。
-
-**第 5 项简报（UI 重设计）要点**：只动 `nps-web/static/`；硬规则：DOM 一律
-textContent 禁 innerHTML、无 CDN/字体/框架、vanilla JS、全部功能与 API 调用
-路径不变、app.js 依赖的 id/class 保持一致。「AI 风格」要避免：紫蓝渐变、玻璃
-拟态、emoji 图标、rounded-2xl 卡片海、Inter+hero 大标题那套 SaaS 脸。目标：
-克制专业的运维工具——信息密度高、表格为主、中性灰底、单一低饱和强调色、
-圆角 2-4px、阴影极轻、语义色常规、中文文案含义不变。验收：`cargo test -p nps-web`
-全绿 + 最好实际起服务用浏览器看一遍（`tools/interop/smoke.py --preview-seconds N`
-可搭真实预览环境，环境信息写在该次运行的 `logs/run-<时间戳>/ui-session.json`）。
-
----
+见「二十九、建议的下一步」——环境受限项（Linux 真机 tcpTrans E2E、管理员自启
+通道、17 架构实测）与需产品决策项（HTTP 更新源签名方案）不变；
+本轮 Goal 口径下的**代码缺口已全部清零**。已知保真度缺口（非缺陷）见二十四.7。
 
 # 第一部分：这个项目是干什么的
 
@@ -910,12 +827,11 @@ D:\Developing\NPS\
 
 | 门禁 | 结果 | 怎么跑 |
 | --- | --- | --- |
-| 全量测试 | **617 项全绿，0 失败**（`54d90db` 提交前的全量基线） | 见下 |
+| 全量测试 | **642 项全绿，0 失败**（2026-11-21，防爆破修复 + 流控全路径 + tcpTrans 接线之后） | 见下 |
 | 零警告 | **0 error / 0 warning** | `cargo check --workspace --all-targets --offline` |
-| 真实 npc 联调 | 全部通过（见 23.2） | — |
+| 真实 npc 联调 | 全部通过（见 23.2，合计 149 项检查） | — |
 
-> ⚠️ **当前树不是全绿**：nps-legacy 实测 **78 通过 / 4 失败**（防爆破新测试的
-> 逻辑 bug，编译本身已修复——诊断见第〇部分 0.2a）。先修完 4 个测试，再：
+> 当前树**全绿**。复跑方式：
 >
 > ```bash
 > cd rust
@@ -1027,7 +943,7 @@ p2p-smoke    6/6
 | 流量持久化精度 | 定时落盘（默认 300s），`kill -9` 会丢最后一段 |
 | 阿里云 DNS-01 | 如实返回 `Unsupported`，不假装成功 |
 
-### 24.5 ★ 限速/流量/IP 白名单覆盖全部转发路径 —— 完整接线方案（侦察完成，未动工）
+### 24.5 ★ 限速/流量/IP 白名单覆盖全部转发路径 —— ✅ 已实现（下文为当时的接线方案，与最终实现基本一致）
 
 **现状**（本轮逐文件核实过，不是猜的）：
 
@@ -1131,7 +1047,7 @@ HTTP / conf / secret 这类「一个实例服务多个客户端」的模块直�
 `crates/nps-server/src/lib.rs` 模块注释、`docs/PHASE2-ACCEPTANCE.md` 边界行、
 本文档十四节。
 
-### 24.6 ★ tcpTrans 接线设计（侦察完成，未动工）
+### 24.6 ★ tcpTrans 接线设计 —— ✅ 已实现（下文为当时的设计，实现按此落地）
 
 **现状**：`transparent.rs`（202 行）只有探测层，全仓库无调用方、无监听器、无配置项：
 
@@ -1323,32 +1239,26 @@ git -c http.proxy=http://127.0.0.1:7897 \
 
 ## 二十八、未提交的改动
 
-见**第〇部分 0.2**（本文档生成时的实时快照）：
-
-1. `rust/crates/nps-legacy/`：防爆破半成品，**编译已修复**、实测 78/82（4 个
-   测试待修，诊断到行号，见 0.2a）；
-2. `rust/crates/nps-web/static/app.css` + `favicon.svg`：UI 重设计半成品，
-   CSS 已重写但未核对 app.js、未验证（0.2b）。
-
-其余全部已提交（最新 `54d90db`）。
+**无**（第四版更新）。第三版记录的两处半成品（nps-legacy 防爆破、nps-web UI CSS）
+已全部完成并随本轮改动一起提交；当前工作树与提交一致，`cargo test --workspace`
+642 全绿。
 
 ## 二十九、建议的下一步（按价值排序）
 
 **Goal 口径**（2026-11-21 /goal，见 A.11.8）：媲美原版功能 + UI 去 AI 风 +
 能直接替代原版 + 兼容旧 npc。据此排序：
 
+Goal 口径下的代码缺口已全部清零（第四版，2026-11-21）。剩余事项均卡在环境或
+需要产品决策：
+
 | 优先级 | 任务 | 理由 |
 | --- | --- | --- |
-| **高** | **恢复全绿**：修完 nps-legacy 防爆破的 4 个失败测试（诊断已到行号，见 0.2a） | 编译已修复；全绿是一切验证之前提 |
-| **高** | **限速/流量/白名单全路径覆盖**（二十四.5） | Goal 缺口；侦察已完成，照方案写即可；也决定 tcpTrans 接线时的构造形态 |
-| **高** | 管理页 UI 去 AI 风（0.2b 接着做或重做） | Goal 明确要求「外观尽量不要使用 AI 风格」 |
-| **高** | tcpTrans 接线（二十四.6，在限速之后做） | 唯一「代码缺口」型 mode 缺失；接线方案已备好 |
+| 高 | Linux 真机跑 tcpTrans iptables REDIRECT 端到端 | 唯一没跑过端到端的 mode；代码与测试已就绪（24.2 有操作步骤） |
 | 中 | 用管理员账号验证 `service` / `task-start` 成功路径 | 唯一「实现了但完全没跑过」的功能 |
-| 中 | Linux 恢复可达后跑 tcpTrans 真机 E2E + `build-matrix.sh` | 卡在环境 |
-| 中 | 桥端口防爆破（若 0.2a 选择放弃重做） | 安全项；简报在 0.4 |
-| 中 | 定更新签名方案（Ed25519 + 内嵌公钥）后实现 HTTP 更新源 | 目前只有本地目录更新源 |
+| 中 | Linux 恢复可达后跑 `build-matrix.sh` + 全量测试 | 卡在环境（远端主机不可达） |
+| 中 | 定更新签名方案（Ed25519 + 内嵌公钥）后实现 HTTP 更新源 | 目前只有本地目录更新源，需产品决策 |
 | 中 | FlowCounter 持久化（24.7） | flow_limit 重启归零，与「完美替代」有差距 |
-| 低 | 从 `ServerConfig` 重新生成 `nps.example.json` | 现有示例只有 4 个字段 |
+| 中 | SOCKS5/UDP/HTTP/secret 子流的 crypt/compress 保真（24.7） | Link 帧硬编码 false，这些路径按明文转发 |
 | 低 | 客户端 KCP / p2p；阿里云 DNS-01 | 工作量大/需 API |
 
 ## 三十、交接注意事项（不要做的事）
@@ -1424,17 +1334,17 @@ git -c http.proxy=http://127.0.0.1:7897 \
 **为什么要重写原版**：原版是 Go + GPLv3；用户想「延续并革新」而不是竞争。
 Rust 能出单文件、零依赖、1.7 MB 内存的版本，并按 MIT 发布。
 
-**做到哪了**：7 个协议模式完整实现（tcpTrans 只有探测层未接线），全部有真实
-Go npc 驱动的黑盒验证；运维特性齐全（限速/流量/白名单当前仅覆盖 TCP 路径，
-接线方案已备好）；HTTPS/证书/多用户是原版能力的超集；客户端持久化与进程管理
-真实验证过；617 项测试全绿、0 warning（`54d90db` 基线）。
+**做到哪了**：8 个协议模式全部实现（tcpTrans 仅 Linux，与原版口径一致），全部有
+真实 Go npc 驱动的黑盒验证；运维特性齐全，限速/流量/白名单按客户端覆盖**全部
+转发路径**；HTTPS/证书/多用户是原版能力的超集；客户端持久化与进程管理
+真实验证过；桥端口有 vkey 防爆破；642 项测试全绿、0 warning。
 
-**当前卡点**：工作树有 2 处未提交半成品——nps-legacy 防爆破编译已修复但
-4 个测试失败（诊断在 0.2a），nps-web UI 的 CSS 已重写未验证（0.2b）。
+**当前状态**：工作树无未提交半成品；本轮 Goal（媲美原版 + UI 去 AI 风 +
+直接替代 + 兼容旧 npc）的代码缺口已全部清零，黑盒联调 149 项检查全过，
+管理页通过真实浏览器截图验收。
 
-**还差什么**：Goal 口径下的缺口——限速全路径、UI 去 AI 风、tcpTrans 接线
-（方案都在第八部分）；三项卡在环境（管理员自启通道、Linux 真机、17 架构实测）；
-一项需要产品决策（HTTP 更新源要先定签名方案）。
+**还差什么**：只剩环境受限项（Linux 真机 tcpTrans E2E、管理员自启通道、
+17 架构实测）与需产品决策项（HTTP 更新源签名方案），见二十九节。
 
 **最重要的一句话**：它现在能自用、能小规模试用，但**不要当生产级方案**——
 没有长时间 soak、没有真实公网跨 NAT 验证，且桥协议是明文的。
@@ -1883,5 +1793,43 @@ Copy-Item "D:\Developing\NPS\.claude\worktrees\workspace-root-project-overview-5
 | 22 | 停活 → 写第三版交接文档替换旧版 | 用户 | 本文档 |
 | 23 | 最终停活：全部开发终止，交接物 = 本文档，交给下一个 Agent | 用户（A.11.13） | 本文档即最终状态 |
 
-> 待用户拍板的仍开放项：HTTP 更新源签名方案（24.3）、防爆破收尾方式（修完 4 个
-> 测试 or 整体还原，0.2a）、UI 半成品去留（0.2b）。
+> 待用户拍板的仍开放项：HTTP 更新源签名方案（24.3）。
+> （第四版补记：防爆破已修完 4 个测试、UI 半成品已续完并验收，上表 0.2a/0.2b
+> 两项不再开放。）
+
+---
+
+## A.13 第四版（2026-11-21 续）新增指令记录
+
+第三版交接之后，新会话按 0.4 清单接手。用户指令逐条：
+
+### A.13.1 接手
+
+> 「阅读交接文件，然后完成整个交接」
+
+—— 按第三版第〇部分接手：先修防爆破 4 个失败测试恢复全绿，再按 0.4 顺序推进。
+
+### A.13.2 继续推进
+
+> 「请继续吧」
+
+—— 确认按计划继续（出现两次，均为继续当前主线）。
+
+### A.13.3 ★ 派工方式
+
+> 「然后算上主会话，限制排出2个子代理，不要用现有的，排通用子代理」
+
+—— 并行度上限 = 主会话 + 2 个子代理；不使用现有具名角色，用通用子代理。
+本轮实际派工：子代理 A = 管理页 UI 收尾核对（nps-web/static），
+子代理 B = nps.example.json 重生成 + 防漂移测试；两者文件域与主会话零交集。
+主会话 = 防爆破修复、流控全路径、tcpTrans 接线、回归、联调、文档。
+
+### A.13.4 本轮完成（对应 0.1 表）
+
+全部 6 项完成 + 2 项顺手（example.json、rust-client-smoke 退出码口径）。
+决策速查表新增：
+
+| # | 决策 | 谁定的 | 影响面 |
+| --- | --- | --- | --- |
+| 24 | 完成「整个交接」= 执行第三版 0.4 全部 6 项 | 用户（A.13.1） | 本轮范围 |
+| 25 | 并行度 = 主会话 + 2 通用子代理，不用具名角色 | 用户（A.13.3） | 派工方式 |

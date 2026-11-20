@@ -6,7 +6,7 @@
 
 ---
 
-## 一、协议模式（原版 8 个 mode：7 项完整实现；tcpTrans 仅有探测层）
+## 一、协议模式（原版 8 个 mode 全部实现；tcpTrans 仅 Linux，与原版一致）
 
 | 原版 mode | 实现位置 | 证据 | 状态 |
 | --- | --- | --- | --- |
@@ -15,7 +15,7 @@
 | `socks5` | `socks5.rs` | `socks5-smoke.py` 29/29（含 UDP ASSOCIATE、用户名密码认证） | ✅ |
 | `httpProxy` | `http_site.rs` | `http-smoke.py` 19/19（含 WebSocket、chunked、2MiB 响应） | ✅ |
 | `file` | `file_service.rs` | 真实 npc `-config` 的 `[file]` 段，HTTP GET 下载到磁盘文件内容 | ✅ |
-| `tcpTrans` | `transparent.rs` | 探测层：Linux `getsockopt(SOL_IP, SO_ORIGINAL_DST)`，非 Linux 返回 Unsupported。**未接入任何转发路径，端到端不可用** | ⚠️ |
+| `tcpTrans` | `transparent.rs` + `tunnel.rs`（transparent 模式） | 配置 `tcp_trans_tunnels` → 监听 → 每连接 `SO_ORIGINAL_DST` 反查原始目标 → `Link::tcp(原始目标)` 交客户端拨号；复用普通隧道的 accept / 泵 / 限速 / 包装（`tests/tcp_trans.rs`）。**仅 Linux**：非 Linux 平台启动时警告、隧道不启用并写入明确 last_error（原版 `transport_windows.go` 同样是空实现）。Linux 真机 iptables REDIRECT 端到端待环境 | ✅（E2E 待真机） |
 | `secret` | `secret.rs` | `secret-smoke.py` 6/6，131072 字节逐字节一致 | ✅ |
 | `p2p` | `p2p.rs` | `p2p-smoke.py` 6/6（三端口会合，双方地址互发正确） | ✅ |
 
@@ -24,7 +24,8 @@
 - **`secret` 拓扑是反的**：客户端本地监听，服务端只按 `md5(password)` 配对。
   因此 `SecretTunnelConfig` 没有 `listen_addr`。
 - **`tcpTrans` 探测仅 Linux**：原版 `transport_windows.go` 就是空实现（`return nil`）。
-  本实现目前也只完成探测层（`transparent.rs`），未接入任何转发路径。
+  本实现接线后同样仅 Linux 生效；未经 REDIRECT 的直连被关闭（不回退默认目标，
+  否则语义就错了）。
 - **`p2p` 需要三个连续 UDP 端口**：原版 `server.go` 起了 `p2p_port`、`+1`、`+2` 三个
   `P2PServer`；客户端向三个端口各发一次会合请求，收齐后合并成 KCP 连接。
 - **`file` 不发 Link 首帧**：原版 `bridge.go` 在 `mode=="file"` 时 `tunnel.NewConn()`
@@ -44,6 +45,22 @@
 | 流量持久化 | `flow_store_interval` | `flow_store.rs` | 单测：save/load 往返、损坏文件不阻塞启动、关闭前落盘 |
 | 加密 | `crypt` | `crypt.rs`（自签 TLS） | `crypt-smoke.py` 4/4 × 5 轮稳定 |
 | 压缩 | `compress` | `crypt.rs`（snappy framed） | `crypt-smoke.py` 4/4 × 5 轮稳定 |
+
+### 流控全路径覆盖（2026-11-21 接线）
+
+限速 / 流量上限 / IP 白名单按**客户端**生效（per-client 一份配额，
+`ClientControls`），覆盖全部转发路径，集成测试见 `tests/controls.rs`：
+
+| 路径 | 限速 | 流量上限 | IP 白名单 | 证据 |
+| --- | --- | --- | --- | --- |
+| TCP 静态隧道 | ✅ | ✅ | ✅ | 原有 `hardening.rs` / `limit.rs` |
+| TCP conf 动态注册 | ✅ | ✅ | ✅ | `controls.rs::conf_registered_tunnel_inherits_ip_whitelist` |
+| UDP | ✅ | ✅（超限拒绝新建流） | ✅（静默丢包） | `controls.rs::udp_ip_whitelist_drops_datagrams_without_opening_stream` |
+| SOCKS5（CONNECT + UDP ASSOCIATE） | ✅ | ✅（建流前拒绝，REP=0x02） | ✅（协商前静默关闭） | `controls.rs::socks5_ip_whitelist_closes_without_reply` |
+| HTTP/HTTPS 站点 | ✅（请求头/体 + 响应头/体逐段） | ✅（resolve 后 503） | ✅（403） | `controls.rs::http_site_ip_whitelist_returns_403`、`flow_limit_is_shared_across_tcp_and_http` |
+| file | ✅ | ✅ | ✅ | 构造处传真值（`server.rs` / `conf.rs`），模块内逻辑与 TCP 同套 |
+| secret | ✅ | ✅ | —（不适用：连接来自已认证 npc） | `secret.rs` relay 双向 throttle |
+| tcpTrans | ✅ | ✅ | ✅ | 复用 TCP 隧道同一套 `Tunnel` 实现 |
 
 ### `crypt` / `compress` 的协议事实（从源码核实）
 
@@ -176,7 +193,7 @@ token → /api/sites  → 200
 
 | 门禁 | 结果 |
 | --- | --- |
-| `cargo test --workspace` | **617 项全绿，0 失败** |
+| `cargo test --workspace` | **642 项全绿，0 失败**（2026-11-21，含流控全路径 `controls.rs`、tcpTrans `tcp_trans.rs`、示例配置防漂移 `example_config.rs`） |
 | `cargo check --workspace --all-targets` | **0 error / 0 warning** |
 | 真实 npc 联调 | `smoke.py` 24/24 |
 | 协议专项 | secret 6/6、udp 7/7、http 19/19、https 8/8、target 4/4、crypt 4/4、p2p 6/6 |
@@ -225,11 +242,13 @@ token → /api/sites  → 200
 
 | 项 | 说明 |
 | --- | --- |
-| `tcpTrans` 未接线 | 仅完成 SO_ORIGINAL_DST 探测层（仅 Linux；**原版在 Windows 上也是空实现**），未接入任何转发路径，端到端不可用 |
+| `tcpTrans` 端到端 | 接线已完成（配置/监听/转发/快照/流控，见第一节）；**Linux 真机 iptables REDIRECT 端到端待环境**。非 Linux 平台不启用并给明确原因（原版在 Windows 上也是空实现） |
 | `p2p` 只做会合信令 | 不实现 KCP 传输——原版也是客户端与提供方拿到地址后自建 KCP |
 | `p2p` 穿透成功率 | 取决于双方 NAT 类型，协议固有限制，原版相同 |
 | 客户端 KCP / P2P | 客户端侧未实现（服务端会合信令已实现） |
 | `crypt` 是自签 TLS | 提供加密但不做身份认证（原版语义），身份靠 vkey |
+| SOCKS5/UDP/HTTP/secret 的 Link 帧 | 硬编码 `crypt=false, compress=false`（TCP 隧道带真值）——这些路径按明文转发，两端语义一致、不是断连 bug，是保真度缺口 |
+| `FlowCounter` 不持久化 | `flow_limit` 的已用量重启归零（与展示用 `flow_store` 是两套计数） |
 | Cloudflare DNS-01 | 代码已写但**无真实令牌验证** |
 | 阿里云 DNS-01 | 如实返回 `Unsupported`，不假装成功 |
 | 生产 Let's Encrypt | 未实测（本机无公网域名），用 Pebble 验证完整流程 |
@@ -243,7 +262,8 @@ token → /api/sites  → 200
 
 ## 十、结论
 
-**功能覆盖**：原版 8 个 mode 中 7 个完整实现（`tcpTrans` 仅有探测层、未接线），运维特性 8 项全部实现，
+**功能覆盖**：原版 8 个 mode 全部实现（`tcpTrans` 仅 Linux，与原版口径一致），运维特性 8 项全部实现，
+限速 / 流量上限 / IP 白名单覆盖全部转发路径，
 管理界面、证书管理与多用户权限为原版能力的超集（原版无 ACME、无站点 CRUD API、
 无服务端强制的权限隔离）。
 
@@ -251,10 +271,11 @@ token → /api/sites  → 200
 `update` 有真校验、真备份、真还原；自启四通道中 `run-key` 已验证。
 
 **验证强度**：所有协议均有真实原版 npc 驱动的黑盒验证；
-617 项测试全绿；浏览器 12 场景 92 断言；Linux 实机验证；
+642 项测试全绿（0 失败）；浏览器 12 场景 92 断言 + 真实预览环境截图验收；Linux 实机验证；
 多用户权限用真实二进制端到端验证（403/200 实测）。
 
-**未达成「完美替代」的部分**：三个需管理员的自启通道成功路径、
-HTTP 更新源与签名、17 架构的本地实测——均受限于当前环境（无管理员、
-无公网域名、无交叉工具链）或未定的设计决策，已在第八节逐项标注。
+**未达成「完美替代」的部分**：tcpTrans 的 Linux 真机 iptables 端到端、
+三个需管理员的自启通道成功路径、
+HTTP 更新源与签名、17 架构的本地实测——均受限于当前环境（非 Linux / 无管理员、
+无公网域名、无交叉工具链）或未定的设计决策，已在第九节逐项标注。
 
