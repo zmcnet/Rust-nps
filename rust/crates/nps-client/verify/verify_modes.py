@@ -5,36 +5,39 @@ Scope / ownership
 -----------------
 This file lives inside `rust/crates/nps-client/verify/` (the client agent's own
 directory). It never writes to `tools/interop/`, `resources/nps/` or any other
-crate. All runtime state (server conf, DB files, logs) goes to a fresh temp
-directory, never into the source tree.
+crate. All runtime state (server conf, DB files, logs) goes to a fresh directory
+under the system temp dir, never into the source tree.
 
-What is verified (all against `tools/interop/server/nps.exe`, the real Go nps
-0.26.10 server, unless `--skip-go` is passed):
+What is verified against `tools/interop/server/nps.exe` (real Go nps 0.26.10):
 
-  [mode3-pub]  rnpc -config npc.json  (server has public_vkey set)
-               -> conf handshake, NEW_CONF, server-assigned 16-byte vkey,
-                  NEW_TASK, then main+chan; a tcp tunnel appears on the server
-                  and moves 768 KiB byte-exactly (sha256 both ways).
-  [mode3-priv] rnpc -config npc.json  (pre-created client, ConfigConnAllow=true)
-               -> conf handshake, isPub=false (no NEW_CONF), NEW_TASK only.
-  [mode2]      rnpc -s <host> -p <port> with an explicit vkey
-               -> identical behaviour to -server=<host:port> (tunnel works).
-  [mode4-ok]   rnpc -s <host> -p <port> with no vkey and NPS_PUBLIC_VKEY set
-               -> rgst is refused by the Go server, fallback public-vkey conf
-                  registration succeeds, client stays online (main+chan up).
-  [mode4-deny] same but NPS_PUBLIC_VKEY wrong -> exit code 7, no retry loop.
-  [cli]        -server host:port + -p   -> exit 2 (explicit conflict)
-               invalid JSON config      -> exit 8 with line/column
-               JSON config > 1 MiB      -> exit 8
-               unknown / reserved subcommand -> exit 2
-  [redaction]  neither the config vkey nor the server-assigned vkey appears in
-               the client log or on stderr.
+  [mode3-pub]   rnpc -config npc.json, server has `public_vkey`
+                -> conf handshake, isPub=true, NEW_CONF, server-assigned
+                   16-byte vkey, NEW_TASK, then main+chan. The tunnel shows up
+                   on the server and moves 768 KiB byte-exactly (sha256).
+  [mode3-priv]  rnpc -config npc.json, pre-created client with
+                ConfigConnAllow=true -> isPub=false (no NEW_CONF), NEW_TASK.
+  [mode2]       rnpc -s <host> -p <port> -vkey <key> serves a tunnel that the
+                server already has configured (server-pushed model); 768 KiB
+                byte-exact. This is the same tunnel that -server=host:port
+                would serve (the two forms are asserted equivalent in unit
+                tests and by the CLI conflict check below).
+  [mode4-ok]    rnpc -s <host> -p <port> with no vkey and NPS_PUBLIC_VKEY set
+                -> rgst refused by the Go server, fallback public-vkey conf
+                   registration assigns a vkey, client stays online.
+  [mode4-deny]  same but wrong NPS_PUBLIC_VKEY -> exit 7, no retry loop.
+  [cli]         -server host:port + -p  -> exit 2
+                invalid JSON config     -> exit 8 with line/column
+                JSON config > 1 MiB     -> exit 8
+                reserved subcommand     -> exit 2 + "尚未实现"
+                unknown subcommand      -> exit 2 + "rnpc help"
+                -type udp               -> exit 5
+  [redaction]   the config vkey never appears in client logs or on stderr.
 
 Usage (isolated, stdlib only):
     python -I verify_modes.py --rnpc <path/to/rnpc.exe>
     python -I verify_modes.py --rnpc ... --nps-bin <path/to/nps.exe> --keep
 
-Exit codes: 0 all checks passed, 1 a check failed, 2 a required binary is missing.
+Exit codes: 0 all checks passed, 1 a check failed, 2 a required binary missing.
 """
 
 from __future__ import annotations
@@ -129,37 +132,32 @@ class Echo:
             self.sock.close()
 
 
-def echo_sha256(port: int, total: int, timeout: float = 60.0) -> str:
-    """Send `total` bytes, read them back, return sha256 of the received data."""
+def echo_sha256(port: int, total: int, timeout: float = 90.0) -> str:
+    """Send `total` bytes through the tunnel and hash what comes back."""
     data = pattern(0x5EED, total)
     digest = hashlib.sha256()
     with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
         sock.settimeout(timeout)
-        sent = 0
 
         def writer() -> None:
             try:
-                nonlocal sent
                 offset = 0
                 while offset < total:
                     n = min(CHUNK, total - offset)
                     sock.sendall(data[offset:offset + n])
                     offset += n
-                sent = offset
             except OSError:
                 pass
 
         thread = threading.Thread(target=writer, daemon=True)
         thread.start()
-        received = bytearray()
-        while len(received) < total:
-            chunk = sock.recv(min(CHUNK, total - len(received)))
+        received = 0
+        while received < total:
+            chunk = sock.recv(min(CHUNK, total - received))
             if not chunk:
-                raise RuntimeError(
-                    f"tunnel closed after {len(received)}/{total} bytes"
-                )
+                raise RuntimeError(f"tunnel closed after {received}/{total} bytes")
             digest.update(chunk)
-            received.extend(chunk)
+            received += len(chunk)
         thread.join(timeout=timeout)
     return digest.hexdigest()
 
@@ -168,8 +166,8 @@ def wait_tunnel(port: int, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            if echo_sha256(port, 4096, timeout=2.0):
-                return True
+            echo_sha256(port, 4096, timeout=3.0)
+            return True
         except (OSError, RuntimeError):
             time.sleep(0.15)
     return False
@@ -238,26 +236,28 @@ class Proc:
 
 
 def run_cli(args: list[str], cwd: Path, timeout: float = 40.0) -> tuple[int, str]:
+    env = {**os.environ}
+    env.pop("RUST_LOG", None)
     result = subprocess.run(
         args, cwd=str(cwd), stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        timeout=timeout, text=True, encoding="utf-8", errors="replace",
-        env={**os.environ, "RUST_LOG": ""},
+        timeout=timeout, text=True, encoding="utf-8", errors="replace", env=env,
     )
     return result.returncode, result.stdout or ""
 
 
 # ---------------------------------------------------------------------------
-# Go nps server config
+# Go nps server fixtures
 # ---------------------------------------------------------------------------
 def write_go_server(root: Path, nps_bin: Path, bridge: int, web: int,
-                    public_vkey: str, precreated_client: dict | None) -> Path:
+                    public_vkey: str, clients: list[dict] | None,
+                    tasks: list[dict] | None) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     conf = root / "conf"
     conf.mkdir(exist_ok=True)
     shutil.copy2(nps_bin, root / "nps.exe")
 
-    lines = [
+    (conf / "nps.conf").write_text("\n".join([
         "appname = nps",
         "runmode = dev",
         "bridge_type = tcp",
@@ -285,23 +285,28 @@ def write_go_server(root: Path, nps_bin: Path, bridge: int, web: int,
         "http_cache = false",
         "disconnect_timeout = 5",
         "",
-    ]
-    (conf / "nps.conf").write_text("\n".join(lines), encoding="utf-8")
+    ]), encoding="utf-8")
 
-    if precreated_client:
-        (conf / "clients.json").write_text(
-            json.dumps(precreated_client, separators=(",", ":")) + "\n*#*",
-            encoding="utf-8",
-        )
-    (conf / "tasks.json").write_text("", encoding="utf-8")
-    (conf / "hosts.json").write_text("", encoding="utf-8")
+    # 这三个文件必须存在，Go 服务端启动时会直接读（缺失会 panic）。
+    for name, records in (
+        ("clients.json", clients),
+        ("tasks.json", tasks),
+        ("hosts.json", None),
+    ):
+        body = ""
+        if records:
+            body = "\n*#*".join(
+                json.dumps(record, separators=(",", ":")) for record in records
+            )
+        (conf / name).write_text(body, encoding="utf-8")
     return root / "nps.exe"
 
 
-def go_client_record(vkey: str, remark: str, config_conn_allow: bool) -> dict:
+def go_client_record(vkey: str, remark: str, config_conn_allow: bool,
+                     client_id: int = 1) -> dict:
     return {
         "Cnf": {"U": "", "P": "", "Compress": False, "Crypt": False},
-        "Id": 1,
+        "Id": client_id,
         "VerifyKey": vkey,
         "Addr": "",
         "Remark": remark,
@@ -321,12 +326,40 @@ def go_client_record(vkey: str, remark: str, config_conn_allow: bool) -> dict:
     }
 
 
+def go_task_record(client: dict, task_id: int, port: int, target: int,
+                   remark: str) -> dict:
+    return {
+        "Id": task_id,
+        "Port": port,
+        "ServerIp": "127.0.0.1",
+        "Mode": "tcp",
+        "Status": True,
+        "RunStatus": True,
+        "Client": client,
+        "Ports": "",
+        "Flow": {"ExportFlow": 0, "InletFlow": 0, "FlowLimit": 0},
+        "Password": "",
+        "Remark": remark,
+        "TargetAddr": f"127.0.0.1:{target}",
+        "NoStore": False,
+        "LocalPath": "",
+        "StripPre": "",
+        "Target": {
+            "TargetStr": f"127.0.0.1:{target}",
+            "TargetArr": None,
+            "LocalProxy": False,
+        },
+        "MultiAccount": None,
+    }
+
+
 # ---------------------------------------------------------------------------
-# checks
+# scenario helpers
 # ---------------------------------------------------------------------------
-def mode3(checks: Checks, rnpc: Path, root: Path, label: str, vkey: str,
-          bridge: int, listen: int, target: int, public_vkey: str | None,
-          extra_env: dict[str, str] | None, expect_assigned: bool) -> None:
+def run_config_tunnel(checks: Checks, rnpc: Path, root: Path, label: str,
+                      vkey: str, bridge: int, listen: int, target: int,
+                      expect_assigned: bool) -> None:
+    """模式 3：配置文件上传隧道，然后校验 768 KiB 双向一致。"""
     config = {
         "common": {
             "server_addr": "127.0.0.1",
@@ -349,22 +382,21 @@ def mode3(checks: Checks, rnpc: Path, root: Path, label: str, vkey: str,
     path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     proc = Proc(label, [str(rnpc), "-config", str(path)], root,
-                root / f"{label}.log", extra_env)
+                root / f"{label}.log")
     try:
         up = wait_tunnel(listen, 30)
         checks.expect(f"[{label}] server-side tunnel is up", up, f"listen={listen}")
         if up:
-            digest = echo_sha256(listen, DATA_SIZE, timeout=90)
+            digest = echo_sha256(listen, DATA_SIZE)
             expected = hashlib.sha256(pattern(0x5EED, DATA_SIZE)).hexdigest()
             checks.expect(f"[{label}] 768 KiB echo sha256 matches", digest == expected,
                           f"sha256={digest[:16]}...")
         text = proc.text()
         checks.expect(f"[{label}] config vkey not in client log", vkey not in text)
-        checks.expect(f"[{label}] client still running", proc.alive(),
-                      proc.tail(6))
+        checks.expect(f"[{label}] client still running", proc.alive(), proc.tail(6))
         if expect_assigned:
-            checks.expect(f"[{label}] NEW_CONF path announced", "已分配新的客户端密钥" in text,
-                          proc.tail(8))
+            checks.expect(f"[{label}] NEW_CONF path announced",
+                          "已分配新的客户端密钥" in text, proc.tail(8))
         else:
             checks.expect(f"[{label}] non-public path (no NEW_CONF)",
                           "已分配新的客户端密钥" not in text)
@@ -372,11 +404,29 @@ def mode3(checks: Checks, rnpc: Path, root: Path, label: str, vkey: str,
         proc.stop()
 
 
-def mode4_ok(checks: Checks, rnpc: Path, root: Path, server: str, port: int,
-             public_vkey: str) -> None:
-    log = root / "mode4-ok.log"
-    proc = Proc("mode4-ok", [str(rnpc), "-s", server, "-p", str(port)],
-                root, log, {"NPS_PUBLIC_VKEY": public_vkey})
+def run_split_port_tunnel(checks: Checks, rnpc: Path, root: Path, label: str,
+                          vkey: str, bridge: int, listen: int) -> None:
+    """模式 2：`-s host -p port` 服务服务端已配置的隧道。"""
+    proc = Proc(label, [str(rnpc), "-s", "127.0.0.1", "-p", str(bridge),
+                        "-vkey", vkey], root, root / f"{label}.log")
+    try:
+        up = wait_tunnel(listen, 30)
+        checks.expect(f"[{label}] -s/-p tunnel is up", up, f"listen={listen}")
+        if up:
+            digest = echo_sha256(listen, DATA_SIZE)
+            expected = hashlib.sha256(pattern(0x5EED, DATA_SIZE)).hexdigest()
+            checks.expect(f"[{label}] 768 KiB echo sha256 matches", digest == expected,
+                          f"sha256={digest[:16]}...")
+        checks.expect(f"[{label}] vkey not in client log", vkey not in proc.text())
+        checks.expect(f"[{label}] client still running", proc.alive(), proc.tail(6))
+    finally:
+        proc.stop()
+
+
+def run_mode4_ok(checks: Checks, rnpc: Path, root: Path, bridge: int,
+                 public_vkey: str) -> None:
+    proc = Proc("mode4-ok", [str(rnpc), "-s", "127.0.0.1", "-p", str(bridge)],
+                root, root / "mode4-ok.log", {"NPS_PUBLIC_VKEY": public_vkey})
     try:
         online = False
         deadline = time.monotonic() + 25
@@ -388,25 +438,29 @@ def mode4_ok(checks: Checks, rnpc: Path, root: Path, server: str, port: int,
             if not proc.alive():
                 break
             time.sleep(0.2)
-        checks.expect("[mode4-ok] registration + main/chan online", online, proc.tail(10))
-        checks.expect("[mode4-ok] assigned vkey not in log",
+        checks.expect("[mode4-ok] rgst refused -> public conf registration -> online",
+                      online, proc.tail(12))
+        checks.expect("[mode4-ok] public vkey not in log",
                       public_vkey not in proc.text())
+        checks.expect("[mode4-ok] rgst refusal was attempted first",
+                      "rgst" in proc.text(), proc.tail(8))
     finally:
         proc.stop()
 
 
-def mode4_denied(checks: Checks, rnpc: Path, root: Path, server: str,
-                 port: int) -> None:
-    env = {"NPS_PUBLIC_VKEY": "definitely-not-the-public-vkey"}
-    proc = Proc("mode4-deny", [str(rnpc), "-s", server, "-p", str(port)],
-                root, root / "mode4-deny.log", env)
+def run_mode4_denied(checks: Checks, rnpc: Path, root: Path, bridge: int) -> None:
+    proc = Proc("mode4-deny", [str(rnpc), "-s", "127.0.0.1", "-p", str(bridge)],
+                root, root / "mode4-deny.log",
+                {"NPS_PUBLIC_VKEY": "definitely-not-the-public-vkey"})
     code = proc.wait(30)
     if code is None:
         proc.stop()
     checks.expect("[mode4-deny] exits with dedicated code 7", code == 7,
-                  f"exit={code} tail={proc.tail(10)}")
-    checks.expect("[mode4-deny] no infinite retry (single process exit)",
-                  code is not None)
+                  f"exit={code} tail={proc.tail(12)}")
+    checks.expect("[mode4-deny] does not retry forever", code is not None)
+    text = proc.text()
+    checks.expect("[mode4-deny] error names both attempts",
+                  "rgst" in text and "public_vkey" in text, proc.tail(10))
     proc.stop()
 
 
@@ -435,22 +489,26 @@ def cli_checks(checks: Checks, rnpc: Path, root: Path, vkey: str) -> None:
 
     code, out = run_cli([str(rnpc), "bogus-cmd"], root)
     checks.expect("[cli] unknown subcommand -> exit 2", code == 2, f"exit={code}")
-    checks.expect("[cli] unknown subcommand points at `rnpc help`",
-                  "rnpc help" in out)
+    checks.expect("[cli] unknown subcommand points at rnpc help", "rnpc help" in out)
 
     code, out = run_cli([str(rnpc), "-s", "10.0.0.1", "-p", "8024",
                          "-vkey", vkey, "-type", "udp"], root)
     checks.expect("[cli] unsupported -type -> exit 5", code == 5, f"exit={code}")
     checks.expect("[cli] unsupported type does not echo vkey", vkey not in out)
 
+    code, out = run_cli([str(rnpc), "--version"], root)
+    checks.expect("[cli] --version works", code == 0 and "Rust-nps" in out, out[-120:])
+
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="rnpc <-> real Go nps verification")
-    parser.add_argument("--rnpc", default=str(REPO / "rust" / "target" / "debug" / "rnpc.exe"))
+    parser = argparse.ArgumentParser(
+        description="rnpc <-> real Go nps cross-verification")
+    parser.add_argument("--rnpc", default=str(
+        REPO / "rust" / "target" / "debug" / "rnpc.exe"))
     parser.add_argument("--nps-bin", default=str(DEFAULT_NPS))
     parser.add_argument("--skip-go", action="store_true",
                         help="only run CLI checks (no live server)")
-    parser.add_argument("--keep", action="store_true", help="keep the temp dir")
+    parser.add_argument("--keep", action="store_true", help="keep temp dir")
     args = parser.parse_args()
 
     rnpc = Path(args.rnpc)
@@ -481,70 +539,53 @@ def main() -> int:
 
         if not args.skip_go:
             echo = Echo()
-            bridge, web, listen_pub = free_port(), free_port(), free_port()
-            listen_priv = free_port()
-            public_vkey = "pub-" + hashlib.sha256(os.urandom(8)).hexdigest()[:8]
-
-            go_root = root / "go-server"
-            exe = write_go_server(go_root, nps, bridge, web, public_vkey, None)
-            server = Proc("nps", [str(exe)], go_root, root / "nps.log")
-            servers.append(server)
-            checks.expect("[server] Go nps bridge is listening", wait_port(bridge, 20),
-                          f"port={bridge}")
-            checks.expect("[server] Go nps web is listening", wait_port(web, 20),
-                          f"port={web}")
-
-            # ---- mode 3, public client: NEW_CONF -> 16-byte vkey ----
-            mode3(checks, rnpc, root, "mode3-pub", public_vkey, bridge, listen_pub,
-                  echo.port, public_vkey, None, expect_assigned=True)
-
-            # ---- mode 3, private client (ConfigConnAllow) ----
-            # Needs a fresh server DB holding a non-public client.
-            server.stop()
-            bridge, web, listen_priv = free_port(), free_port(), free_port()
-            go_root2 = root / "go-server-private"
-            pre = go_client_record(secret, "private-client", True)
-            exe2 = write_go_server(go_root2, nps, bridge, web, "", pre)
-            server2 = Proc("nps-private", [str(exe2)], go_root2, root / "nps-private.log")
-            servers.append(server2)
-            checks.expect("[server-private] bridge listening", wait_port(bridge, 20),
-                          f"port={bridge}")
-            mode3(checks, rnpc, root, "mode3-priv", secret, bridge, listen_priv,
-                  echo.port, None, None, expect_assigned=False)
-
-            # ---- mode 2: -s host -p port with explicit vkey ----
-            listen_split = free_port()
-            config = {
-                "common": {"server_addr": "127.0.0.1", "server_port": bridge,
-                           "vkey": secret, "remark": "split"},
-                "tasks": [{"remark": "split-tcp", "mode": "tcp",
-                           "server_port": listen_split,
-                           "target_addr": f"127.0.0.1:{echo.port}"}],
-            }
-            split_cfg = root / "split.json"
-            split_cfg.write_text(json.dumps(config), encoding="utf-8")
-            # register the tunnel through config mode, then run with -s/-p
-            setup = Proc("split-setup", [str(rnpc), "-config", str(split_cfg)],
-                         root, root / "split-setup.log")
-            time.sleep(2.0)
-            setup.stop()
-            proc = Proc("mode2", [str(rnpc), "-s", "127.0.0.1", "-p", str(bridge),
-                                  "-vkey", secret], root, root / "mode2.log")
             try:
-                up = wait_tunnel(listen_split, 30)
-                checks.expect("[mode2] -s/-p tunnel works", up, f"listen={listen_split}")
-                if up:
-                    digest = echo_sha256(listen_split, 128 * 1024, timeout=60)
-                    expected = hashlib.sha256(pattern(0x5EED, 128 * 1024)).hexdigest()
-                    checks.expect("[mode2] 128 KiB echo sha256 matches", digest == expected)
+                # ---------- server A: public_vkey (mode 3 pub + mode 4) ----------
+                bridge_a, web_a, listen_pub = free_port(), free_port(), free_port()
+                public_vkey = "pub-" + hashlib.sha256(os.urandom(8)).hexdigest()[:8]
+                exe_a = write_go_server(root / "go-pub", nps, bridge_a, web_a,
+                                        public_vkey, None, None)
+                server_a = Proc("nps-pub", [str(exe_a)], root / "go-pub",
+                                root / "nps-pub.log")
+                servers.append(server_a)
+                checks.expect("[server-pub] bridge listening", wait_port(bridge_a, 20),
+                              f"port={bridge_a}")
+
+                run_config_tunnel(checks, rnpc, root, "mode3-pub", public_vkey,
+                                  bridge_a, listen_pub, echo.port,
+                                  expect_assigned=True)
+                run_mode4_ok(checks, rnpc, root, bridge_a, public_vkey)
+                run_mode4_denied(checks, rnpc, root, bridge_a)
+
+                # ---------- server B: private client + pre-created tasks ----------
+                bridge_b, web_b, listen_priv = free_port(), free_port(), free_port()
+                listen_split = free_port()
+                client_b = go_client_record(secret, "verify-client", True)
+                tasks_b = [
+                    go_task_record(client_b, 1, listen_split, echo.port, "mode2-tcp"),
+                    go_task_record(client_b, 2, listen_priv, echo.port, "priv-tcp"),
+                ]
+                exe_b = write_go_server(root / "go-priv", nps, bridge_b, web_b,
+                                        "", [client_b], tasks_b)
+                server_b = Proc("nps-priv", [str(exe_b)], root / "go-priv",
+                                root / "nps-priv.log")
+                servers.append(server_b)
+                checks.expect("[server-priv] bridge listening", wait_port(bridge_b, 20),
+                              f"port={bridge_b}")
+
+                # 模式 2：-s host -p port，服务服务端预配置的隧道
+                run_split_port_tunnel(checks, rnpc, root, "mode2", secret,
+                                      bridge_b, listen_split)
+                # 模式 3：同一服务端上的私有客户端（isPub=false）
+                run_config_tunnel(checks, rnpc, root, "mode3-priv", secret,
+                                  bridge_b, listen_priv, echo.port,
+                                  expect_assigned=False)
+
+                # 服务端进程仍然存活（没有因我们的客户端崩溃）
+                checks.expect("[server] Go nps still alive after all scenarios",
+                              server_a.alive() and server_b.alive())
             finally:
-                proc.stop()
-
-            # ---- mode 4 ----
-            mode4_ok(checks, rnpc, root, "127.0.0.1", bridge, public_vkey)
-            mode4_denied(checks, rnpc, root, "127.0.0.1", bridge)
-
-            echo.close()
+                echo.close()
     except Exception:  # noqa: BLE001 - surface everything in the report
         checks.expect("harness completed without exception", False,
                       traceback.format_exc())
@@ -558,8 +599,9 @@ def main() -> int:
         for failure in checks.failures:
             print(f"  - {failure}")
     print(f"logs: {root}")
-    if not args.keep and not checks.failures:
-        pass  # logs are small; keep them for the report
+    if not args.keep and checks.failed == 0:
+        shutil.rmtree(root, ignore_errors=True)
+        print("(temp dir removed; --keep to retain logs)")
     return 0 if checks.failed == 0 else 1
 
 

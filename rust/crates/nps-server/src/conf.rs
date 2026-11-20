@@ -153,11 +153,17 @@ impl ConfRegistry {
         loop {
             let flag = tokio::select! {
                 _ = closing.changed() => break,
-                r = nps_legacy::read_flag(&mut stream) => match r {
-                    Ok(flag) => flag,
-                    // 客户端注册完成后会主动关闭连接（Go: c.Close()）
-                    Err(_) => break,
-                },
+                r = tokio::time::timeout(CONF_IDLE_TIMEOUT, nps_legacy::read_flag(&mut stream)) => {
+                    match r {
+                        Ok(Ok(flag)) => flag,
+                        // 客户端注册完成后会主动关闭连接（Go: c.Close()）
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            debug!("配置文件模式会话空闲超时 (clientId {client_id})");
+                            break;
+                        }
+                    }
+                }
             };
 
             match &flag {
