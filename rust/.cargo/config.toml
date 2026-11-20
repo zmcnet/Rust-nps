@@ -1,0 +1,27 @@
+# Windows 发布产物要求：单个 exe 双击即用。
+#
+# 默认的 MSVC 动态 CRT 会让 rnps.exe / rnpc.exe 依赖 VCRUNTIME140.dll / MSVCP140.dll，
+# 用户机器没装 VC++ 运行库时程序直接无法启动。自部署用户不该被迫先装运行库，
+# 因此发布构建静态链接 CRT（仅影响 Windows target，不影响 Linux/macOS）。
+#
+# 注意：这里刻意不用全局 [build] 配置，也不设置默认 target，以免影响交叉编译
+# 矩阵中的其它平台。新增 Windows 发布 target 时必须在这里补一条，否则该架构
+# 会退回动态 CRT，产物在干净机器上无法启动。
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# x86_64-win7 / i686-win7 是 tier-3 target，stable 工具链没有预编译 std，
+# 必须 nightly + -Z build-std 才能构建（见 WINDOWS-COMPAT.md）。此处先为它们
+# 也固定静态 CRT，避免将来真正构建时出现运行库依赖。
+[target.x86_64-win7-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-win7-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

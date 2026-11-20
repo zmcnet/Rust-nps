@@ -1,0 +1,8 @@
+# Generated during interop runs; never commit test logs or artifacts.
+logs/
+__pycache__/
+*.pyc
+
+# Real Go npc build output (reproduce from resources/nps with the command in
+# README.md); kept on disk locally for the parent's end-to-end run.
+bin/

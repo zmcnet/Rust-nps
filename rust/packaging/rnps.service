@@ -1,0 +1,61 @@
+[Unit]
+Description=Rust-nps TCP tunnel server (rnps)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nps
+Group=nps
+WorkingDirectory=/etc/nps
+
+# 管理令牌只从环境文件读取；install.sh 会把它设为 0600 root:root。
+EnvironmentFile=/etc/nps/nps.env
+ExecStart=/usr/local/bin/rnps --config /etc/nps/nps.json
+
+Restart=on-failure
+RestartSec=5s
+
+# 程序用 tokio::signal::ctrl_c 做优雅关闭，SIGINT 才会走关闭流程。
+# nps-server 的 shutdown 对每条隧道最多等 5s，桥最多等 10s，这里给足余量。
+KillSignal=SIGINT
+TimeoutStopSec=30s
+
+# ---- 沙箱 ----
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+UMask=0077
+
+# 默认端口 8024/8080 都 >1024，不需要任何 capability。
+# 若改用 1024 以下端口，删掉下面一行并加：
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# 空赋值在 systemd 里是合法的"清空集合"，不会解析成路径。
+CapabilityBoundingSet=
+
+# 配置只读；程序不需要写任何路径（运行态全在内存，重启按配置恢复），
+# 所以 ReadWritePaths 给空列表。systemd 文档：给路径类选项赋空字符串
+# 表示"重置列表"，这里即"不额外开放任何可写路径"。
+# 将来若要持久化状态，就在这里加最小目录，例如 ReadWritePaths=/var/lib/nps
+ReadWritePaths=
+ReadOnlyPaths=/etc/nps
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

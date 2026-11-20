@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="no-referrer">
+  <title>NPS · Rust 管理台</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#overview">
+        <span class="brand-mark" aria-hidden="true"><span></span></span>
+        <span class="brand-text">
+          <span class="brand-name">NPS · Rust</span>
+          <span class="brand-tag">轻量内网穿透</span>
+        </span>
+      </a>
+
+      <nav class="nav" id="main-nav" aria-label="主导航" hidden>
+        <a href="#overview">总览</a>
+        <a href="#clients">客户端</a>
+        <a href="#tunnels">隧道</a>
+        <a href="#about">说明</a>
+      </nav>
+
+      <div class="top-actions">
+        <span class="pill" id="conn-status" data-state="idle" role="status" aria-live="polite">未登录</span>
+        <span class="muted last-updated" id="last-updated"></span>
+        <button class="btn btn-ghost" id="logout-btn" type="button" hidden>退出</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="page" id="app-main" hidden>
+    <div class="banner" id="banner" role="alert" hidden></div>
+
+    <section class="section" id="overview" aria-labelledby="overview-title">
+      <div class="section-head">
+        <div>
+          <h1 id="overview-title">总览</h1>
+          <p class="sub">桥接监听地址 <code id="bridge-addr">—</code></p>
+        </div>
+      </div>
+
+      <div class="stats">
+        <article class="stat">
+          <span class="stat-label">在线客户端</span>
+          <strong class="stat-value" id="stat-clients-online">—</strong>
+          <span class="stat-hint" id="stat-clients-hint">共 — 个</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label">启用隧道</span>
+          <strong class="stat-value" id="stat-tunnels-enabled">—</strong>
+          <span class="stat-hint" id="stat-tunnels-hint">共 — 条</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label">活动连接</span>
+          <strong class="stat-value" id="stat-active-conns">—</strong>
+          <span class="stat-hint">当前合计</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label">累计流量</span>
+          <strong class="stat-value" id="stat-traffic">—</strong>
+          <span class="stat-hint">收发合计</span>
+        </article>
+      </div>
+
+      <div class="notice-grid">
+        <div class="notice">
+          <h2>仅支持 TCP 桥接</h2>
+          <p>当前版本提供 TCP 端口转发；UDP 与 P2P 模式尚未实现，界面不会展示相关入口。</p>
+        </div>
+        <div class="notice">
+          <h2>启停暂在内存中生效</h2>
+          <p>此处启停立即作用于运行中的隧道；服务重启后会按配置文件中的状态恢复。</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="clients" aria-labelledby="clients-title">
+      <div class="section-head">
+        <h2 id="clients-title">客户端</h2>
+        <span class="muted" id="clients-count"></span>
+      </div>
+      <div class="card table-wrap">
+        <table class="table table-clients">
+          <thead>
+            <tr>
+              <th scope="col">名称</th>
+              <th scope="col">ID</th>
+              <th scope="col">状态</th>
+              <th scope="col">版本</th>
+            </tr>
+          </thead>
+          <tbody id="clients-body">
+            <tr class="empty-row"><td colspan="4">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" id="tunnels" aria-labelledby="tunnels-title">
+      <div class="section-head">
+        <h2 id="tunnels-title">隧道</h2>
+        <span class="muted" id="tunnels-count"></span>
+      </div>
+      <div class="card table-wrap">
+        <table class="table table-tunnels">
+          <thead>
+            <tr>
+              <th scope="col">隧道</th>
+              <th scope="col">客户端</th>
+              <th scope="col">监听地址</th>
+              <th scope="col">目标地址</th>
+              <th scope="col">状态</th>
+              <th scope="col" class="num">活动连接</th>
+              <th scope="col" class="num">流量（发送 / 接收）</th>
+              <th scope="col" class="actions-col">操作</th>
+            </tr>
+          </thead>
+          <tbody id="tunnels-body">
+            <tr class="empty-row"><td colspan="8">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="table-note">流量列的「发送」指发送至客户端，「接收」指接收自客户端，均为该隧道的累计值。</p>
+    </section>
+
+    <section class="section" id="about" aria-labelledby="about-title">
+      <div class="section-head">
+        <h2 id="about-title">说明</h2>
+      </div>
+      <div class="notice-grid">
+        <div class="notice">
+          <h2>管理令牌</h2>
+          <p>首次部署时，在启动服务前设置环境变量 <code>NPS_ADMIN_TOKEN</code>（至少 24 字节，可见 ASCII，不含空格）。本页面不提供默认密码，令牌只保存在当前浏览器会话（sessionStorage），关闭标签页即清除。</p>
+        </div>
+        <div class="notice">
+          <h2>数据与安全</h2>
+          <p>页面不加载任何 CDN、外部字体或统计脚本，所有请求只发往当前管理服务；所有 API 都需要 Bearer 令牌，且不接收 Cookie。页面每 3 秒自动刷新一次状态。</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="login-wrap" id="login-view">
+    <div class="login-card">
+      <div class="login-brand">
+        <span class="brand-mark" aria-hidden="true"><span></span></span>
+        <span class="brand-name">NPS · Rust</span>
+      </div>
+      <h1>管理登录</h1>
+      <p class="muted login-lead">输入服务端环境变量 <code>NPS_ADMIN_TOKEN</code> 中配置的管理令牌。</p>
+
+      <form id="login-form" novalidate>
+        <label for="token-input">管理令牌</label>
+        <input
+          id="token-input"
+          name="token"
+          type="password"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+          minlength="24"
+          placeholder="至少 24 字节"
+          required
+        >
+        <p class="hint" id="token-hint">令牌仅保存在当前浏览器会话（sessionStorage），关闭标签页后自动清除。</p>
+        <p class="form-error" id="login-error" role="alert" hidden></p>
+        <button class="btn btn-primary btn-block" id="login-btn" type="submit">进入管理台</button>
+      </form>
+
+      <p class="footnote">首次部署：启动服务前设置环境变量 <code>NPS_ADMIN_TOKEN</code>（至少 24 字节，可见 ASCII，无空格）。页面不会把令牌发送到本服务以外的任何地址。</p>
+    </div>
+  </div>
+
+  <footer class="footer">
+    <span>NPS · Rust</span>
+    <span>单二进制内嵌管理界面 · 仅支持 TCP 桥接</span>
+  </footer>
+
+  <noscript>
+    <p class="noscript">管理台需要启用 JavaScript 才能读取状态与执行启停操作。</p>
+  </noscript>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

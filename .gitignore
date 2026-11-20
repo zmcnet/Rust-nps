@@ -1,0 +1,45 @@
+# Rust 构建产物
+/target/
+rust/target/
+**/target/
+
+# 本地配置与密钥（绝不提交）
+*.local.json
+nps.local.json
+rnpc.local.json
+*.env
+!.env.example
+!*.env.example
+
+# 日志与运行时状态
+*.log
+/logs/
+/.local/
+
+# 原版 NPS 的 Go 源码：仅作协议参考，GPLv3，不属于本仓库
+/resources/
+
+# 端到端联调用的真实二进制（可由 tools/interop/README.md 的步骤重建）
+/tools/interop/bin/
+/tools/interop/server/*.exe
+/tools/interop/server/run/
+/tools/interop/logs/
+
+# Python 缓存
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# 临时/备份
+*.bak
+*.orig
+*.rej
+/tmp/

@@ -1,0 +1,20 @@
+[package]
+name = "nps-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NPS Rust 管理界面：内嵌静态资源 + 只读状态 / 隧道启停 API"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+nps-server = { path = "../nps-server" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "nps-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rnps"
+path = "src/main.rs"
+
+[dependencies]
+nps-server = { path = "../nps-server" }
+nps-web = { path = "../nps-web" }
+tokio.workspace = true
+axum.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

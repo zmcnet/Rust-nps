@@ -1,0 +1,15 @@
+[package]
+name = "nps-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NPS Rust 重写：服务端配置、运行状态与 TCP 隧道服务（兼容老 npc，TCP-only P0）"
+
+[dependencies]
+nps-legacy = { path = "../nps-legacy" }
+nps-proto = { path = "../nps-proto" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

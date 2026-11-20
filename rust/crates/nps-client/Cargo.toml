@@ -1,0 +1,28 @@
+[package]
+name = "nps-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Rust 原生 npc 客户端（过渡期兼容原版 Go nps 协议）"
+
+[lib]
+name = "nps_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rnpc"
+path = "src/main.rs"
+
+[dependencies]
+nps-legacy = { path = "../nps-legacy" }
+nps-proto = { path = "../nps-proto" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time"] }
