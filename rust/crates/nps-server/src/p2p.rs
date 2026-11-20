@@ -126,21 +126,32 @@ impl P2pRendezvous {
                 }
             };
             let text = match std::str::from_utf8(&buf[..n]) {
-                Ok(t) => t.trim(),
+                Ok(t) => t.trim().to_owned(),
                 Err(_) => {
                     self.malformed.fetch_add(1, Ordering::Relaxed);
                     debug!("p2p: 收到非 UTF-8 报文（{n} 字节），忽略");
                     continue;
                 }
             };
-            let before = self.paired.load(Ordering::Relaxed);
-            if let Err(e) = self.handle_datagram(&socket, peer, text).await {
-                debug!("p2p: {e}");
-            }
-            let after = self.paired.load(Ordering::Relaxed);
-            if after > before {
-                shared_paired.fetch_add(after - before, Ordering::Relaxed);
-            }
+
+            // 每个数据报一个独立任务：visitor 分支会内联等待 provider 最长
+            // 20 秒，若在端口循环里串行处理，会把该端口后续的所有会合包
+            // 排队阻塞——真实 npc 场景下 visitor 总是先到，provider 的
+            // 登记包全部被卡到 20 秒超时之后，配对永远失败。原版
+            // `go s.handleP2P(...)` 同样是每包一个 goroutine。
+            let this = self.clone();
+            let sock = socket.clone();
+            let counter = shared_paired.clone();
+            tokio::spawn(async move {
+                let before = this.paired.load(Ordering::Relaxed);
+                if let Err(e) = this.handle_datagram(&sock, peer, &text).await {
+                    debug!("p2p: {e}");
+                }
+                let after = this.paired.load(Ordering::Relaxed);
+                if after > before {
+                    counter.fetch_add(after - before, Ordering::Relaxed);
+                }
+            });
         }
         debug!("p2p 会合循环退出");
     }
@@ -152,10 +163,13 @@ impl P2pRendezvous {
         peer: SocketAddr,
         text: &str,
     ) -> Result<()> {
-        let Some((password, role)) = text.split_once("*#*") else {
-            self.malformed.fetch_add(1, Ordering::Relaxed);
-            anyhow::bail!("报文格式应为 <password>*#*<role>，收到 {text:?}");
-        };
+        // 原版 npc 的会合包经 `GetWriteStr(md5, role)` 组包，线上格式是
+        // `md5*#*role*#*`——**每个字段后面都跟一个分隔符，尾部也带**。
+        // 因此不能按两段切分，要按分隔符切段取前两段、容忍尾部空段；
+        // 同时兼容不带尾分隔符的写法（测试与手工探测）。
+        let mut parts = text.split("*#*");
+        let password = parts.next().unwrap_or("");
+        let role = parts.next().unwrap_or("");
         if password.is_empty() || password.len() > 256 {
             self.malformed.fetch_add(1, Ordering::Relaxed);
             anyhow::bail!("password 长度非法（{}）", password.len());
@@ -274,6 +288,53 @@ pub async fn spawn_three(
     Ok((bound, tx, paired))
 }
 
+/// p2p 任务登记表：`md5(password) -> 拥有该任务的 client id`（提供方）。
+///
+/// 原版 `file.GetDb().GetTaskByMd5Password` 的最小对应物。p2p 任务来自
+/// npc 配置文件（`[p2p]` 段）经 conf 通道注册（原版亦支持 Web API 创建，
+/// 本实现暂只接 conf——真实 npc 的标准用法）。
+///
+/// 桥收到 `p2pm` 连接时按 md5 查这里：命中则给该 client 的 signal 推
+/// `udpc` 邀请帧；未命中则关闭请求连接（与原版「failed to match the key
+/// successfully」同语义）。
+#[derive(Default)]
+pub struct P2pTaskRegistry {
+    entries: tokio::sync::Mutex<HashMap<String, i32>>,
+}
+
+impl P2pTaskRegistry {
+    /// 登记一个 p2p 任务；同 md5 重复登记视为幂等成功（npc 重连会重发）。
+    ///
+    /// 同 md5 已被**其它客户端**占用时返回 `Err`（密码摘要必须唯一，
+    /// 否则无法确定邀请发给谁——与 secret 隧道的约束一致）。
+    pub async fn register(&self, password_md5: String, client_id: i32) -> Result<()> {
+        let mut entries = self.entries.lock().await;
+        if let Some(&owner) = entries.get(&password_md5) {
+            if owner == client_id {
+                return Ok(());
+            }
+            anyhow::bail!("p2p 密码摘要已被客户端 {owner} 占用");
+        }
+        entries.insert(password_md5, client_id);
+        Ok(())
+    }
+
+    /// 按 `md5(password)` 查提供方 client id
+    pub async fn lookup(&self, password_md5: &str) -> Option<i32> {
+        self.entries.lock().await.get(password_md5).copied()
+    }
+
+    /// 已登记任务数
+    pub async fn len(&self) -> usize {
+        self.entries.lock().await.len()
+    }
+
+    /// 是否为空
+    pub async fn is_empty(&self) -> bool {
+        self.entries.lock().await.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,9 +359,9 @@ mod tests {
         let provider_addr = provider.local_addr().unwrap();
         let visitor_addr = visitor.local_addr().unwrap();
 
-        // provider 先登记
+        // provider 先登记（真实 npc 的线上格式：末尾多一个分隔符）
         provider
-            .send_to(format!("pw1*#*{ROLE_PROVIDER}").as_bytes(), addr)
+            .send_to(format!("pw1*#*{ROLE_PROVIDER}*#*").as_bytes(), addr)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;

@@ -16,7 +16,7 @@
 
 ## 能力范围
 
-- 原版 8 个 mode：tcp / udp / socks5 / httpProxy（域名代理）/ file / secret / p2p（会合信令）/ tcpTrans（透明代理，**仅 Linux**：目标由 `SO_ORIGINAL_DST` 反查，需 iptables REDIRECT 指入；原版 Windows 同样是空实现）。逐项证据见 [docs/PHASE2-ACCEPTANCE.md](docs/PHASE2-ACCEPTANCE.md)。
+- 原版 8 个 mode：tcp / udp / socks5 / httpProxy（域名代理）/ file / secret / p2p（`p2pm` 邀请 + 三端口会合，双真实 npc 打洞直连端到端验证）/ tcpTrans（透明代理，**仅 Linux**：目标由 `SO_ORIGINAL_DST` 反查，需 iptables REDIRECT 指入；原版 Windows 同样是空实现）。逐项证据见 [docs/PHASE2-ACCEPTANCE.md](docs/PHASE2-ACCEPTANCE.md)。
 - JSON 配置定义客户端与 tcp / udp / http 站点 / socks5 / secret / file 隧道；老 npc 也可用 `-config` 动态注册 task（tcp/udp/file）与 host 站点。
 - 网页管理：客户端/隧道/连接数/流量总览、隧道启停、站点 CRUD、证书上传/自签/ACME；多用户登录（管理员账号 + 客户端账号 + 超级令牌），权限在服务端强制，不只是前端隐藏。
 - 管理 API 使用独立管理令牌。客户端 vkey 和管理令牌分别设置。

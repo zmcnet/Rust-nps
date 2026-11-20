@@ -21,7 +21,7 @@ use nps_legacy::Bridge;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::conf::ConfRegistry;
 use crate::config::ServerConfig;
@@ -386,6 +386,28 @@ impl Server {
             controls: controls_map.clone(),
         }));
 
+        // ---- p2p 任务登记表（conf 注册的 [p2p] 段；桥的 p2pm 连接按 md5 查）----
+        //
+        // 只有配置了 p2p_listen_addr（会合服务）时才安装 p2p 处理器；
+        // 未安装时 p2pm 连接会被桥直接关闭（与原版未配置 p2p 端口的行为一致）。
+        let p2p_tasks = Arc::new(crate::p2p::P2pTaskRegistry::default());
+        if let Some(addr) = config.p2p_listen_addr.as_deref() {
+            let advertise = addr.trim().to_owned();
+            // 邀请帧会把该地址原样写给 npc：绑定 0.0.0.0 时远程 npc 无法回连
+            let host = advertise.rsplit_once(':').map(|(h, _)| h);
+            if host.is_some_and(|h| h.parse::<std::net::IpAddr>().is_ok_and(|i| i.is_unspecified())) {
+                warn!(
+                    "p2p_listen_addr 绑定在未指定地址（{advertise}）：邀请帧会把这个地址原样写给 npc，\
+                     远程 npc 无法回连；请把 p2p_listen_addr 配置成可直达的 ip:port"
+                );
+            }
+            bridge.set_p2p_handler(Arc::new(P2pSink {
+                bridge: bridge.clone(),
+                registry: p2p_tasks.clone(),
+                advertise,
+            }));
+        }
+
         // ---- p2p 会合服务（仅信令；原版需要**三个连续端口**）----
         let (p2p_paired, p2p_cancel) = match config.p2p_listen_addr.as_deref() {
             Some(addr) => {
@@ -545,6 +567,7 @@ impl Server {
                 file_tunnels_for_conf.clone(),
                 file_channels.clone(),
                 verify,
+                p2p_tasks.clone(),
                 controls_map.clone(),
                 listen_host,
                 config.conf_max_tunnels,
@@ -1081,6 +1104,54 @@ impl nps_legacy::bridge::SecretHandler for SecretSink {
                 stream,
             )
             .await;
+        })
+    }
+}
+
+/// 处理桥收到的 `p2pm` 连接（visitor 发起的打洞请求）。
+///
+/// 字节序对齐原版 `bridge.go` WORK_P2P 分支：
+/// ① 按 md5(password) 查 p2p 任务（conf 注册的 `[p2p]` 段）；
+/// ② 命中 → 向**任务归属客户端**（provider）的 signal 推
+///    `udpc + len(会合地址) + len(md5)` 邀请帧；
+/// ③ 在这条 p2pm 连接上回写 `len(会合地址)` 给请求方（visitor）。
+/// 之后双方自行 KCP punch，服务端不参与传输。未命中 → 直接关闭
+/// （原版日志 "failed to match the key successfully" 同语义）。
+struct P2pSink {
+    bridge: Bridge,
+    registry: Arc<crate::p2p::P2pTaskRegistry>,
+    /// 写给双方的会合地址（应为可直达的 ip:port）
+    advertise: String,
+}
+
+impl nps_legacy::bridge::P2pRequestHandler for P2pSink {
+    fn handle(
+        &self,
+        _client_id: i32,
+        password_md5: String,
+        mut stream: tokio::net::TcpStream,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let bridge = self.bridge.clone();
+        let registry = self.registry.clone();
+        let advertise = self.advertise.clone();
+        Box::pin(async move {
+            let Some(provider_id) = registry.lookup(&password_md5).await else {
+                debug!("p2p: 未知的密码摘要，关闭请求连接");
+                return;
+            };
+            // 先邀请 provider（原版顺序），成功后回执请求方
+            if !bridge
+                .send_p2p_invite(provider_id, &advertise, &password_md5)
+                .await
+            {
+                warn!("p2p: provider 客户端 {provider_id} 不在线，关闭 visitor 请求");
+                return;
+            }
+            if let Err(e) =
+                nps_legacy::write_len_content(&mut stream, advertise.as_bytes()).await
+            {
+                debug!("p2p: 回执会合地址给 visitor 失败: {e}");
+            }
         })
     }
 }

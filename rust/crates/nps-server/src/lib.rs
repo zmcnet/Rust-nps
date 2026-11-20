@@ -15,8 +15,11 @@
 //! - `SOCKS5` / `UDP` / `HTTP` / `secret` 路径的 Link 帧未携带客户端的
 //!   crypt/compress 标志（数据按明文转发；TCP 隧道会带真值）
 //! - `FlowCounter`（流量上限计数）不持久化：重启后 `flow_limit` 已用量归零
-//! - `conf` 注册支持 `task`（tcp/udp/file）、`host`（站点）与 `stus` 查询；
-//!   `rgst` / `p2pm` 未实现
+//! - `conf` 注册支持 `task`（tcp/udp/file/p2p）、`host`（站点）与 `stus` 查询；
+//!   `rgst`（public_vkey 动态注册客户端）未实现
+//! - p2p：`p2pm` 桥分支 + `udpc` 邀请 + 三端口会合信令已实现，
+//!   双真实 npc 打洞直连经端到端验证（`tools/interop/p2p-e2e-smoke.py`）；
+//!   npc 打洞失败时的「经服务端中转」回退原版同样不可用（p2p 任务无目标）
 //! - 注册隧道只存内存：重启即失效，不做持久化
 //! - `crypt` 是自签 TLS（不做身份认证，身份靠 vkey），`compress` 是 snappy framed
 //!

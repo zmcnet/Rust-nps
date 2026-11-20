@@ -126,10 +126,31 @@ pub trait SecretHandler: Send + Sync {
         -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
 }
 
+/// `p2p`（WORK_P2P，"p2pm"）请求处理器。
+///
+/// 原版 `bridge.go` 的 `WORK_P2P` 分支：请求方（visitor）连桥并发 32 字节
+/// md5(password)，服务端按 md5 查 p2p 任务、给**任务归属客户端**（provider）
+/// 的 signal 连接推 `NEW_UDP_CONN`（"udpc"）+ 会合地址 + md5 三段帧，
+/// 再把会合地址回写到这条 p2pm 连接上（visitor 从这里读到会合地址）。
+/// 之后双方各自去 UDP 会合端口 punch，服务端不参与传输。
+///
+/// 查任务表属于上层职责：这里把「已读完 md5 的连接」整条交给上层，
+/// 连接所有权一并移交（上层写完回执后连接即被丢弃）。
+pub trait P2pRequestHandler: Send + Sync {
+    fn handle(&self, client_id: i32, password_md5: String, stream: tokio::net::TcpStream)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+}
+
 /// signal（main）连接的一代
 struct SignalState {
     gen: u64,
     guard: ConnGuard,
+    /// 服务端 → 客户端的写半边（p2p 邀请帧从这里写）。
+    ///
+    /// `main` 连接与其它通道不同：npc 会在**同一条连接**上继续读服务端
+    /// 主动推送的帧（`udpc` 邀请），因此不能把整条 stream 消耗在读循环里，
+    /// 读写半边要分开保管。
+    write: Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
 }
 
 /// tunnel（chan）连接的一代
@@ -182,6 +203,8 @@ struct BridgeShared {
     file_handler: std::sync::OnceLock<std::sync::Arc<dyn FileChannelHandler>>,
     /// `secret` 通道处理器（加密隧道用）。未设置时收到 `sert` 连接直接关闭。
     secret_handler: std::sync::OnceLock<std::sync::Arc<dyn SecretHandler>>,
+    /// `p2p` 请求处理器（打洞用）。未设置时收到 `p2pm` 连接直接关闭。
+    p2p_handler: std::sync::OnceLock<std::sync::Arc<dyn P2pRequestHandler>>,
     /// vkey 防爆破：按来源 IP 的握手失败记账（策略见 [`crate::ip_guard`]）。
     ///
     /// 用 std `Mutex` 而非 tokio `Mutex`：临界区内没有任何 await，纯内存
@@ -231,6 +254,7 @@ impl Bridge {
                 conf_handler: OnceLock::new(),
                 file_handler: OnceLock::new(),
                 secret_handler: OnceLock::new(),
+                p2p_handler: OnceLock::new(),
                 ip_guard: std::sync::Mutex::new(IpGuard::new(guard_cfg)),
                 _close_keepalive: close_keepalive,
             }),
@@ -276,6 +300,62 @@ impl Bridge {
         if self.shared.file_handler.set(handler).is_err() {
             tracing::warn!("file 通道处理器已设置，忽略重复设置");
         }
+    }
+
+    /// 设置 `p2p` 请求处理器（打洞用）。只允许设置一次。
+    pub fn set_p2p_handler(&self, handler: Arc<dyn P2pRequestHandler>) {
+        if self.shared.p2p_handler.set(handler).is_err() {
+            tracing::warn!("p2p 请求处理器已设置，忽略重复设置");
+        }
+    }
+
+    /// 向某客户端的 signal（main）连接推一条 p2p 邀请帧。
+    ///
+    /// 字节序对齐原版 `bridge.go` WORK_P2P 分支：
+    /// `"udpc"`（4 字节裸写，不带长度前缀）→ `WriteLenContent(会合地址)`
+    /// → `WriteLenContent(md5(password))`。npc 的 signal 读循环按
+    /// 「4 字节 flag = udpc → 两个长度前缀内容」解析（client.go TRPClient）。
+    ///
+    /// 客户端不在线 / signal 已断 / 写失败时返回 `false`（调用方据此关闭
+    /// 请求方的 p2pm 连接）。
+    pub async fn send_p2p_invite(
+        &self,
+        client_id: i32,
+        rendezvous_addr: &str,
+        password_md5: &str,
+    ) -> bool {
+        // 先取出写半边的 Arc 再放锁：写盘不持有 clients 锁
+        let write = {
+            let clients = self.shared.clients.lock().await;
+            clients.get(&client_id).and_then(|st| {
+                st.signal.as_ref().map(|s| s.write.clone())
+            })
+        };
+        let Some(write) = write else {
+            debug!("p2p 邀请失败：clientId {client_id} 不在线（无 signal 连接）");
+            return false;
+        };
+        let mut w = write.lock().await;
+        if w.write_all(nps_proto::NEW_UDP_CONN.as_bytes()).await.is_err() {
+            debug!("p2p 邀请失败：clientId {client_id} signal 写入 flag 失败");
+            return false;
+        }
+        if crate::codec::write_len_content(&mut *w, rendezvous_addr.as_bytes())
+            .await
+            .is_err()
+        {
+            debug!("p2p 邀请失败：clientId {client_id} signal 写入地址失败");
+            return false;
+        }
+        if crate::codec::write_len_content(&mut *w, password_md5.as_bytes())
+            .await
+            .is_err()
+        {
+            debug!("p2p 邀请失败：clientId {client_id} signal 写入密码失败");
+            return false;
+        }
+        debug!("已向 clientId {client_id} 推送 p2p 邀请（会合地址 {rendezvous_addr}）");
+        true
     }
 
     pub fn has_conf_handler(&self) -> bool {
@@ -489,8 +569,37 @@ impl Bridge {
                     let _ = stream.shutdown().await;
                 }
             },
-            b"rgst" | b"p2pm" => {
-                warn!("连接类型 {conn_type:?} P0 暂未支持 (clientId {client_id})");
+            b"p2pm" => match self.shared.p2p_handler.get() {
+                Some(handler) => {
+                    // 原版：读 32 字节 md5(password)（GetShortContent(32)，无长度前缀）
+                    let mut digest = [0u8; 32];
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut digest),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            let password_md5 = String::from_utf8_lossy(&digest).to_string();
+                            handler.handle(client_id, password_md5, stream).await;
+                        }
+                        Ok(Err(e)) => {
+                            debug!("p2p 通道读取密码失败 (clientId {client_id}): {e}");
+                        }
+                        Err(_) => {
+                            debug!("p2p 通道读取密码超时 (clientId {client_id})");
+                        }
+                    }
+                }
+                None => {
+                    debug!("p2p 未启用，关闭 p2pm 连接 (clientId {client_id} from {peer})");
+                    let _ = stream.shutdown().await;
+                }
+            },
+            b"rgst" => {
+                // 动态客户端注册（原版 public_vkey 流程）：如实告知未支持
+                debug!("连接类型 \"rgst\" 暂未支持 (clientId {client_id})，关闭");
+                let _ = stream.shutdown().await;
             }
             other => {
                 warn!("未知连接类型 {other:?}，关闭 (clientId {client_id})");
@@ -501,7 +610,7 @@ impl Bridge {
     /// 处理 control 面（main）连接：注册/替换 signal，然后持续读取健康上报。
     async fn handle_main(
         &self,
-        mut stream: tokio::net::TcpStream,
+        stream: tokio::net::TcpStream,
         hs: HandshakeResult,
         peer: String,
     ) {
@@ -509,10 +618,16 @@ impl Bridge {
         let gen = self.next_gen();
         let (guard, stop_rx) = stop_channel();
 
+        // main 连接要同时支持「服务端主动推帧」（p2p 邀请）与「读健康上报」，
+        // 因此读写半边分开保管：写半边进 SignalState（send_p2p_invite 用），
+        // 读半边留给健康上报循环。
+        let (mut read_half, write_half) = stream.into_split();
+        let write = Arc::new(Mutex::new(write_half));
+
         {
             let mut clients = self.shared.clients.lock().await;
             let st = clients.entry(id).or_insert_with(|| ClientState::empty(id));
-            let old = st.signal.replace(SignalState { gen, guard });
+            let old = st.signal.replace(SignalState { gen, guard, write });
             st.version = hs.client_version.clone();
             if let Some(mut old) = old {
                 // 丢弃旧 sender → 旧读循环退出 → 旧 socket 关闭
@@ -522,7 +637,7 @@ impl Bridge {
         }
 
         // 持续读取健康上报帧，直到对端关闭 / 超长帧 / 被替换
-        let reason = Self::read_health_loop(&mut stream, stop_rx).await;
+        let reason = Self::read_health_loop(&mut read_half, stop_rx).await;
         debug!("clientId {id} main 读循环结束: {reason}");
 
         // 仅当 state 仍指向本代连接时才清理（避免误伤新连接）
@@ -545,7 +660,7 @@ impl Bridge {
     /// 否则视为协议错误并断开（Go 侧返回 error 后 `DelClient`）。
     /// 返回结束原因，仅用于日志。
     async fn read_health_loop(
-        stream: &mut tokio::net::TcpStream,
+        stream: &mut tokio::net::tcp::OwnedReadHalf,
         mut stop_rx: oneshot::Receiver<()>,
     ) -> &'static str {
         let mut len_buf = [0u8; 4];
@@ -1080,6 +1195,104 @@ mod tests {
         match r {
             Ok(Ok(0)) | Ok(Err(_)) => {}
             other => panic!("达到阈值后的连接未被直接关闭: {other:?}"),
+        }
+        bridge.shutdown().await;
+    }
+
+    /// 测试用 p2p 处理器：调 send_p2p_invite 后把会合地址回写给请求连接
+    struct TestP2pHandler {
+        bridge: Arc<Bridge>,
+        rendezvous: std::sync::Mutex<Option<String>>,
+    }
+
+    impl crate::bridge::P2pRequestHandler for TestP2pHandler {
+        fn handle(
+            &self,
+            _client_id: i32,
+            password_md5: String,
+            mut stream: TcpStream,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let bridge = self.bridge.clone();
+            let addr = self.rendezvous.lock().unwrap().clone().unwrap();
+            Box::pin(async move {
+                assert!(bridge.send_p2p_invite(1, &addr, &password_md5).await);
+                let _ = crate::codec::write_len_content(&mut stream, addr.as_bytes()).await;
+            })
+        }
+    }
+
+    /// p2pm 全链路：visitor 发 md5 → 处理器邀请 provider（signal 收到
+    /// `udpc` + 地址 + md5 三段帧）→ p2pm 连接收到会合地址回执。
+    #[tokio::test]
+    async fn p2pm_invite_reaches_provider_signal_and_replies_visitor() {
+        let bridge = test_bridge();
+        let addr = start_bridge(&bridge).await;
+
+        // provider：main 连接先建立（invite 要写到它的 signal 上）
+        let mut provider_main = npc_handshake(addr, "vkey-test", b"main").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let rendezvous = "127.0.0.1:34567";
+        let handler = Arc::new(TestP2pHandler {
+            bridge: bridge.clone(),
+            rendezvous: std::sync::Mutex::new(Some(rendezvous.to_owned())),
+        });
+        bridge.set_p2p_handler(handler);
+
+        // visitor：以 p2pm 连入并发 md5(password)
+        let md5 = crate::handshake::md5_hex("p2p-pass");
+        let mut p2pm = npc_handshake(addr, "vkey-test", b"p2pm").await;
+        p2pm.write_all(md5.as_bytes()).await.unwrap();
+
+        // visitor 应收到 len(addr) 回执
+        let mut len_buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), p2pm.read_exact(&mut len_buf))
+            .await
+            .expect("等待回执超时")
+            .expect("读取回执长度失败");
+        let n = i32::from_le_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; n];
+        p2pm.read_exact(&mut buf).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf), rendezvous);
+
+        // provider 的 signal 应收到 udpc + len(addr) + len(md5)
+        let mut flag = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), provider_main.read_exact(&mut flag))
+            .await
+            .expect("等待邀请帧超时")
+            .expect("读取邀请 flag 失败");
+        assert_eq!(&flag, nps_proto::NEW_UDP_CONN.as_bytes());
+
+        let mut l1 = [0u8; 4];
+        provider_main.read_exact(&mut l1).await.unwrap();
+        let n1 = i32::from_le_bytes(l1) as usize;
+        let mut a = vec![0u8; n1];
+        provider_main.read_exact(&mut a).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&a), rendezvous);
+
+        let mut l2 = [0u8; 4];
+        provider_main.read_exact(&mut l2).await.unwrap();
+        let n2 = i32::from_le_bytes(l2) as usize;
+        assert_eq!(n2, 32, "第二段应是 32 字节 md5");
+        let mut m = vec![0u8; n2];
+        provider_main.read_exact(&mut m).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&m), md5);
+
+        bridge.shutdown().await;
+    }
+
+    /// 未安装 p2p 处理器时，p2pm 连接被直接关闭（干净 FIN）。
+    #[tokio::test]
+    async fn p2pm_closed_when_handler_absent() {
+        let bridge = test_bridge();
+        let addr = start_bridge(&bridge).await;
+
+        let mut c = npc_handshake(addr, "vkey-test", b"p2pm").await;
+        c.write_all(&[0u8; 32]).await.unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(3), c.read(&mut [0u8; 1])).await;
+        match r {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            other => panic!("未安装处理器的 p2pm 连接未被关闭: {other:?}"),
         }
         bridge.shutdown().await;
     }

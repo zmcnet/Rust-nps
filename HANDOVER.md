@@ -5,8 +5,14 @@
 > （68/68 + 浏览器截图验收）；限速/流量/白名单全路径覆盖、tcpTrans 接线、
 > 示例配置重生成均已实现并带测试；文档口径同步。本版仅改写头部与第〇部分、
 > 二十三/二十四/二十八/二十九/三十二节及附录 A 收尾，其余章节凡仍然准确的保留）
-> 状态：**本轮计划内开发全部完成**。测试基线：**642 项全绿**（617 基线 + 25 项
-> 新增）；真实 Go npc 黑盒联调 **149 项检查全部通过**。**工作树无未提交半成品**。
+> 状态：**本轮计划内开发全部完成**。测试基线：**648 项全绿**（617 基线 + 31 项
+> 新增）；真实 Go npc 黑盒联调 **164 项检查全部通过**（12 套件 + rnpc 双向）。
+> **工作树无未提交半成品**。
+>
+> 第五版补记（同日，「完整替代原版 NPS」Goal 攻坚）：对照原版源码逐项审计后
+> 补齐 **p2pm 桥分支**（32B md5 配对 + `udpc` 邀请帧 + conf `mode=p2p` 任务登记，
+> 见 0.5），修复会合服务两个真实 npc 才暴露的兼容 bug（包尾分隔符、串行处理
+> 阻塞），新增 file / p2p 端到端黑盒套件。详见 0.5。
 
 ## 目录
 
@@ -43,7 +49,7 @@
 | 3 | 限速/流量/IP 白名单全路径覆盖 | ✅ `ClientControls` 一张 per-client 表，接进 UDP / SOCKS5（CONNECT+UDP ASSOCIATE）/ HTTP(S) 站点（含 body 逐段）/ file / secret / conf 注册 | `tests/controls.rs` 5 项全绿（UDP 白名单丢包、HTTP 403/503、SOCKS5 静默关闭、conf 继承白名单、TCP↔HTTP 跨路径共享流量上限） |
 | 4 | 桥端口 vkey 防爆破 | ✅ 4 个失败测试修复：ip_guard.rs 三处 `saturating_duration_since` 方向写反（front↔now）；bridge 清零时机提前到 verify 回调（vkey 校验通过即清零，不再等 conn_type 读毕） | `cargo test -p nps-legacy` **82/82** |
 | 5 | 管理页 UI 去 AI 风 | ✅ class/id/data-state 双向核对无缺失（仅删 1 条死样式）；`cargo test -p nps-web` **68/68**；真实预览环境浏览器截图验收（登录页/总览/隧道/证书，中性灰底+钢蓝单强调色+直角表格，无渐变/emoji/CDN） | 子代理核对报告 + 截图 |
-| 6 | 全量回归 + 文档同步 | ✅ `cargo test --workspace` **642 全绿 0 失败**；黑盒联调 smoke 24 / udp 7 / http 19 / https 8 / socks5 29 / secret 6 / p2p 6 / target 4 / crypt 4 / rate-limit 3 / rust-client 39 全过；README / PHASE2-ACCEPTANCE / 本文档口径同步 | 本节 |
+| 6 | 全量回归 + 文档同步 | ✅ `cargo test --workspace` **648 全绿 0 失败**；黑盒联调 smoke 24 / udp 7 / http 19 / https 8 / socks5 29 / secret 6 / p2p 6 / target 4 / crypt 4 / rate-limit 3 / **file 10** / **p2p-e2e 5** / rust-client 39 全过；README / PHASE2-ACCEPTANCE / 本文档口径同步 | 本节 |
 
 顺手完成的：`nps.example.json` 从 4 个字段重写为全字段示例（含 `_notes` 说明），
 并新增防漂移测试 `tests/example_config.rs`（4 项，反序列化 + validate 双断言）；
@@ -85,6 +91,36 @@ python -I tools/interop/smoke.py --server-bin "$SERVER" --npc-bin "$NPC"
 
 UI 预览环境：`python -I tools/interop/smoke.py --server-bin "$SERVER" --npc-bin "$NPC" --preview-seconds 600`，
 登录信息在该次运行的 `logs/run-<时间戳>/ui-session.json`（web_addr + admin_token）。
+
+## 0.5 第五版补记：对照原版源码的「完整替代」攻坚（2026-11-21）
+
+用户 Goal：**完整替代官方原版 NPS，验收标准为测试所有 NPS 有的功能正常**。
+做法：通读 `resources/nps` 原版源码（nps.conf / npc.conf / bridge.go / control.go /
+p2p.go / secret 路径）逐项对照，发现并补齐：
+
+1. **`p2pm` 桥分支（此前未实现，真实 npc 的 p2p 会直接被断）**：
+   - `nps-legacy/bridge.rs`：`WORK_P2P` 分支读 32B md5(password)，交上层
+     `P2pRequestHandler`；`main` 连接拆出写半边（`SignalState.write`），
+     新增 `Bridge::send_p2p_invite`（`udpc` 裸 4B + `len(会合地址)` +
+     `len(md5)`，字节序对齐原版 `bridge.go:278`）；
+   - `nps-server/p2p.rs`：新增 `P2pTaskRegistry`（md5 → provider client id）；
+   - `nps-server/conf.rs`：接受 `Mode=p2p` 任务登记（无端口，只登记密码归属）；
+   - `nps-server/server.rs`：`P2pSink` 完成「查表 → 邀请 provider → 回执 visitor」。
+2. **会合协议两个真实 npc 才暴露的兼容 bug**（此前 p2p-smoke 用的是简化包）：
+   - 原版 `GetWriteStr` 的线上包是 `md5*#*role*#*`（**尾部分隔符**），
+     原 `split_once` 解析出的 role 带尾巴被拒 → 改为切段取前两段；
+   - visitor 分支内联等待 provider 最长 20s，会**阻塞所在端口的后续会合包**
+     （原版每包一个 goroutine）→ 改为每包派生任务。修复后双真实 npc
+     打洞直连端到端全通（`p2p-e2e-smoke.py` 5/5）。
+3. **新增黑盒套件**：`file-smoke.py`（10 项：下载/子目录/strip_pre/404/断线恢复/
+   多客户端隔离）、`p2p-e2e-smoke.py`（5 项，双真实 npc 全链路）。
+4. 测试 642→648（nps-legacy 84、`tests/p2p_invite.rs` 4 项）；黑盒 149→164。
+
+**对照原版仍有的缺口**（诚实口径）：
+`bridge_type=kcp` 桥（原版可选传输，需要引入 KCP 依赖——与「不加新依赖」规则
+冲突，待用户拍板）；`rgst`（public_vkey 动态注册）；Web 管理台 TLS / 子路径
+（`web_open_ssl` / `web_base_url`）；`http_cache` / `http_add_origin_header`；
+`allow_ports` 端口白名单；tcpTrans 的 Linux 真机 iptables E2E（环境受限）。
 
 ## 0.4 仍然开放的事项（更新后的下一步）
 

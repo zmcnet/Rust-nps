@@ -85,6 +85,8 @@ struct Inner {
     file_channels: Arc<crate::file_service::FileChannelRegistry>,
     /// md5(vkey) -> client id，仅用于 `stus` 帧校验归属（不写日志、不进快照）
     verify: Arc<std::collections::HashMap<String, i32>>,
+    /// p2p 任务登记表（conf 注册的 `[p2p]` 段；桥的 `p2pm` 连接按 md5 查）
+    p2p_tasks: Arc<crate::p2p::P2pTaskRegistry>,
     /// per-client 流控表（注册的隧道必须继承客户端的限额，否则 conf
     /// 就成了绕过 rate/flow/ip_limit 的后门）
     controls: Arc<std::collections::HashMap<i32, crate::limit::ClientControls>>,
@@ -111,6 +113,7 @@ impl ConfRegistry {
         file_tunnels: Arc<Mutex<Vec<Arc<crate::file_service::FileTunnel>>>>,
         file_channels: Arc<crate::file_service::FileChannelRegistry>,
         verify: Arc<std::collections::HashMap<String, i32>>,
+        p2p_tasks: Arc<crate::p2p::P2pTaskRegistry>,
         controls: Arc<std::collections::HashMap<i32, crate::limit::ClientControls>>,
         listen_host: IpAddr,
         max_tunnels: usize,
@@ -126,6 +129,7 @@ impl ConfRegistry {
                 file_tunnels,
                 file_channels,
                 verify,
+                p2p_tasks,
                 controls,
                 listen_host,
                 max_tunnels,
@@ -310,10 +314,40 @@ impl ConfRegistry {
             "" | "tcp" => self.register_tcp_task(bridge, client_id, info).await,
             "udp" => self.register_udp_task(bridge, client_id, info).await,
             "file" => self.register_file_task(bridge, client_id, info).await,
+            "p2p" => self.register_p2p_task(client_id, info).await,
             other => Err(format!(
-                "暂不支持 mode={other:?}（当前支持 tcp / udp / file）"
+                "暂不支持 mode={other:?}（当前支持 tcp / udp / file / p2p）"
             )),
         }
+    }
+
+    /// 注册一个 p2p 任务（npc 配置 `[p2p]` 段：只有 password，无端口/目标）。
+    ///
+    /// 对齐原版语义：p2p 任务**不创建任何监听**，只把 md5(password) 归到
+    /// 该客户端名下；之后 visitor 的 `p2pm` 桥连接按 md5 找到这里的
+    /// client id，向它推 `udpc` 邀请帧（见 `server.rs` 的 `P2pSink`）。
+    /// KCP 打洞与传输都在两个 npc 之间进行，服务端不参与。
+    async fn register_p2p_task(&self, client_id: i32, info: &TaskInfo) -> Result<Registered, String> {
+        if info.password.trim().is_empty() {
+            return Err("p2p 任务缺少 password".to_owned());
+        }
+        let md5 = nps_legacy::md5_hex(&info.password);
+        // 与其它注册共用串行锁 + 关闭检查，保持一致性
+        let _serial = self.inner.register_op.lock().await;
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            return Err("服务端正在关闭".to_owned());
+        }
+        self.inner
+            .p2p_tasks
+            .register(md5, client_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        info!("配置文件模式登记 p2p 任务（clientId {client_id}，无监听端口）");
+        Ok(Registered {
+            id: 0,
+            created: true,
+            describe: "p2p（密码已登记，无监听端口）".to_owned(),
+        })
     }
 
     /// 注册一条 UDP 隧道。
@@ -843,6 +877,9 @@ struct TaskInfo {
     /// 文件服务的 URL 前缀（`mode=file` 用）
     #[serde(default, rename = "StripPre")]
     strip_pre: String,
+    /// p2p 任务的连接密码（`mode=p2p` 用；登记的是它的 md5）
+    #[serde(default, rename = "Password")]
+    password: String,
 }
 
 #[derive(Debug, Default, Deserialize)]

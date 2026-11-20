@@ -14,10 +14,10 @@
 | `udp` | `udp.rs` | `udp-smoke.py` 7/7（含 60000 字节大包、4 来源并发隔离） | ✅ |
 | `socks5` | `socks5.rs` | `socks5-smoke.py` 29/29（含 UDP ASSOCIATE、用户名密码认证） | ✅ |
 | `httpProxy` | `http_site.rs` | `http-smoke.py` 19/19（含 WebSocket、chunked、2MiB 响应） | ✅ |
-| `file` | `file_service.rs` | 真实 npc `-config` 的 `[file]` 段，HTTP GET 下载到磁盘文件内容 | ✅ |
+| `file` | `file_service.rs` | `file-smoke.py` 10/10：真实 npc `-config` `[file]` 段，根目录/子目录/strip_pre 下载逐字节一致、404、断线重启恢复、多客户端隔离 | ✅ |
 | `tcpTrans` | `transparent.rs` + `tunnel.rs`（transparent 模式） | 配置 `tcp_trans_tunnels` → 监听 → 每连接 `SO_ORIGINAL_DST` 反查原始目标 → `Link::tcp(原始目标)` 交客户端拨号；复用普通隧道的 accept / 泵 / 限速 / 包装（`tests/tcp_trans.rs`）。**仅 Linux**：非 Linux 平台启动时警告、隧道不启用并写入明确 last_error（原版 `transport_windows.go` 同样是空实现）。Linux 真机 iptables REDIRECT 端到端待环境 | ✅（E2E 待真机） |
 | `secret` | `secret.rs` | `secret-smoke.py` 6/6，131072 字节逐字节一致 | ✅ |
-| `p2p` | `p2p.rs` | `p2p-smoke.py` 6/6（三端口会合，双方地址互发正确） | ✅ |
+| `p2p` | `p2p.rs` + `bridge.rs`（p2pm 分支） | `p2p-smoke.py` 6/6（三端口会合字节兼容）+ **`p2p-e2e-smoke.py` 5/5：双真实 npc（provider `[p2p]` 经 conf 登记 → visitor `p2pm` → `udpc` 邀请 → 会合 → npc↔npc KCP 直连）64 KiB 往返逐字节一致，流量不过服务端** | ✅ |
 
 ### 关键实现细节（均从 Go 源码核实，非猜测）
 
@@ -193,7 +193,7 @@ token → /api/sites  → 200
 
 | 门禁 | 结果 |
 | --- | --- |
-| `cargo test --workspace` | **642 项全绿，0 失败**（2026-11-21，含流控全路径 `controls.rs`、tcpTrans `tcp_trans.rs`、示例配置防漂移 `example_config.rs`） |
+| `cargo test --workspace` | **648 项全绿，0 失败**（2026-11-21，含流控全路径 `controls.rs`、tcpTrans `tcp_trans.rs`、示例配置防漂移 `example_config.rs`、p2p 邀请链路 `p2p_invite.rs`） |
 | `cargo check --workspace --all-targets` | **0 error / 0 warning** |
 | 真实 npc 联调 | `smoke.py` 24/24 |
 | 协议专项 | secret 6/6、udp 7/7、http 19/19、https 8/8、target 4/4、crypt 4/4、p2p 6/6 |
@@ -245,7 +245,7 @@ token → /api/sites  → 200
 | `tcpTrans` 端到端 | 接线已完成（配置/监听/转发/快照/流控，见第一节）；**Linux 真机 iptables REDIRECT 端到端待环境**。非 Linux 平台不启用并给明确原因（原版在 Windows 上也是空实现） |
 | `p2p` 只做会合信令 | 不实现 KCP 传输——原版也是客户端与提供方拿到地址后自建 KCP |
 | `p2p` 穿透成功率 | 取决于双方 NAT 类型，协议固有限制，原版相同 |
-| 客户端 KCP / P2P | 客户端侧未实现（服务端会合信令已实现） |
+| 客户端 KCP 桥 / rnpc 的 p2p 角色 | rnps 服务端 p2p 信令完整（双真实 npc 端到端验证）；rnpc 自身暂不支持 `conn_type=kcp` 桥与 p2p visitor/provider 角色（用真实 npc 兜底，同 Server 2008 策略） |
 | `crypt` 是自签 TLS | 提供加密但不做身份认证（原版语义），身份靠 vkey |
 | SOCKS5/UDP/HTTP/secret 的 Link 帧 | 硬编码 `crypt=false, compress=false`（TCP 隧道带真值）——这些路径按明文转发，两端语义一致、不是断连 bug，是保真度缺口 |
 | `FlowCounter` 不持久化 | `flow_limit` 的已用量重启归零（与展示用 `flow_store` 是两套计数） |
@@ -271,7 +271,7 @@ token → /api/sites  → 200
 `update` 有真校验、真备份、真还原；自启四通道中 `run-key` 已验证。
 
 **验证强度**：所有协议均有真实原版 npc 驱动的黑盒验证；
-642 项测试全绿（0 失败）；浏览器 12 场景 92 断言 + 真实预览环境截图验收；Linux 实机验证；
+648 项测试全绿（0 失败）；黑盒联调 164 项检查全过（12 套件 + rnpc 双向）；浏览器 12 场景 92 断言 + 真实预览环境截图验收；
 多用户权限用真实二进制端到端验证（403/200 实测）。
 
 **未达成「完美替代」的部分**：tcpTrans 的 Linux 真机 iptables 端到端、
