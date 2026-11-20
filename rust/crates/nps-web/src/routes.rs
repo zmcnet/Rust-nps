@@ -275,6 +275,34 @@ async fn security_headers(request: AxumRequest, next: Next) -> Response {
 }
 
 /// 解析请求主体：`NPS_ADMIN_TOKEN` 优先，其次会话令牌。
+/// 管理员专用端点守卫。
+///
+/// 只有已认证**且** `is_admin()` 的主体能通过；客户端账号返回 403。
+///
+/// 前端会隐藏管理功能入口，但那只是 UI 约束——绕过前端直接发请求必须在这里被拦住。
+fn require_admin_principal<B>(
+    headers: &HeaderMap,
+    state: &WebState<B>,
+) -> Option<Response> {
+    match resolve_principal(headers, state) {
+        Some(principal) if principal.is_admin() => None,
+        Some(principal) => {
+            let mut response = error_response(
+                StatusCode::FORBIDDEN,
+                &format!("需要管理员权限（当前身份：{}）", principal.display()),
+            );
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static(API_CACHE));
+            Some(response)
+        }
+        None => Some(error_response(
+            StatusCode::UNAUTHORIZED,
+            "未授权：缺少或无效的凭证",
+        )),
+    }
+}
+
 fn resolve_principal<B>(
     headers: &HeaderMap,
     state: &WebState<B>,
@@ -418,6 +446,9 @@ async fn set_tunnel_state<B: AdminBackend>(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    if let Some(response) = require_admin_principal(&headers, &state) {
+        return response;
+    }
     if !is_json_content_type(&headers) {
         return error_response(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -571,15 +602,33 @@ async fn get_listeners<B: AdminBackend>(State(state): State<WebState<B>>) -> Res
     Json(state.backend.listener_stats()).into_response()
 }
 
-async fn get_acme<B: AdminBackend>(State(state): State<WebState<B>>) -> Response {
+async fn get_acme<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = require_admin_principal(&headers, &state) {
+        return response;
+    }
     Json(state.backend.acme_summary()).into_response()
 }
 
-async fn list_sites<B: AdminBackend>(State(state): State<WebState<B>>) -> Response {
+async fn list_sites<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = require_admin_principal(&headers, &state) {
+        return response;
+    }
     Json(state.backend.list_sites().await).into_response()
 }
 
-async fn list_certs<B: AdminBackend>(State(state): State<WebState<B>>) -> Response {
+async fn list_certs<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = require_admin_principal(&headers, &state) {
+        return response;
+    }
     Json(state.backend.list_certificates().await).into_response()
 }
 
@@ -589,6 +638,9 @@ async fn upsert_site<B: AdminBackend>(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    if let Some(response) = require_admin_principal(&headers, &state) {
+        return response;
+    }
     let body = match require_json_body(&headers, body) {
         Ok(body) => body,
         Err(response) => return response,
@@ -614,7 +666,11 @@ async fn upsert_site<B: AdminBackend>(
 async fn remove_site<B: AdminBackend>(
     State(state): State<WebState<B>>,
     Path(domain): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
+    if let Some(response) = require_admin_principal(&headers, &state) {
+        return response;
+    }
     match state.backend.remove_site(domain.clone()).await {
         Ok(true) => (StatusCode::OK, Json(json!({ "ok": true, "domain": domain }))).into_response(),
         Ok(false) => error_response(StatusCode::NOT_FOUND, "未找到该站点"),
@@ -640,6 +696,9 @@ async fn upload_cert<B: AdminBackend>(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    if let Some(response) = require_admin_principal(&headers, &state) {
+        return response;
+    }
     let body = match require_json_body(&headers, body) {
         Ok(body) => body,
         Err(response) => return response,
@@ -685,6 +744,9 @@ async fn self_signed_cert<B: AdminBackend>(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    if let Some(response) = require_admin_principal(&headers, &state) {
+        return response;
+    }
     let body = match require_json_body(&headers, body) {
         Ok(body) => body,
         Err(response) => return response,
@@ -711,7 +773,13 @@ async fn self_signed_cert<B: AdminBackend>(
     }
 }
 
-async fn reload_certs<B: AdminBackend>(State(state): State<WebState<B>>) -> Response {
+async fn reload_certs<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = require_admin_principal(&headers, &state) {
+        return response;
+    }
     match state.backend.reload_certificates().await {
         Ok(count) => (StatusCode::OK, Json(json!({ "ok": true, "loaded": count }))).into_response(),
         Err(error) => {
@@ -724,7 +792,11 @@ async fn reload_certs<B: AdminBackend>(State(state): State<WebState<B>>) -> Resp
 async fn remove_cert<B: AdminBackend>(
     State(state): State<WebState<B>>,
     Path(domain): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
+    if let Some(response) = require_admin_principal(&headers, &state) {
+        return response;
+    }
     match state.backend.remove_certificate(domain.clone()).await {
         Ok(true) => (StatusCode::OK, Json(json!({ "ok": true, "domain": domain }))).into_response(),
         Ok(false) => error_response(StatusCode::NOT_FOUND, "未找到该证书"),
@@ -767,6 +839,9 @@ async fn acme_request<B: AdminBackend>(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    if let Some(response) = require_admin_principal(&headers, &state) {
+        return response;
+    }
     let body = match require_json_body(&headers, body) {
         Ok(body) => body,
         Err(response) => return response,

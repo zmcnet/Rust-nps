@@ -168,6 +168,13 @@ pub enum Command {
     List,
     /// `status`
     Status { name: String },
+    /// `start` / `stop` / `restart`
+    Process {
+        action: ProcessAction,
+        name: String,
+        /// stop/restart 的优雅超时（秒）
+        timeout: u64,
+    },
     /// `doctor`
     Doctor,
     /// `logs`
@@ -219,6 +226,14 @@ pub struct UpdateArgs {
     pub name: String,
     pub feed: Option<String>,
     pub check_only: bool,
+}
+
+/// `start` / `stop` / `restart` 动作
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessAction {
+    Start,
+    Stop,
+    Restart,
 }
 
 /// `channel` 子命令动作
@@ -315,6 +330,9 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, C
         Some("status") => return parse_status(args),
         Some("doctor") => return Ok(Command::Doctor),
         Some("path") => return parse_path(args),
+        Some("start") => return parse_process(args, ProcessAction::Start),
+        Some("stop") => return parse_process(args, ProcessAction::Stop),
+        Some("restart") => return parse_process(args, ProcessAction::Restart),
         Some("logs") => return parse_logs(args),
         Some("channel") => return parse_channel(args),
         Some(name) if RESERVED_SUBCOMMANDS.contains(&name) => {
@@ -603,6 +621,30 @@ fn parse_update(args: Vec<OsString>) -> Result<Command, CliError> {
         feed,
         check_only,
     }))
+}
+
+fn parse_process(args: Vec<OsString>, action: ProcessAction) -> Result<Command, CliError> {
+    let mut name = "default".to_owned();
+    let mut timeout = 10u64;
+    let mut iter = args.into_iter();
+    while let Some((opt, inline)) = next_option(&mut iter)? {
+        match opt.as_str() {
+            "name" => name = take_value(&mut iter, &opt, inline)?,
+            "timeout" => {
+                let raw = take_value(&mut iter, &opt, inline)?;
+                timeout = raw
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| CliError::InvalidArgument("--timeout 必须是非负整数秒"))?;
+            }
+            other => return Err(CliError::UnknownOption(format!("-{other}"))),
+        }
+    }
+    Ok(Command::Process {
+        action,
+        name,
+        timeout,
+    })
 }
 
 fn parse_logs(args: Vec<OsString>) -> Result<Command, CliError> {
@@ -1047,15 +1089,23 @@ mod tests {
             Command::Path { .. }
         ));
 
-        // 仍未实现的子命令保持 UnsupportedSubcommand
-        for name in ["start", "stop"] {
-            assert_eq!(
-                parse(&[name]).unwrap(),
-                Command::UnsupportedSubcommand((*name).to_owned()),
-                "subcommand={name}"
-            );
+        // start / stop / restart 已实现，必须解析成 Process 变体
+        for (name, expected) in [
+            ("start", PathAction2::Start),
+            ("stop", PathAction2::Stop),
+            ("restart", PathAction2::Restart),
+        ] {
+            match parse(&[name]).unwrap() {
+                Command::Process { action, .. } => {
+                    assert_eq!(action, expected, "subcommand={name}")
+                }
+                other => panic!("subcommand={name} 期望 Process，实际 {other:?}"),
+            }
         }
     }
+
+    /// 测试内别名，避免与 `cli::ProcessAction` 的名字冲突
+    type PathAction2 = crate::cli::ProcessAction;
 
     #[test]
     fn install_parses_aliases_and_defaults() {

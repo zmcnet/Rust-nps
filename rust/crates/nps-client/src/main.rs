@@ -164,6 +164,49 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        Command::Process {
+            action,
+            name,
+            timeout,
+        } => {
+            let root = nps_client::instance::data_root();
+            let timeout = std::time::Duration::from_secs(timeout);
+            let result = match action {
+                nps_client::cli::ProcessAction::Start => {
+                    nps_client::process::start(&root, &name).map(|pid| {
+                        println!("实例 {name} 已启动（PID {pid}）");
+                    })
+                }
+                nps_client::cli::ProcessAction::Stop => {
+                    nps_client::process::stop(&root, &name, timeout).map(|stopped| {
+                        if stopped {
+                            println!("实例 {name} 已停止");
+                        } else {
+                            println!("实例 {name} 本就没有在运行");
+                        }
+                    })
+                }
+                nps_client::cli::ProcessAction::Restart => {
+                    nps_client::process::restart(&root, &name, timeout).map(|pid| {
+                        println!("实例 {name} 已重启（PID {pid}）");
+                    })
+                }
+            };
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    let text = format!("{e:#}");
+                    eprintln!("rnpc: {text}");
+                    if text.contains("仅 Windows") {
+                        ExitCode::from(nps_client::cli::EXIT_UNSUPPORTED)
+                    } else if text.contains("未安装") {
+                        ExitCode::from(nps_client::commands::EXIT_NO_INSTANCE)
+                    } else {
+                        ExitCode::from(nps_client::commands::EXIT_RUNTIME)
+                    }
+                }
+            }
+        }
         Command::Logs { name, lines, follow } => {
             let root = nps_client::instance::data_root();
             match nps_client::commands::cmd_logs(&root, &name, lines, follow) {

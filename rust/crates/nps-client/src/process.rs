@@ -20,10 +20,17 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+// 运行时记录的**存储格式与读写**统一由 `instance` 模块负责，
+// 本模块只在它之上做「PID 归属校验 + 进程控制」，避免两处格式各自漂移。
+use crate::instance::{
+    now_rfc3339, read_runtime, validate_instance_name, InstancePaths,
+};
+
+/// 运行时记录（复用 [`crate::instance::RuntimeRecord`]，此处 re-export 便于调用方使用）。
+pub use crate::instance::RuntimeRecord;
 
 /// 进程控制仅 Windows 实现。
 pub const UNSUPPORTED_MSG: &str = "进程控制仅 Windows 实现";
@@ -32,8 +39,6 @@ pub const UNSUPPORTED_MSG: &str = "进程控制仅 Windows 实现";
 const START_WAIT: Duration = Duration::from_secs(15);
 /// 轮询间隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// 实例名最大长度（与 `instance::validate_instance_name` 一致）。
-const MAX_NAME_LEN: usize = 32;
 
 /// 实例运行时状态
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,106 +51,9 @@ pub enum RunState {
     Unknown { pid: u32, reason: String },
 }
 
-/// 运行时记录，字段与 `instance::RuntimeRecord` 保持兼容（可互相读写）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeRecord {
-    pub pid: u32,
-    pub started_at: String,
-    pub exe: String,
-    pub name: String,
-}
-
 // ---------------------------------------------------------------------------
 // 路径与校验
 // ---------------------------------------------------------------------------
-
-/// 该实例的 runtime.json 路径。
-fn runtime_path(root: &Path, name: &str) -> PathBuf {
-    root.join("instances").join(name).join("runtime.json")
-}
-
-/// 本地实例名校验（防止 `..` / 分隔符造成路径穿越，从而误删他人文件）。
-///
-/// 规则与 `docs/rnpc-cli-spec.md` 一致：`[a-z0-9]([a-z0-9_-]{0,30}[a-z0-9])?`，
-/// 保留名 `all` / `rnpc`。不 import `instance` 模块，保持本模块自包含。
-fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        bail!("实例名不能为空");
-    }
-    if name.len() > MAX_NAME_LEN {
-        bail!("实例名过长（{} > {MAX_NAME_LEN}）", name.len());
-    }
-    if name == "all" || name == "rnpc" {
-        bail!("实例名 {name:?} 是保留名");
-    }
-    let bytes = name.as_bytes();
-    let edge = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-    if !edge(bytes[0]) || !edge(bytes[bytes.len() - 1]) {
-        bail!("实例名必须以小写字母或数字开头/结尾: {name:?}");
-    }
-    if !bytes
-        .iter()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'_')
-    {
-        bail!("实例名只能包含小写字母、数字、- 和 _: {name:?}");
-    }
-    Ok(())
-}
-
-/// 读取运行时记录；格式损坏视为陈旧并删除。
-fn read_runtime(path: &Path) -> Option<RuntimeRecord> {
-    let bytes = std::fs::read(path).ok()?;
-    match serde_json::from_slice::<RuntimeRecord>(&bytes) {
-        Ok(r) => Some(r),
-        Err(_) => {
-            let _ = std::fs::remove_file(path);
-            None
-        }
-    }
-}
-
-/// 手写 RFC3339 秒精度时间戳（不引入 chrono 依赖）。
-fn now_rfc3339() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = secs / 86400;
-    let rem = secs % 86400;
-    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let mut year = 1970i64;
-    let mut d = days as i64;
-    loop {
-        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-        let yd = if leap { 366 } else { 365 };
-        if d < yd {
-            break;
-        }
-        d -= yd;
-        year += 1;
-    }
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    let mdays = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut month = 1usize;
-    while month <= 12 && d >= mdays[month - 1] as i64 {
-        d -= mdays[month - 1] as i64;
-        month += 1;
-    }
-    format!("{year:04}-{month:02}-{:02}T{h:02}:{m:02}:{s:02}Z", d + 1)
-}
 
 /// 路径规范化后比较（去 `\\?\` 前缀、统一分隔符与大小写）。
 fn path_equal(a: &Path, b: &Path) -> bool {
@@ -322,8 +230,8 @@ pub fn pid_belongs_to(pid: u32, exe: &Path, name: &str) -> bool {
 ///
 /// 非 Windows：读到记录即返回 `Unknown { reason: "仅 Windows 实现…" }`，否则 `Stopped`。
 pub fn state(root: &Path, name: &str) -> Result<RunState> {
-    validate_name(name)?;
-    let path = runtime_path(root, name);
+    validate_instance_name(name)?;
+    let path = InstancePaths::new(root, name).runtime_path();
     let Some(record) = read_runtime(&path) else {
         return Ok(RunState::Stopped);
     };
@@ -407,16 +315,10 @@ pub fn state(root: &Path, name: &str) -> Result<RunState> {
 /// - 若属于**本进程 + 本实例**（同 PID 重复调用）→ 幂等成功；
 /// - 否则删除陈旧记录后重建（重建仍用 `create_new`，失败则报错）。
 pub fn record_self(root: &Path, name: &str) -> Result<()> {
-    #[cfg(not(windows))]
+    // 纯文件操作，跨平台都能做：`rnpc run --name` 在 Linux 上同样要能被 `list` 看到。
     {
-        let _ = (root, name);
-        bail!("{UNSUPPORTED_MSG}")
-    }
-
-    #[cfg(windows)]
-    {
-        validate_name(name)?;
-        let path = runtime_path(root, name);
+        validate_instance_name(name)?;
+        let path = InstancePaths::new(root, name).runtime_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("无法创建实例目录 {}", parent.display()))?;
@@ -465,16 +367,10 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 ///
 /// 只清除属于当前进程的那条记录，避免误删后继进程覆盖后的记录。
 pub fn clear_self(root: &Path, name: &str) -> Result<()> {
-    #[cfg(not(windows))]
+    // 同 record_self：纯文件操作，跨平台一致。
     {
-        let _ = (root, name);
-        bail!("{UNSUPPORTED_MSG}")
-    }
-
-    #[cfg(windows)]
-    {
-        validate_name(name)?;
-        let path = runtime_path(root, name);
+        validate_instance_name(name)?;
+        let path = InstancePaths::new(root, name).runtime_path();
         let Some(record) = read_runtime(&path) else {
             return Ok(());
         };
@@ -514,7 +410,7 @@ pub fn start(root: &Path, name: &str) -> Result<u32> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
-        validate_name(name)?;
+        validate_instance_name(name)?;
 
         match state(root, name)? {
             RunState::Stopped => {}
@@ -529,17 +425,37 @@ pub fn start(root: &Path, name: &str) -> Result<u32> {
             bail!("未找到可执行文件 {}；请先 rnpc install", exe.display());
         }
 
+        // 守护进程**不能继承调用方的 stdio**：
+        // 1) 继承 stdout 会让调用方的管道永不关闭，上层命令（如 `restart`）看起来"挂住"；
+        // 2) 实例日志本来就该落在 `<root>\logs\<name>.log`（`rnpc logs` 读的就是它）。
+        let log_path = InstancePaths::new(root, name).log_path();
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("无法创建日志目录 {}", parent.display()))?;
+        }
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("无法打开实例日志 {}", log_path.display()))?;
+        let log_err = log
+            .try_clone()
+            .with_context(|| format!("无法复制日志句柄 {}", log_path.display()))?;
+
         let mut child = std::process::Command::new(&exe)
             .args(["run", "--name", name])
             // 让子进程认同一个数据根（否则它会按 LOCALAPPDATA 自行推断，导致
             // 记录写到别处、start 永远等不到 runtime.json）。
             .env("RNPC_DATA_DIR", root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(log))
+            .stderr(std::process::Stdio::from(log_err))
             .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
             .spawn()
             .with_context(|| format!("启动 {} 失败", exe.display()))?;
         let pid = child.id();
 
-        let path = runtime_path(root, name);
+        let path = InstancePaths::new(root, name).runtime_path();
         let deadline = SystemTime::now() + START_WAIT;
         loop {
             if let Some(record) = read_runtime(&path) {
@@ -609,7 +525,7 @@ pub fn stop(root: &Path, name: &str, timeout: Duration) -> Result<bool> {
 
 /// 仅当记录中的 PID 匹配时才删除（避免误删后继进程的记录）。
 fn clear_record_if_pid(root: &Path, name: &str, pid: u32) {
-    let path = runtime_path(root, name);
+    let path = InstancePaths::new(root, name).runtime_path();
     if let Some(record) = read_runtime(&path) {
         if record.pid == pid {
             let _ = std::fs::remove_file(&path);
@@ -630,8 +546,8 @@ mod tests {
     #[test]
     fn runtime_path_is_isolated_per_name() {
         let root = PathBuf::from("/tmp/rnpc");
-        let a = runtime_path(&root, "web");
-        let b = runtime_path(&root, "db");
+        let a = InstancePaths::new(&root, "web").runtime_path();
+        let b = InstancePaths::new(&root, "db").runtime_path();
         assert_ne!(a, b);
         assert!(a.ends_with("runtime.json"));
         assert!(a.to_string_lossy().contains("web"));
@@ -640,10 +556,10 @@ mod tests {
     #[test]
     fn names_with_path_traversal_are_rejected() {
         for bad in ["", "..", "a/b", "a\\b", "A", "all", "rnpc", ".", "-a", "a-"] {
-            assert!(validate_name(bad).is_err(), "{bad:?} 应被拒绝");
+            assert!(validate_instance_name(bad).is_err(), "{bad:?} 应被拒绝");
         }
         for ok in ["default", "web", "a", "a-b", "a_b", "abc123"] {
-            validate_name(ok).unwrap_or_else(|e| panic!("{ok} 应合法: {e}"));
+            validate_instance_name(ok).unwrap_or_else(|e| panic!("{ok} 应合法: {e}"));
         }
     }
 

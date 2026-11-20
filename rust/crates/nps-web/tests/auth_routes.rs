@@ -342,3 +342,109 @@ async fn login_throttle_locks_after_repeated_failures() {
         "达到失败上限后即使密码正确也应被限流"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 权限隔离：客户端账号必须被管理员端点拒绝
+// ---------------------------------------------------------------------------
+
+fn with_auth(mut request: Request<Body>, token: &str) -> Request<Body> {
+    request
+        .headers_mut()
+        .insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+    request
+}
+
+#[tokio::test]
+async fn client_account_is_forbidden_on_admin_endpoints() {
+    let app = app_with_accounts();
+    let client_token = login(&app, "alice", "alicepw").await;
+
+    // 这些端点只有管理员能碰；客户端账号必须 403，而不是 200
+    let cases: Vec<(&str, &str, &str)> = vec![
+        ("POST", "/api/tunnels/1/state", r#"{"enabled":false}"#),
+        ("GET", "/api/sites", ""),
+        ("POST", "/api/sites", r#"{"domain":"x.test","target":"127.0.0.1:22"}"#),
+        ("DELETE", "/api/sites/x.test", ""),
+        ("GET", "/api/certs", ""),
+        ("POST", "/api/certs/reload", "{}"),
+        ("DELETE", "/api/certs/x.test", ""),
+        ("GET", "/api/acme", ""),
+    ];
+
+    for (method, uri, body) in cases {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if !body.is_empty() {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        let request = builder.body(Body::from(body.to_owned())).unwrap();
+        let request = with_auth(request, &client_token);
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} 应拒绝客户端账号"
+        );
+    }
+}
+
+#[tokio::test]
+async fn admin_account_is_allowed_on_admin_endpoints() {
+    let app = app_with_accounts();
+    let admin_token = login(&app, "root", "rootpw").await;
+
+    for uri in ["/api/sites", "/api/certs", "/api/acme"] {
+        let request = with_auth(get(uri), &admin_token);
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "GET {uri} 应允许管理员"
+        );
+    }
+}
+
+#[tokio::test]
+async fn super_admin_token_still_reaches_admin_endpoints() {
+    // 已有部署靠 NPS_ADMIN_TOKEN，加了权限校验后必须仍然可用
+    let app = app_with_accounts();
+    for uri in ["/api/sites", "/api/certs", "/api/acme", "/api/status"] {
+        let request = with_auth(get(uri), ADMIN_TOKEN);
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "GET {uri} 应允许超级管理员令牌"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unauthenticated_admin_endpoints_are_401() {
+    let app = app_with_accounts();
+    for uri in ["/api/sites", "/api/certs", "/api/acme"] {
+        let response = app.clone().oneshot(get(uri)).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "GET {uri} 未认证应 401"
+        );
+    }
+}
+
+#[tokio::test]
+async fn client_can_still_read_own_status() {
+    // 权限收紧不能误伤客户端本来就能用的端点
+    let app = app_with_accounts();
+    let client_token = login(&app, "alice", "alicepw").await;
+    let response = app
+        .clone()
+        .oneshot(with_auth(get("/api/status"), &client_token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "/api/status 应允许客户端账号");
+
+    let body = body_json(response).await;
+    let clients = body["clients"].as_array().expect("clients 数组");
+    assert_eq!(clients.len(), 1, "客户端只应看到自己");
+    assert_eq!(clients[0]["id"], 1);
+}

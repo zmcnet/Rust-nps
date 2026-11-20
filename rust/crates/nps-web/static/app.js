@@ -400,6 +400,21 @@
     return request('/api/whoami', { token: token, handle401: false });
   }
 
+  /// 兼容旧后端（只有 /api/status、没有 /api/whoami）：用 status 验证管理员令牌。
+  /// 仅在管理员令牌路径使用，不能用来推断客户端账号的身份。
+  function fetchLegacyAdminIdentity(token) {
+    return request('/api/status', { token: token, handle401: false }).then(function () {
+      return { is_admin: true, display: '超级管理员（令牌）' };
+    });
+  }
+
+  function fetchAdminIdentity(token) {
+    return fetchWhoami(token).catch(function (error) {
+      if (error && error.status === 404) return fetchLegacyAdminIdentity(token);
+      throw error;
+    });
+  }
+
   /// 所有 401 的唯一出口：清空凭据与数据，回到登录页。
   function handleAuthFailure() {
     clearCredentials();
@@ -758,6 +773,11 @@
     var message;
     if (error && error.status === 429) {
       message = '尝试次数过多，请稍后再试';
+    } else if (error && error.status === 404) {
+      message =
+        '当前服务端未启用用户名密码登录（' +
+        ((error && error.message) || '接口不存在') +
+        '），请使用下方管理员令牌。';
     } else if (error instanceof AuthError || (error && error.status === 401)) {
       if (error && error.stage === 'whoami') {
         message = '登录状态未能建立，请重试。';
@@ -800,7 +820,7 @@
     setConnStatus('loading', '验证中');
 
     state.adminToken = candidate;
-    fetchWhoami(candidate)
+    fetchAdminIdentity(candidate)
       .then(function (info) {
         state.sessionToken = '';
         writeSession(SESSION_KEY, '');
@@ -884,7 +904,13 @@
     setConnStatus('loading', '检查中');
 
     // 页面加载时先问后端「我是谁」：有 Cookie/Bearer 就进主界面，否则显示登录页。
-    fetchWhoami(token)
+    // 旧后端没有 /api/whoami 时，管理员令牌退回 /api/status 验证。
+    var probe;
+    if (state.sessionToken) probe = fetchWhoami(state.sessionToken);
+    else if (state.adminToken) probe = fetchAdminIdentity(state.adminToken);
+    else probe = fetchWhoami('');
+
+    probe
       .then(function (info) {
         enterApp(info);
       })
@@ -894,6 +920,9 @@
         var message = '';
         if (error && error.status === 401) {
           if (hadCredential) message = '登录已失效，请重新登录。';
+        } else if (error && error.status === 404 && !hadCredential) {
+          // 旧后端且没有凭据：等价于未登录，静默显示登录页。
+          message = '';
         } else if (error) {
           message = '无法连接管理服务：' + ((error && error.message) || '网络错误');
         }

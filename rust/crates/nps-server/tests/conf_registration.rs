@@ -32,6 +32,8 @@ fn config(conf_register: bool, max_tunnels: usize) -> ServerConfig {
             flow_limit: 0,
             crypt: false,
             compress: false,
+            web_username: None,
+            web_password: None,
         }],
         tunnels: Vec::new(),
         conf_register,

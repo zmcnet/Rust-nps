@@ -95,6 +95,17 @@ pub struct ServerConfig {
     /// **默认 `None`（不监听）**：HTTPS 需要证书，用户显式配置才开启。
     #[serde(default)]
     pub https_listen_addr: Option<String>,
+    /// Web 管理面**命名管理员**用户名。对应原版 `web_username`。
+    ///
+    /// 与 `web_password` 同时非空时，该账号可通过 `/api/auth/login` 登录管理面
+    /// （权限等同超级管理员）。二者为空则只能使用 `NPS_ADMIN_TOKEN`。
+    #[serde(default)]
+    pub web_username: Option<String>,
+    /// Web 管理面命名管理员密码。对应原版 `web_password`。
+    ///
+    /// **注意**：这是明文配置项（与原版一致）；`Debug` 输出会打码。
+    #[serde(default)]
+    pub web_password: Option<String>,
     /// 证书根目录。默认 `<配置目录>/certs`。
     #[serde(default)]
     pub cert_dir: Option<String>,
@@ -163,6 +174,8 @@ impl Default for ServerConfig {
             http_sites: Vec::new(),
             http_listen_addr: None,
             https_listen_addr: None,
+            web_username: None,
+            web_password: None,
             cert_dir: None,
             acme: Default::default(),
             data_dir: None,
@@ -373,6 +386,16 @@ pub struct ClientConfig {
     /// 是否压缩子流（snappy framed）。对应原版 `client.Cnf.Compress`。
     #[serde(default)]
     pub compress: bool,
+    /// 该客户端的 Web 登录用户名。对应原版 `WebUserName`。
+    ///
+    /// 与 `web_password` 同时非空时，可用该账号登录管理面，
+    /// **只能看到本客户端自己的隧道**。
+    /// 二者都为空时回退为 `user` + `vkey`（与原版一致）。
+    #[serde(default)]
+    pub web_username: Option<String>,
+    /// 该客户端的 Web 登录密码。对应原版 `WebPassword`。
+    #[serde(default)]
+    pub web_password: Option<String>,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -381,6 +404,14 @@ impl std::fmt::Debug for ClientConfig {
             .field("id", &self.id)
             .field("name", &self.name)
             .field("vkey", &"<redacted>")
+            .field(
+                "web_password",
+                &if self.web_password.as_deref().is_some_and(|p| !p.is_empty()) {
+                    "<redacted>"
+                } else {
+                    "<unset>"
+                },
+            )
             .finish()
     }
 }
@@ -759,6 +790,8 @@ mod tests {
             flow_limit: 0,
             crypt: false,
             compress: false,
+            web_username: None,
+            web_password: None,
         }
     }
 

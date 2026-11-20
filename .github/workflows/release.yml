@@ -1,0 +1,256 @@
+name: Release
+
+# Builds the full 17-target architecture matrix for rnps (server) and rnpc (client).
+#
+# Triggers:
+#   * push of a tag like v0.1.0  -> build everything and publish a GitHub Release
+#   * manual dispatch            -> build everything, artifacts only (no Release)
+#
+# Runner allocation (see docs/RELEASE-ARCHITECTURES.md for why):
+#   Linux   (13 targets) -> ubuntu-latest  + cross toolchains
+#   Windows ( 2 targets) -> windows-latest (native MSVC)
+#   macOS   ( 2 targets) -> macos-latest   (native Apple SDK)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Release profile in Cargo.toml already sets lto/codegen-units/strip.
+
+jobs:
+  # ---------------------------------------------------------------- Linux ----
+  build-linux:
+    name: linux-${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- glibc (needs the matching cross gcc) ---
+          - target: x86_64-unknown-linux-gnu
+            pkg: []
+            linkergcc: ""
+          - target: aarch64-unknown-linux-gnu
+            pkg: [gcc-aarch64-linux-gnu]
+            linkergcc: aarch64-linux-gnu-gcc
+          - target: i686-unknown-linux-gnu
+            pkg: [gcc-multilib]
+            linkergcc: ""
+          - target: armv7-unknown-linux-gnueabihf
+            pkg: [gcc-arm-linux-gnueabihf]
+            linkergcc: arm-linux-gnueabihf-gcc
+          - target: arm-unknown-linux-gnueabihf
+            pkg: [gcc-arm-linux-gnueabihf]
+            linkergcc: arm-linux-gnueabihf-gcc
+
+          # --- musl (static; self-contained via rust-lld, no cross libc needed) ---
+          - target: x86_64-unknown-linux-musl
+            pkg: []
+            linkergcc: ""
+          - target: aarch64-unknown-linux-musl
+            pkg: []
+            linkergcc: ""
+          - target: i686-unknown-linux-musl
+            pkg: []
+            linkergcc: ""
+          - target: armv7-unknown-linux-musleabihf
+            pkg: []
+            linkergcc: ""
+          - target: arm-unknown-linux-musleabihf
+            pkg: []
+            linkergcc: ""
+
+          # --- MIPS (musl) ---
+          # NOTE: these triples have NO prebuilt std in current stable Rust
+          # (verified: rustup target add fails with "no prebuilt artifacts").
+          # They are kept in the matrix but marked non-blocking; see the docs.
+          - target: mips-unknown-linux-musl
+            pkg: []
+            linkergcc: ""
+            allow_failure: true
+          - target: mipsel-unknown-linux-musl
+            pkg: []
+            linkergcc: ""
+            allow_failure: true
+          - target: mips64-unknown-linux-muslabi64
+            pkg: []
+            linkergcc: ""
+            allow_failure: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross toolchain
+        if: matrix.pkg != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ join(matrix.pkg, ' ') }}
+
+      - name: Configure linker
+        if: matrix.linkergcc != ''
+        run: |
+          KEY="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')_LINKER"
+          echo "$KEY=${{ matrix.linkergcc }}" >> "$GITHUB_ENV"
+
+      - name: Build rnps + rnpc
+        id: build
+        continue-on-error: ${{ matrix.allow_failure == true }}
+        run: |
+          cargo build --release --target '${{ matrix.target }}' \
+            -p nps-app --bin rnps \
+            -p nps-client --bin rnpc
+
+      - name: Package
+        if: steps.build.outcome == 'success'
+        run: |
+          T='${{ matrix.target }}'
+          D="dist/$T"
+          mkdir -p "$D"
+          cp "target/$T/release/rnps" "$D/rnps"
+          cp "target/$T/release/rnpc" "$D/rnpc"
+          case "$T" in
+            *-musl*)
+              for b in rnps rnpc; do llvm-strip "$D/$b" 2>/dev/null || strip "$D/$b" || true; done ;;
+            *-gnueabihf)
+              for b in rnps rnpc; do arm-linux-gnueabihf-strip "$D/$b" 2>/dev/null || true; done ;;
+            aarch64-*)
+              for b in rnps rnpc; do aarch64-linux-gnu-strip "$D/$b" 2>/dev/null || true; done ;;
+          esac
+          ls -l "$D"
+
+      - name: Upload artifact
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-nps-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/*
+          if-no-files-found: error
+
+  # -------------------------------------------------------------- Windows ----
+  build-windows:
+    name: windows-${{ matrix.target }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - i686-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # .cargo/config.toml already pins +crt-static for these two targets,
+      # so the exe runs on machines without the VC++ redistributable.
+      - name: Build rnps + rnpc
+        run: |
+          cargo build --release --target ${{ matrix.target }} `
+            -p nps-app --bin rnps `
+            -p nps-client --bin rnpc
+
+      - name: Package
+        shell: bash
+        run: |
+          T='${{ matrix.target }}'
+          D="dist/$T"
+          mkdir -p "$D"
+          cp "target/$T/release/rnps.exe" "$D/rnps.exe"
+          cp "target/$T/release/rnpc.exe" "$D/rnpc.exe"
+          ls -l "$D"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-nps-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/*
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------- macOS ----
+  # Apple targets cannot be cross-compiled from Linux (they need the macOS SDK
+  # and Apple linker), so they must run on a macOS runner.
+  build-macos:
+    name: macos-${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build rnps + rnpc
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p nps-app --bin rnps \
+            -p nps-client --bin rnpc
+
+      - name: Package
+        run: |
+          T='${{ matrix.target }}'
+          D="dist/$T"
+          mkdir -p "$D"
+          cp "target/$T/release/rnps" "$D/rnps"
+          cp "target/$T/release/rnpc" "$D/rnpc"
+          ls -l "$D"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-nps-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/*
+          if-no-files-found: error
+
+  # --------------------------------------------------------------- Release ----
+  release:
+    name: publish release
+    needs: [build-linux, build-windows, build-macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # Flatten into one archive per target so users get rnps+rnpc together.
+      - name: Assemble release bundles
+        run: |
+          mkdir -p release
+          for d in artifacts/rust-nps-*; do
+            [ -d "$d" ] || continue
+            t="${d#artifacts/rust-nps-}"
+            ( cd "$d" && zip -9 -r "../../release/rust-nps-${t}.zip" . )
+          done
+          ls -l release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.zip
+          generate_release_notes: true
+          draft: false

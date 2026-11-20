@@ -459,26 +459,40 @@ fn safe_binary_rel(rel: &str) -> Result<&Path> {
     Ok(Path::new(rel))
 }
 
-/// 把清单里的相对 `binary` 解析成更新源目录内的真实路径。
+/// 把清单里的相对 `binary` 解析成更新源目录内的真实路径；文件不存在时返回 `None`。
 ///
 /// 先用 [`safe_binary_rel`] 拒绝绝对路径与 `..`，再在 canonicalize 后确认
-/// 仍落在目录内（防符号链接逃逸），最后要求文件真实存在。
-fn resolve_binary(dir: &Path, rel: &str) -> Result<PathBuf> {
+/// 仍落在目录内（防符号链接逃逸）。
+fn resolve_binary_opt(dir: &Path, rel: &str) -> Result<Option<PathBuf>> {
     let raw = safe_binary_rel(rel)?;
     let canon_dir = dir
         .canonicalize()
         .with_context(|| format!("更新源目录无效: {}", dir.display()))?;
     let joined = canon_dir.join(raw);
+    if !joined.exists() {
+        return Ok(None);
+    }
     let canon = joined
         .canonicalize()
-        .with_context(|| format!("更新源缺少二进制文件: {}", joined.display()))?;
+        .with_context(|| format!("更新源二进制路径无效: {}", joined.display()))?;
     if !canon.starts_with(&canon_dir) {
         bail!("更新清单 binary 指向更新源目录之外，拒绝: {rel}");
     }
     if !canon.is_file() {
-        bail!("更新源 binary 不是普通文件: {}", canon.display());
+        return Ok(None);
     }
-    Ok(canon)
+    Ok(Some(canon))
+}
+
+/// 同 [`resolve_binary_opt`]，但文件缺失时直接报错（`apply` 用）。
+fn resolve_binary(dir: &Path, rel: &str) -> Result<PathBuf> {
+    match resolve_binary_opt(dir, rel)? {
+        Some(path) => Ok(path),
+        None => bail!(
+            "更新源缺少二进制文件: {}",
+            dir.join(rel.trim()).display()
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -527,9 +541,9 @@ pub fn plan(dir: &Path, current_version: &str) -> Result<Plan> {
             manifest.version
         )
     })?;
-    // 先做路径安全校验（拒绝 `..` 与绝对路径）；文件缺失只记录，不在计划阶段失败。
-    let rel = safe_binary_rel(&manifest.binary)?;
-    let binary_present = dir.join(rel).is_file();
+    // 先做路径安全校验（拒绝 `..`、绝对路径与符号链接逃逸）；文件缺失只记录，
+    // 不在计划阶段失败。
+    let binary_present = resolve_binary_opt(dir, &manifest.binary)?.is_some();
 
     let blocked = match &manifest.min_version {
         Some(min) => match compare_versions(current_version, min).with_context(|| {

@@ -18,6 +18,8 @@ fn config(enabled: bool) -> ServerConfig {
             flow_limit: 0,
             crypt: false,
             compress: false,
+            web_username: None,
+            web_password: None,
         }],
         tunnels: vec![TcpTunnelConfig {
             id: 1,
@@ -139,6 +141,8 @@ async fn start_rejects_duplicate_client_vkey() {
             flow_limit: 0,
             crypt: false,
             compress: false,
+            web_username: None,
+            web_password: None,
         });
     assert!(Server::start(cfg).await.is_err());
 }

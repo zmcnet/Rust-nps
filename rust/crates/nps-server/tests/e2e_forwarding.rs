@@ -26,6 +26,8 @@ fn config(target_addr: String) -> ServerConfig {
             flow_limit: 0,
             crypt: false,
             compress: false,
+            web_username: None,
+            web_password: None,
         }],
         tunnels: vec![TcpTunnelConfig {
             id: 1,

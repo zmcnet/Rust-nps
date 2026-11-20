@@ -148,14 +148,14 @@ async fn run_instance(
     info!(instance = %name, server = %server, "实例启动");
 
     // 写运行时记录（供 stop/list 使用）。失败不阻断启动。
-    if let Err(e) = crate::instance::record_runtime(&paths.runtime_path(), &name) {
+    if let Err(e) = crate::process::record_self(&root, &name) {
         warn!(instance = %name, error = %e, "写运行时记录失败（rnpc stop 可能不可用）");
     }
 
     let result = run_loop(server, vkey, true, shutdown).await;
 
     // 无论成功失败都清除运行时记录
-    if let Err(e) = crate::instance::clear_runtime(&paths.runtime_path()) {
+    if let Err(e) = crate::process::clear_self(&root, &name) {
         warn!(instance = %name, error = %e, "清除运行时记录失败");
     }
     result

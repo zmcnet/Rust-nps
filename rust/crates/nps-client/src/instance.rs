@@ -382,34 +382,6 @@ pub fn read_runtime(path: &Path) -> Option<RuntimeRecord> {
     }
 }
 
-/// 记录当前进程（供 `rnpc run --name` 调用）。
-///
-/// 用独占创建 + 先读后写的方式，避免两个进程同时写坏文件。
-pub fn record_runtime(path: &Path, name: &str) -> Result<()> {
-    let exe = std::env::current_exe().context("无法获取自身可执行文件路径")?;
-    let record = RuntimeRecord {
-        pid: std::process::id(),
-        started_at: now_rfc3339(),
-        exe: exe.display().to_string(),
-        name: name.to_owned(),
-    };
-    let bytes = serde_json::to_vec_pretty(&record).context("序列化运行时记录失败")?;
-    write_atomic(path, &bytes)
-}
-
-/// 清除运行时记录（只清除属于自己的那条，避免误删后继进程的记录）
-pub fn clear_runtime(path: &Path) -> Result<bool> {
-    let Some(record) = read_runtime(path) else {
-        return Ok(false);
-    };
-    if record.pid != std::process::id() {
-        // 记录已被另一个进程覆盖，不要动
-        return Ok(false);
-    }
-    std::fs::remove_file(path).context("删除运行时记录失败")?;
-    Ok(true)
-}
-
 /// RFC3339 时间戳（UTC，秒精度）
 pub fn now_rfc3339() -> String {
     let secs = std::time::SystemTime::now()

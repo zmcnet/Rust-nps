@@ -89,8 +89,15 @@ async fn run(config_path: PathBuf) -> Result<()> {
         .await
         .context("无法绑定管理端口，请检查 web_addr 和端口占用")?;
     let web_addr = web_listener.local_addr()?;
+
+    // 在把 config 交给 Server 之前，先按原版 `login.go` 的规则构建账号表：
+    // - 管理员：`web_username` + `web_password`
+    // - 客户端：各自的 `web_username` + `web_password`
+    // - 客户端两者都空 → 回退为 `user` + vkey（与原版一致）
+    let accounts = build_accounts(&config);
+
     let server = Server::start(config).await?;
-    let router = match nps_web::router(server.clone(), admin_token) {
+    let router = match nps_web::router_with_accounts(server.clone(), admin_token, accounts) {
         Ok(router) => router,
         Err(error) => {
             server.shutdown().await;
@@ -151,4 +158,46 @@ async fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// 按原版 `login.go` 的规则构建 Web 账号表。
+///
+/// - 管理员：配置里的 `web_username` / `web_password`（两者都非空才生效）
+/// - 客户端：配置里各自的 `web_username` / `web_password`；
+///   两者都为空时回退为 `user` + `vkey`（原版 `Client.GetUser()` 的行为）
+fn build_accounts(config: &nps_server::config::ServerConfig) -> nps_web::AccountStore {
+    let admin = match (
+        config.web_username.as_deref(),
+        config.web_password.as_deref(),
+    ) {
+        (Some(u), Some(p)) if !u.trim().is_empty() && !p.is_empty() => {
+            Some((u.trim().to_owned(), p.to_owned()))
+        }
+        _ => None,
+    };
+
+    let clients: Vec<(i32, String, String, String)> = config
+        .clients
+        .iter()
+        .map(|c| {
+            let user = c
+                .web_username
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .unwrap_or("user")
+                .to_owned();
+            let pass = c
+                .web_password
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .unwrap_or(&c.vkey)
+                .to_owned();
+            // 元组顺序是 (client_id, web_user, web_pass, vkey)：
+            // 前两个是登录凭据，vkey 仅在两者都空时作为回退密码。
+            (c.id, user, pass, c.vkey.clone())
+        })
+        .collect();
+
+    nps_web::AccountStore::build(admin, &clients)
 }
