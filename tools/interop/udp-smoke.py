@@ -17,9 +17,12 @@ Two server modes:
     crates/nps-server/tests/udp_tunnel.rs starts the legacy Bridge + a conf
     handler that accepts the task registration + a real UdpTunnel bound to the
     UDP port given via env.
-  * --server-bin <rnps.exe>: the REAL production server binary reads a JSON
-    config with a `udp_tunnels` entry (the same code path users run). Stronger
-    evidence: it exercises Server::start wiring + config parsing + shutdown.
+  * --server-bin <rnps.exe>: the REAL production server binary. Two sub-paths:
+      - default: JSON `udp_tunnels` defines the tunnel, npc runs plain
+        (-server/-vkey). Exercises Server::start wiring + config parsing.
+      - --conf-register: JSON has no udp_tunnels; npc runs with
+        `-config=npc.conf` whose `[udp] mode=udp` section is registered over the
+        legacy `conf` handshake (conf.rs -> register_udp_task -> UdpTunnel).
 
 Run:
     python -I udp-smoke.py --npc-bin <npc.exe> [--harness-bin <udp_tunnel.exe>]
@@ -241,14 +244,23 @@ def solve_harness_bin(repo: Path, explicit: str | None) -> Path:
 
 
 def start_rnps(server_bin: Path, run_dir: Path, bridge_port: int, tunnel_port: int,
-               target_addr: tuple[str, int], vkey: str) -> dict:
-    """Start the real rnps binary with a JSON config containing one UDP tunnel."""
+               target_addr: tuple[str, int], vkey: str, conf_register: bool = False) -> dict:
+    """Start the real rnps binary.
+
+    `conf_register=False`: the JSON `udp_tunnels` list defines the tunnel.
+    `conf_register=True` : JSON has no udp_tunnels; the tunnel must come from
+    npc's `[udp] mode=udp` conf registration (conf.rs path).
+    """
     cfg = {
         "bridge_addr": f"127.0.0.1:{bridge_port}",
         "web_addr": f"127.0.0.1:{free_tcp_port()}",
         "clients": [{"id": 1, "name": "udp-interop", "vkey": vkey}],
         "tunnels": [],
-        "udp_tunnels": [
+        "conf_register": conf_register,
+        "conf_listen_host": "127.0.0.1",
+    }
+    if not conf_register:
+        cfg["udp_tunnels"] = [
             {
                 "id": 1,
                 "name": "udp-echo",
@@ -257,8 +269,7 @@ def start_rnps(server_bin: Path, run_dir: Path, bridge_port: int, tunnel_port: i
                 "target_addr": f"{target_addr[0]}:{target_addr[1]}",
                 "enabled": True,
             }
-        ],
-    }
+        ]
     cfg_path = run_dir / "config.json"
     cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     env = dict(os.environ)
@@ -288,6 +299,10 @@ def udp_probe(addr: tuple[str, int], tcp_udp_port: int, timeout: float) -> tuple
             data, _ = sock.recvfrom(65535)
         except socket.timeout:
             return False, "timeout"
+        except ConnectionResetError:
+            # Windows surfaces the ICMP port-unreachable from a *previous*
+            # probe as WSAECONNRESET on the next recvfrom. Treat as "not up yet".
+            return False, "port-unreachable (ICMP)"
         if data != payload:
             return False, f"echo mismatch (got {data[:32]!r} len={len(data)})"
         return True, "ok"
@@ -309,6 +324,9 @@ def recv_exact_total(sock: socket.socket, total: int, timeout: float) -> tuple[b
             data, _ = sock.recvfrom(65535)
         except socket.timeout:
             break
+        except ConnectionResetError:
+            # ICMP port-unreachable noise on Windows; keep waiting.
+            continue
         buf += data
         chunks.append(len(data))
     return bytes(buf), chunks
@@ -343,7 +361,8 @@ def run(args: argparse.Namespace) -> int:
         ready_file = run_dir / "harness.ready"
 
         if use_rnps:
-            harness = start_rnps(server_bin, run_dir, bridge_port, tunnel_port, echo_addr, vkey)
+            harness = start_rnps(server_bin, run_dir, bridge_port, tunnel_port, echo_addr, vkey,
+                                 conf_register=args.conf_register)
             # rnps has no ready file: poll its ports until it answers
             deadline = time.monotonic() + START_TIMEOUT
             ready = False
@@ -381,28 +400,41 @@ def run(args: argparse.Namespace) -> int:
             wait_ready(ready_file, harness, START_TIMEOUT)
             checks.ok("harness ready", f"bridge={bridge_port} udp={tunnel_port} target={echo_addr}")
 
-        # ---- real Go npc with a `mode=udp` config File ----------------------
-        conf = run_dir / "npc.conf"
-        conf.write_text(
-            "[common]\n"
-            f"server_addr=127.0.0.1:{bridge_port}\n"
-            f"vkey={vkey}\n"
-            "conn_type=tcp\n"
-            "auto_reconnection=true\n"
-            "\n"
-            "[udp-echo]\n"
-            "mode=udp\n"
-            f"server_port={tunnel_port}\n"
-            f"target_addr={echo_addr[0]}:{echo_addr[1]}\n",
-            encoding="utf-8",
-        )
-        log(f"[npc.conf]\n{conf.read_text(encoding='utf-8')}")
+        if use_rnps and not args.conf_register:
+            # Production path A: the server owns the UDP tunnel from its JSON
+            # `udp_tunnels` config, so npc only needs bridge+vkey (plain mode).
+            npc = spawn(
+                "npc",
+                [str(npc_bin), f"-server=127.0.0.1:{bridge_port}", f"-vkey={vkey}",
+                 "-type=tcp", "-log=stdout", "-log_level=7"],
+                dict(os.environ), run_dir / "npc.log", run_dir,
+            )
+            log("[npc] plain mode (-server/-vkey); UDP tunnel comes from rnps JSON config")
+        else:
+            # ---- real Go npc with a `mode=udp` config file --------------------
+            # (production --conf-register: conf.rs creates the UDP listener;
+            #  default harness mode: the harness conf handler accepts the task)
+            conf = run_dir / "npc.conf"
+            conf.write_text(
+                "[common]\n"
+                f"server_addr=127.0.0.1:{bridge_port}\n"
+                f"vkey={vkey}\n"
+                "conn_type=tcp\n"
+                "auto_reconnection=true\n"
+                "\n"
+                "[udp-echo]\n"
+                "mode=udp\n"
+                f"server_port={tunnel_port}\n"
+                f"target_addr={echo_addr[0]}:{echo_addr[1]}\n",
+                encoding="utf-8",
+            )
+            log(f"[npc.conf]\n{conf.read_text(encoding='utf-8')}")
 
-        npc = spawn(
-            "npc",
-            [str(npc_bin), f"-config={conf}", "-log=stdout", "-log_level=7"],
-            dict(os.environ), run_dir / "npc.log", run_dir,
-        )
+            npc = spawn(
+                "npc",
+                [str(npc_bin), f"-config={conf}", "-log=stdout", "-log_level=7"],
+                dict(os.environ), run_dir / "npc.log", run_dir,
+            )
 
         # ---- wait until the tunnel actually forwards ----------------------
         tunnel_addr = ("127.0.0.1", tunnel_port)
@@ -442,6 +474,9 @@ def run(args: argparse.Namespace) -> int:
                 got, _ = sock.recvfrom(65535)
             except socket.timeout:
                 seq_fail.append(f"#{i}: timeout")
+                continue
+            except ConnectionResetError:
+                seq_fail.append(f"#{i}: icmp-reset")
                 continue
             if got == body:
                 seq_ok += 1
@@ -547,6 +582,9 @@ def main() -> int:
                     help="udp_tunnel test binary (auto-located via cargo when omitted)")
     ap.add_argument("--server-bin", default=None,
                     help="use the real rnps.exe (JSON udp_tunnels config) instead of the harness")
+    ap.add_argument("--conf-register", action="store_true",
+                    help="with --server-bin: register the tunnel through npc.conf's "
+                         "[udp] mode=udp conf handshake instead of JSON udp_tunnels")
     ap.add_argument("--repo", default=str(Path(__file__).resolve().parents[2] / "rust"),
                     help="rust workspace root (default: ../../rust)")
     args = ap.parse_args()

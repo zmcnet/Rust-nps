@@ -84,8 +84,6 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 struct FlowEntry {
     /// 有界队列：recv 循环只 `try_send`，慢流只丢自己的包
     send: mpsc::Sender<Vec<u8>>,
-    /// 最近一次活动（上行命中 / 下行响应）的毫秒时间戳
-    last_active: Arc<AtomicU64>,
     /// 已入队但未被子流消费的字节数（近似值：并发下允许短暂超采，仅用于限流）
     queued_bytes: Arc<AtomicU64>,
     /// 每流排队字节上限
@@ -328,6 +326,12 @@ impl UdpTunnel {
                     Err(e) => {
                         warn!("UDP 隧道 {} recv_from 失败: {e}", self.cfg.id);
                         self.set_error(format!("recv_from 失败: {e}")).await;
+                        // 短暂退避，避免 socket 持续报错时把 CPU 打满；
+                        // 取消信号仍能在 select 里及时打断。
+                        tokio::select! {
+                            _ = cancel.changed() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                        }
                         continue;
                     }
                 },
@@ -337,7 +341,6 @@ impl UdpTunnel {
             // ① 命中映射：刷新活跃时间，非阻塞入队
             let existing = flows.lock().await.get(&addr).cloned();
             if let Some(entry) = existing {
-                touch(&entry.last_active);
                 enqueue(&entry, data, self.cfg.id, addr);
                 continue;
             }
@@ -462,10 +465,8 @@ impl UdpTunnel {
         }
 
         let (tx, mut rx) = mpsc::channel(self.per_flow_queue);
-        let last_active = Arc::new(AtomicU64::new(now_millis()));
         let entry = Arc::new(FlowEntry {
             send: tx.clone(),
-            last_active: last_active.clone(),
             queued_bytes: Arc::new(AtomicU64::new(first.len() as u64)),
             max_queued_bytes: self.per_flow_bytes,
         });
@@ -480,13 +481,10 @@ impl UdpTunnel {
         let _ = tx.try_send(first);
 
         // 上行：队列 -> mux。慢子流在这里 await，不阻塞 recv 循环。
-        let up_last = last_active.clone();
         let up_bytes = entry.queued_bytes.clone();
         let up_tunnel = self.clone();
-        let up_addr = addr;
         let mut up = Pump::new(tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
-                touch(&up_last);
                 // 无论成功与否都释放排队字节额度（数据已出队）
                 let _ = up_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(data.len() as u64))
@@ -498,14 +496,17 @@ impl UdpTunnel {
                 up_tunnel
                     .bytes_to_client
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
-                let _ = up_addr;
             }
             // 不做半关闭：老协议没有独立半关闭帧，发 ConnClose 会截断下行响应
         }));
 
         // 下行：mux -> UDP socket（独立任务；按 Go `PoolSizeUdp` 分块写回）
+        //
+        // 空闲判定严格对齐 Go `udp.go`：**只有下行读活动**刷新
+        // `SetReadDeadline(now+10min)`。上行持续但下行长期无响应的流同样会在
+        // 超时后回收（否则对端目标已消失的流会永久占着名额）。
         let this = self.clone();
-        let down_last = last_active.clone();
+        let down_last = Arc::new(AtomicU64::new(now_millis()));
         let down_socket = socket.clone();
         let mut down_cancel = cancel.clone();
         let mut down = Pump::new(tokio::spawn(async move {

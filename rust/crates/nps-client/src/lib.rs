@@ -15,9 +15,9 @@
 //! - `tcp`：拨号目标 + 双向拷贝（已实现）
 //! - `udp`：绑定本地 UDP + 双向数据报转发，见 [`udp`]
 //! - `http`：解析一个完整 HTTP 请求后透传 + 双向拷贝，见 [`http_proxy`]
-//! - `udp5`：SOCKS5 UDP ASSOCIATE，**暂不支持**（原版两端分帧不对称），见 [`socks5`]
+//! - `udp5`：SOCKS5 UDP ASSOCIATE 中继，见 [`socks5`]
 //!
-//! 本阶段明确不实现：SOCKS5 UDP ASSOCIATE(`udp5`)、KCP、P2P、加密、压缩。
+//! 本阶段明确不实现：KCP、P2P、加密、压缩。
 //! 迁移期结束后，本 crate 与 `nps-legacy` 一并删除。
 
 pub mod cli;

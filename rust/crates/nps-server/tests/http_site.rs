@@ -143,10 +143,7 @@ async fn spawn_fake_npc(
 }
 
 /// 消费一个 chunked 请求体（含尾部头）
-async fn drain_chunked(
-    stream: &mut nps_legacy::mux::MuxStream,
-    pending: &mut Vec<u8>,
-) -> bool {
+async fn drain_chunked(stream: &mut nps_legacy::mux::MuxStream, pending: &mut Vec<u8>) -> bool {
     loop {
         let line = match take_line(stream, pending).await {
             Some(line) => line,
@@ -278,8 +275,7 @@ async fn respond(stream: &mut nps_legacy::mux::MuxStream, path: &str) -> bool {
             true
         }
         "/close" => {
-            let head =
-                b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 4\r\n\r\nbye\n";
+            let head = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 4\r\n\r\nbye\n";
             stream.send_data(head).await.is_ok()
         }
         "/until-close" => {
@@ -322,7 +318,6 @@ async fn respond(stream: &mut nps_legacy::mux::MuxStream, path: &str) -> bool {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // 测试环境
@@ -430,10 +425,7 @@ fn site(domain: &str, target: &str) -> HttpSite {
 }
 
 /// 发一个请求并读完整响应（按 Content-Length / chunked / EOF 判定结束）
-async fn roundtrip(
-    addr: SocketAddr,
-    raw_request: &str,
-) -> (String, Vec<u8>, bool) {
+async fn roundtrip(addr: SocketAddr, raw_request: &str) -> (String, Vec<u8>, bool) {
     let mut sock = TcpStream::connect(addr).await.unwrap();
     sock.write_all(raw_request.as_bytes()).await.unwrap();
     read_response(&mut sock).await
@@ -528,7 +520,11 @@ async fn longest_path_prefix_selects_target() {
     )
     .await;
 
-    let cases = [("/", "10.0.0.1:80"), ("/api/x", "10.0.0.2:8000"), ("/api/v2/x", "10.0.0.3:9000")];
+    let cases = [
+        ("/", "10.0.0.1:80"),
+        ("/api/x", "10.0.0.2:8000"),
+        ("/api/v2/x", "10.0.0.3:9000"),
+    ];
     for (path, expected) in cases {
         let req = format!("GET {path} HTTP/1.1\r\nHost: site.test\r\n\r\n");
         let (head, _, _) = roundtrip(h.http_addr, &req).await;
@@ -572,9 +568,14 @@ async fn chunked_response_is_relayed() {
     let req = format!("GET /chunked HTTP/1.1\r\nHost: {DOMAIN}\r\n\r\n");
     let (head, body, _) = roundtrip(h.http_addr, &req).await;
     assert_eq!(status_of(&head), 200);
-    assert!(head.to_ascii_lowercase().contains("transfer-encoding: chunked"));
+    assert!(head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked"));
     let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("alpha") && text.contains("beta") && text.contains("gamma"), "{text}");
+    assert!(
+        text.contains("alpha") && text.contains("beta") && text.contains("gamma"),
+        "{text}"
+    );
     assert!(text.trim_end().ends_with("0"), "缺少终止块: {text:?}");
     let _ = h.next_link().await;
 }
@@ -735,7 +736,10 @@ async fn unmatched_host_returns_404_with_connection_close() {
     let req = "GET / HTTP/1.1\r\nHost: nope.local\r\n\r\n";
     let (head, _, _) = roundtrip(h.http_addr, req).await;
     assert_eq!(status_of(&head), 404);
-    assert!(head.to_ascii_lowercase().contains("connection: close"), "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "{head}"
+    );
     // 没有建流发生
     assert!(h.links.try_recv().is_err());
 }
@@ -746,7 +750,10 @@ async fn offline_client_returns_502() {
     let req = format!("GET / HTTP/1.1\r\nHost: {DOMAIN}\r\n\r\n");
     let (head, _, _) = roundtrip(h.http_addr, &req).await;
     assert_eq!(status_of(&head), 502, "head={head}");
-    assert!(head.to_ascii_lowercase().contains("connection: close"), "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "{head}"
+    );
     let _ = h;
 }
 
@@ -832,6 +839,9 @@ async fn router_api_surface_works_without_server_wiring() {
 
     let router = HttpSiteRouter::new(vec![site]).unwrap();
     assert_eq!(router.len(), 1);
-    assert_eq!(router.resolve(DOMAIN, "/api/x").unwrap().target, "127.0.0.1:9001");
+    assert_eq!(
+        router.resolve(DOMAIN, "/api/x").unwrap().target,
+        "127.0.0.1:9001"
+    );
     assert!(router.resolve("other.test", "/").is_none());
 }

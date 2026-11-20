@@ -318,10 +318,10 @@ async fn privileged_port_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. 非 tcp 模式 -> false
+// 7. udp 模式注册成功并真的建 UDP 监听（对齐 Go 的 `OpenTask <- tl`）
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn non_tcp_mode_is_rejected() {
+async fn udp_mode_registers_and_listens() {
     let server = Server::start(config(true, 8)).await.unwrap();
     let port = free_port().await;
     let target = format!("127.0.0.1:{}", free_port().await);
@@ -331,8 +331,48 @@ async fn non_tcp_mode_is_rejected() {
     let mut conn = npc_handshake(server.bridge_addr(), b"conf").await;
     assert!(!read_bool(&mut conn).await);
     send_frame(&mut conn, b"task", &body).await;
-    assert!(!read_bool(&mut conn).await, "udp 模式必须返回 false");
-    assert!(server.snapshot().await.tunnels.is_empty());
+    assert!(read_bool(&mut conn).await, "udp 模式必须注册成功");
+
+    // 必须真的出现在快照里，且处于启用状态
+    let snap = server.snapshot().await;
+    let udp = snap
+        .tunnels
+        .iter()
+        .find(|t| t.name == "udp-tunnel")
+        .expect("udp 隧道应出现在快照中");
+    assert!(udp.enabled, "udp 隧道应为启用状态");
+    assert_eq!(udp.target_addr, target);
+    assert_eq!(udp.client_id, 1);
+
+    // 端口必须真的在监听（绑定失败即说明已被占用）
+    assert!(
+        std::net::UdpSocket::bind(format!("127.0.0.1:{port}")).is_err(),
+        "udp 端口 {port} 应已被监听"
+    );
+
+    server.shutdown().await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        std::net::UdpSocket::bind(format!("127.0.0.1:{port}")).is_ok(),
+        "shutdown 后 udp 端口 {port} 应已释放"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7b. 未实现的模式仍诚实返回 false
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn unknown_mode_is_rejected() {
+    let server = Server::start(config(true, 8)).await.unwrap();
+    let port = free_port().await;
+    let target = format!("127.0.0.1:{}", free_port().await);
+    let mut body = task(port, &target, "weird");
+    body["Mode"] = json!("socks5");
+
+    let mut conn = npc_handshake(server.bridge_addr(), b"conf").await;
+    assert!(!read_bool(&mut conn).await);
+    send_frame(&mut conn, b"task", &body).await;
+    assert!(!read_bool(&mut conn).await, "未实现的模式必须返回 false");
     server.shutdown().await;
 }
 

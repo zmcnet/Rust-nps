@@ -72,6 +72,8 @@ pub(crate) struct ConfRegistry {
 struct Inner {
     /// 与 Server 共享的隧道表（配置隧道在前、注册隧道追加）
     tunnels: Arc<Mutex<Vec<Arc<Tunnel>>>>,
+    /// 与 Server 共享的 UDP 隧道表（conf 注册的 UDP 任务追加到这里）
+    udp_tunnels: Arc<Mutex<Vec<Arc<crate::udp::UdpTunnel>>>>,
     /// md5(vkey) -> client id，仅用于 `stus` 帧校验归属（不写日志、不进快照）
     verify: Arc<std::collections::HashMap<String, i32>>,
     /// 注册隧道的监听 IP（客户端只上报端口）
@@ -91,6 +93,7 @@ struct Inner {
 impl ConfRegistry {
     pub(crate) fn new(
         tunnels: Arc<Mutex<Vec<Arc<Tunnel>>>>,
+        udp_tunnels: Arc<Mutex<Vec<Arc<crate::udp::UdpTunnel>>>>,
         verify: Arc<std::collections::HashMap<String, i32>>,
         listen_host: IpAddr,
         max_tunnels: usize,
@@ -100,6 +103,7 @@ impl ConfRegistry {
         Self {
             inner: Arc::new(Inner {
                 tunnels,
+                udp_tunnels,
                 verify,
                 listen_host,
                 max_tunnels,
@@ -272,10 +276,139 @@ impl ConfRegistry {
         client_id: i32,
         info: &TaskInfo,
     ) -> Result<Registered, String> {
-        if !matches!(info.mode.as_str(), "" | "tcp") {
-            return Err(format!("仅支持 tcp 隧道，收到 mode={:?}", info.mode));
+        match info.mode.as_str() {
+            "" | "tcp" => self.register_tcp_task(bridge, client_id, info).await,
+            "udp" => self.register_udp_task(bridge, client_id, info).await,
+            other => Err(format!(
+                "暂不支持 mode={other:?}（当前支持 tcp / udp）"
+            )),
+        }
+    }
+
+    /// 注册一条 UDP 隧道。
+    ///
+    /// 对齐 Go `bridge.go` 的 `NEW_TASK` 处理：原版对每个端口调 `s.OpenTask <- tl`，
+    /// 即**真的创建监听器**（`NewMode` 按 `mode` 选 `UdpModeServer`），
+    /// 所以这里也必须真正建 UDP 监听，而不是只回 true。
+    async fn register_udp_task(
+        &self,
+        bridge: &Bridge,
+        client_id: i32,
+        info: &TaskInfo,
+    ) -> Result<Registered, String> {
+        let ports = parse_ports(&info.ports, info.port);
+        if ports.is_empty() {
+            return Err("server_port 缺失或非法".to_owned());
+        }
+        if ports.len() > 1 {
+            return Err(format!(
+                "多端口任务未支持（收到 {} 个端口，请拆成多个配置段）",
+                ports.len()
+            ));
+        }
+        let port = ports[0];
+        if port < CONF_MIN_LISTEN_PORT {
+            return Err(format!(
+                "端口 {port} 是特权端口（<{CONF_MIN_LISTEN_PORT}），拒绝监听"
+            ));
+        }
+        let target = resolve_target(info)?;
+        let name = display_name(&info.remark, port);
+        if name.is_empty() {
+            return Err("隧道名（remark）清洗后为空".to_owned());
+        }
+        let listen = SocketAddr::new(self.inner.listen_host, port);
+
+        let _serial = self.inner.register_op.lock().await;
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            return Err("服务端正在关闭".to_owned());
         }
 
+        let existing_udp = self.inner.udp_tunnels.lock().await.clone();
+        let existing_tcp = self.inner.tunnels.lock().await.clone();
+
+        // ① 幂等：同 client + 同 remark + 同端口 + 同目标 -> 复用
+        if let Some(prev) = existing_udp
+            .iter()
+            .find(|t| same_udp_identity(t, client_id, &name, port, &target))
+        {
+            let id = t_id(prev);
+            if prev.is_listening().await {
+                return Ok(Registered {
+                    id,
+                    created: false,
+                    describe: format!("{listen}/udp -> {target}（已在运行）"),
+                });
+            }
+            // 存在但未监听：重新启动
+            prev.start(bridge.clone())
+                .await
+                .map_err(|e| format!("重新启动 UDP 隧道 {id} 失败: {e:#}"))?;
+            info!("配置文件模式重新启动已存在的 UDP 隧道 {id} ({name}) 监听 {listen}");
+            return Ok(Registered {
+                id,
+                created: false,
+                describe: format!("{listen}/udp -> {target}（重新启动）"),
+            });
+        }
+
+        // ② 端口冲突：TCP 与 UDP 共享同一 IP:port 是允许的（协议不同），
+        //    但同一协议内不允许重复。
+        for t in &existing_udp {
+            if parse_listen_addr(&t.cfg.listen_addr) == Some(listen) && t.is_listening().await {
+                return Err(format!(
+                    "UDP 端口 {listen} 已被隧道 {} ({}) 占用",
+                    t_id(t),
+                    t.cfg.name
+                ));
+            }
+        }
+        let _ = &existing_tcp; // TCP 同端口不冲突，仅保留以表明这是有意为之
+
+        // ③ 总数上限
+        if existing_udp.len() + existing_tcp.len() >= self.inner.max_tunnels {
+            return Err(format!(
+                "隧道总数已达上限 {}（conf_max_tunnels）",
+                self.inner.max_tunnels
+            ));
+        }
+
+        // ④ 分配 id、建 UdpTunnel、绑定并启动
+        let id = self
+            .inner
+            .next_id
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+            .map_err(|_| "隧道 id 已耗尽".to_owned())?;
+        let tunnel = Arc::new(crate::udp::UdpTunnel::new(
+            crate::config::UdpTunnelConfig {
+                id,
+                name: name.clone(),
+                client_id,
+                listen_addr: listen.to_string(),
+                target_addr: target.clone(),
+                enabled: true,
+                idle_timeout_secs: crate::config::DEFAULT_UDP_IDLE_SECS,
+                max_sessions: crate::config::DEFAULT_UDP_MAX_SESSIONS,
+            },
+        ));
+        let bound = tunnel
+            .start(bridge.clone())
+            .await
+            .map_err(|e| format!("UDP 监听 {listen} 失败: {e:#}"))?;
+        self.inner.udp_tunnels.lock().await.push(tunnel);
+        Ok(Registered {
+            id,
+            created: true,
+            describe: format!("{bound}/udp -> {target}"),
+        })
+    }
+
+    async fn register_tcp_task(
+        &self,
+        bridge: &Bridge,
+        client_id: i32,
+        info: &TaskInfo,
+    ) -> Result<Registered, String> {
         let ports = parse_ports(&info.ports, info.port);
         if ports.is_empty() {
             return Err("server_port 缺失或非法".to_owned());
@@ -571,6 +704,25 @@ fn same_identity(t: &Tunnel, client_id: i32, name: &str, port: u16, target: &str
         && t.cfg.name == name
         && t.cfg.target_addr == target
         && parse_listen_addr(&t.cfg.listen_addr).map(|a| a.port()) == Some(port)
+}
+
+/// UDP 隧道的身份比较（与 TCP 版同语义，但作用在 `UdpTunnel` 上）
+fn same_udp_identity(
+    t: &crate::udp::UdpTunnel,
+    client_id: i32,
+    name: &str,
+    port: u16,
+    target: &str,
+) -> bool {
+    t.cfg.client_id == client_id
+        && t.cfg.name == name
+        && t.cfg.target_addr == target
+        && parse_listen_addr(&t.cfg.listen_addr).map(|a| a.port()) == Some(port)
+}
+
+/// 取 UDP 隧道 id（`UdpTunnel::id()` 已有，这里只是让调用处更简洁）
+fn t_id(t: &crate::udp::UdpTunnel) -> u32 {
+    t.id()
 }
 
 fn parse_listen_addr(addr: &str) -> Option<SocketAddr> {

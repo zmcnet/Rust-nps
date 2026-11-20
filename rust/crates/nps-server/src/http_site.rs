@@ -75,10 +75,8 @@ pub const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(15);
 /// 每个站点默认的并发请求上限
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
-/// `Host` 记录的路径路由：前缀 → 目标。
-///
-/// 直接复用 [`crate::config::HttpRoute`]（配置层已定义 `prefix` / `target_addr`），
-/// 避免同一契约出现两份定义。
+// `Host` 记录的路径路由直接复用 `crate::config::HttpRoute`
+// （配置层已定义 `prefix` / `target_addr`），避免同一契约出现两份定义。
 
 /// 一个 HTTP 域名站点（对应原版 `file.Host` 的可用子集）。
 ///
@@ -151,7 +149,10 @@ impl HttpSite {
             bail!("HTTP 站点 {} 的 client_id 必须为正数", self.domain);
         }
         validate_target(&self.target).with_context(|| {
-            format!("HTTP 站点 {} 的 target 非法: {:?}", self.domain, self.target)
+            format!(
+                "HTTP 站点 {} 的 target 非法: {:?}",
+                self.domain, self.target
+            )
         })?;
         for route in &self.routes {
             if route.prefix.trim().is_empty() {
@@ -237,11 +238,11 @@ pub struct SiteGuard {
 
 impl Drop for SiteGuard {
     fn drop(&mut self) {
-        let _ = self.active.try_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |v| Some(v.saturating_sub(1)),
-        );
+        let _ = self
+            .active
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 }
 
@@ -264,7 +265,6 @@ impl Drop for ConnCounter {
             });
     }
 }
-
 
 /// 域名 → 站点 的路由表。
 #[derive(Debug, Default)]
@@ -540,11 +540,7 @@ impl HttpSiteServer {
     /// 在已绑定的监听器上跑 accept 循环；`cancel` 变为 `true` 时退出。
     ///
     /// 退出时会 abort 所有连接任务（各自的子流随 `Drop` 收到 `ConnClose`）。
-    pub async fn serve(
-        self: Arc<Self>,
-        listener: TcpListener,
-        mut cancel: watch::Receiver<bool>,
-    ) {
+    pub async fn serve(self: Arc<Self>, listener: TcpListener, mut cancel: watch::Receiver<bool>) {
         let addr = listener.local_addr().ok();
         info!("HTTP 域名代理监听 {:?}", addr);
         let mut conns: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
@@ -581,7 +577,9 @@ impl HttpSiteServer {
         cancel: watch::Receiver<bool>,
     ) -> Result<(std::net::SocketAddr, JoinHandle<()>)> {
         let listener = self.bind().await?;
-        let bound = listener.local_addr().context("读取 HTTP 代理绑定地址失败")?;
+        let bound = listener
+            .local_addr()
+            .context("读取 HTTP 代理绑定地址失败")?;
         let task = tokio::spawn(async move {
             self.serve(listener, cancel).await;
         });
@@ -611,7 +609,8 @@ impl HttpSiteServer {
                 Ok(Ok(head)) => head,
                 Ok(Err(HttpError::HeadTooLarge)) => {
                     self.served_requests.fetch_add(1, Ordering::Relaxed);
-                    let _ = send_error(&mut write_half, 431, "Request Header Fields Too Large").await;
+                    let _ =
+                        send_error(&mut write_half, 431, "Request Header Fields Too Large").await;
                     return;
                 }
                 Ok(Err(HttpError::Eof)) => return,
@@ -741,7 +740,11 @@ impl HttpSiteServer {
         // 那个中间响应会被跳过（客户端已经收到过）。
         let expect_continue = header_contains_token(&request.headers, "expect", "100-continue");
         if expect_continue {
-            if write_half.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await.is_err() {
+            if write_half
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await
+                .is_err()
+            {
                 return Err(ServeError {
                     kind: ServeErrorKind::ClientGone,
                     response_started: true,
@@ -767,8 +770,11 @@ impl HttpSiteServer {
 
         // 读取响应头（1xx 中间响应先转发再继续读；101 走升级分支）
         let (head, resp) = loop {
-            let head = match timeout(RESPONSE_HEAD_TIMEOUT, response.read_head(self.max_head_bytes))
-                .await
+            let head = match timeout(
+                RESPONSE_HEAD_TIMEOUT,
+                response.read_head(self.max_head_bytes),
+            )
+            .await
             {
                 Err(_) => {
                     debug!("HTTP 域名代理: 等待目标响应超时");
@@ -883,10 +889,7 @@ impl HttpSiteServer {
         let stream = match timeout(OPEN_STREAM_TIMEOUT, mux.open_stream()).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
-                debug!(
-                    "HTTP 域名代理: 客户端 {} 建流失败: {e}",
-                    site.client_id
-                );
+                debug!("HTTP 域名代理: 客户端 {} 建流失败: {e}", site.client_id);
                 return Err(ServeErrorKind::ClientOffline);
             }
             Err(_) => {
@@ -1116,10 +1119,23 @@ fn trim_ows(value: &str) -> &str {
 fn is_token(text: &str) -> bool {
     !text.is_empty()
         && text.bytes().all(|b| {
-            matches!(b,
-                b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
-                | b'^' | b'_' | b'`' | b'|' | b'~')
-                || b.is_ascii_alphanumeric()
+            matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            ) || b.is_ascii_alphanumeric()
         })
 }
 
@@ -1203,6 +1219,9 @@ trait ChunkSource {
 }
 
 impl ChunkSource for OwnedReadHalf {
+    // 显式写成 `impl Future + Send`（而不是 `async fn`）：trait 方法必须
+    // 保证 Send，才能把连接处理放进 tokio::spawn 的多线程任务里。
+    #[allow(clippy::manual_async_fn)]
     fn next_chunk(&mut self) -> impl std::future::Future<Output = Option<Vec<u8>>> + Send + '_ {
         async move {
             let mut buf = vec![0u8; COPY_BUF];
@@ -1218,6 +1237,7 @@ impl ChunkSource for OwnedReadHalf {
 }
 
 impl ChunkSource for MuxRecvHalf {
+    #[allow(clippy::manual_async_fn)]
     fn next_chunk(&mut self) -> impl std::future::Future<Output = Option<Vec<u8>>> + Send + '_ {
         async move { self.recv_data().await }
     }
@@ -1406,9 +1426,7 @@ async fn forward_chunked(
             // 尾部头：逐行转发到空行为止
             loop {
                 let trailer = client.read_line(MAX_HEAD_BYTES).await?;
-                let empty = trailer
-                    .iter()
-                    .all(|b| matches!(b, b'\r' | b'\n'));
+                let empty = trailer.iter().all(|b| matches!(b, b'\r' | b'\n'));
                 if send.send_data(&trailer).await.is_err() {
                     return Err(HttpError::Malformed("写子流失败"));
                 }
@@ -1638,7 +1656,10 @@ mod tests {
         ])])
         .unwrap();
 
-        assert_eq!(router.resolve("a.local", "/").unwrap().target, "127.0.0.1:1");
+        assert_eq!(
+            router.resolve("a.local", "/").unwrap().target,
+            "127.0.0.1:1"
+        );
         assert_eq!(
             router.resolve("a.local", "/api/x").unwrap().target,
             "127.0.0.1:2"
@@ -1675,7 +1696,9 @@ mod tests {
     #[test]
     fn invalid_site_rejected() {
         assert!(HttpSite::new("", 1, "127.0.0.1:1").validate().is_err());
-        assert!(HttpSite::new("a.local", 0, "127.0.0.1:1").validate().is_err());
+        assert!(HttpSite::new("a.local", 0, "127.0.0.1:1")
+            .validate()
+            .is_err());
         assert!(HttpSite::new("a.local", 1, "127.0.0.1").validate().is_err());
         assert!(HttpSite::new("a.local", 1, "127.0.0.1:1")
             .with_routes(vec![route("api", "127.0.0.1:2")])
@@ -1704,7 +1727,8 @@ mod tests {
 
     #[test]
     fn conflicting_content_length_rejected() {
-        let raw = b"POST / HTTP/1.1\r\nHost: a.local\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n";
+        let raw =
+            b"POST / HTTP/1.1\r\nHost: a.local\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n";
         assert!(RequestHead::parse(raw).is_err());
     }
 

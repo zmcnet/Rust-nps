@@ -17,7 +17,6 @@
 //! 单连接累计缓冲上限（[`MAX_RELAY_BUFFER`]）与非 TCP 子流的空闲超时
 //! （[`RELAY_IDLE_TIMEOUT`]）都集中在本文件，避免各协议各自为政。
 
-use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -303,7 +302,10 @@ pub(crate) trait ChunkSource {
     /// 消费掉前 `n` 字节。
     fn consume(&mut self, n: usize);
     /// 取下一块数据；返回 `false` 表示子流已关闭。
-    async fn fill(&mut self) -> bool;
+    ///
+    /// 用 RPITIT（`impl Future`）而非 `async fn`，这样 trait 对 dyn 不友好但
+    /// 无需 `async_trait` 一类额外依赖；实现方允许写成 `async fn`。
+    fn fill(&mut self) -> impl std::future::Future<Output = bool> + Send;
 }
 
 /// 带缓冲的 mux 子流读取器。

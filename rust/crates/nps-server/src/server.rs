@@ -41,8 +41,11 @@ struct ServerInner {
     tunnels: Arc<Mutex<Vec<Arc<Tunnel>>>>,
     /// 配置文件模式注册表；`None` = 该能力关闭
     conf: Option<Arc<ConfRegistry>>,
-    /// UDP 隧道（配置里的 `udp_tunnels`）
-    udp: Vec<Arc<crate::udp::UdpTunnel>>,
+    /// UDP 隧道（配置里的 `udp_tunnels` + conf 动态注册的）
+    ///
+    /// 与 [`ServerInner::tunnels`] 同理用共享 `Arc<Mutex<..>>`，
+    /// 这样 conf 注册路径 push 进来的隧道会立即出现在快照里。
+    udp: Arc<Mutex<Vec<Arc<crate::udp::UdpTunnel>>>>,
     /// HTTP 域名代理；`None` = 未配置站点
     http: Option<Arc<crate::http_site::HttpSiteServer>>,
     /// HTTP 域名代理的取消信号
@@ -136,6 +139,8 @@ impl Server {
 
         // ---- 3. 配置文件模式（默认关闭）----
         let shutdown = Arc::new(AtomicBool::new(false));
+        let udp_tunnels_shared: Arc<Mutex<Vec<Arc<crate::udp::UdpTunnel>>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let conf = if config.conf_register {
             let listen_host = config
                 .conf_listen_host
@@ -144,6 +149,7 @@ impl Server {
                 .context("conf_listen_host 非法")?;
             let registry = Arc::new(ConfRegistry::new(
                 tunnels.clone(),
+                udp_tunnels_shared.clone(),
                 verify,
                 listen_host,
                 config.conf_max_tunnels,
@@ -177,7 +183,6 @@ impl Server {
         }
 
         // ---- 6. UDP 隧道：先全部绑定，失败则整体回滚 ----
-        let mut udp_tunnels: Vec<Arc<crate::udp::UdpTunnel>> = Vec::new();
         let mut udp_bound: Vec<(Arc<crate::udp::UdpTunnel>, tokio::net::UdpSocket)> = Vec::new();
         for cfg in config.udp_tunnels.iter().filter(|t| t.enabled) {
             let t = Arc::new(crate::udp::UdpTunnel::new(cfg.clone()));
@@ -198,8 +203,10 @@ impl Server {
                 .await
                 .with_context(|| format!("UDP 隧道 {} 启动失败", t.id()))?;
             info!("UDP 隧道 {} 监听 {}", t.id(), bound_addr);
-            udp_tunnels.push(t);
+            udp_tunnels_shared.lock().await.push(t);
         }
+        let udp_tunnels: Vec<Arc<crate::udp::UdpTunnel>> =
+            udp_tunnels_shared.lock().await.clone();
 
         // ---- 7. HTTP 域名代理：先绑定，失败则整体回滚 ----
         let (http, http_cancel) = if config.http_sites.is_empty() {
@@ -280,7 +287,7 @@ impl Server {
                 clients,
                 tunnels,
                 conf,
-                udp: udp_tunnels,
+                udp: udp_tunnels_shared,
                 http,
                 http_cancel,
                 socks5: socks5_servers,
@@ -300,8 +307,13 @@ impl Server {
     /// 各监听面的运行时统计（供管理端展示；不含任何密钥）。
     pub fn listeners(&self) -> ListenerStats {
         ListenerStats {
-            udp_tunnels: self.inner.udp.len(),
-            udp_active_flows: self.inner.udp.iter().map(|t| t.active_flows()).sum(),
+            udp_tunnels: self.inner.udp.try_lock().map(|v| v.len()).unwrap_or(0),
+            udp_active_flows: self
+                .inner
+                .udp
+                .try_lock()
+                .map(|v| v.iter().map(|t| t.active_flows()).sum())
+                .unwrap_or(0),
             http_configured: self.inner.http.is_some(),
             http_active_connections: self
                 .inner
@@ -342,6 +354,11 @@ impl Server {
         let list = self.inner.tunnels.lock().await.clone();
         let mut tunnels = Vec::with_capacity(list.len());
         for t in &list {
+            tunnels.push(t.snapshot().await);
+        }
+        // UDP 隧道复用同一快照契约（字段一致）
+        let udp_list = self.inner.udp.lock().await.clone();
+        for t in &udp_list {
             tunnels.push(t.snapshot().await);
         }
 
@@ -411,7 +428,8 @@ impl Server {
         drop(_register_guard);
 
         // 停 UDP 隧道（关闭 socket 并回收全部来源映射）
-        for t in &self.inner.udp {
+        let udp_list = self.inner.udp.lock().await.clone();
+        for t in &udp_list {
             t.shutdown().await;
         }
 
