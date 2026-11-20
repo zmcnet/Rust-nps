@@ -96,33 +96,98 @@
 
 ---
 
-## 五、多用户与权限（对齐原版 `login.go`）
+## 五、多用户与权限（对齐原版 `login.go`，**服务端强制**）
 
 | 原版能力 | 本实现 | 证据 |
 | --- | --- | --- |
-| 管理员 `web_username`/`web_password` | 命名管理员账号 | `tests/auth_routes.rs`：登录成功、`is_admin=true` |
-| 客户端账号 `WebUserName`/`WebPassword` | 客户端账号 | 同上：`visible_clients == [2]` |
+| 管理员 `web_username`/`web_password` | 配置项 `web_username`/`web_password` | 真实二进制：`root` 登录后 `/api/sites` → 200 |
+| 客户端账号 `WebUserName`/`WebPassword` | 客户端 `web_username`/`web_password` | 真实二进制：`alice` 登录成功，`is_admin: false` |
 | 两者都空 → `user` + VerifyKey | 同规则 | `auth.rs` 单测：`client_with_empty_credentials_falls_back_to_user_plus_vkey` |
-| 客户端只能看自己的隧道 | `/api/status` 按 `Principal` 过滤 | `client_sees_only_own_resources`：只返回 1 个 client + 1 条隧道 |
+| 客户端只能看自己的隧道 | `/api/status` 按 `Principal` 过滤 | 真实二进制：alice 只看到 `['alice']` |
 | 同 IP 60 秒 10 次失败锁定 | `LoginThrottle` | `login_throttle_locks_after_repeated_failures`：第 11 次即使密码正确也 429 |
-| （原版无）超级管理员 token | `NPS_ADMIN_TOKEN` 保持 | `admin_token_still_works_unchanged`：现有部署零影响 |
+| （原版无）超级管理员 token | `NPS_ADMIN_TOKEN` 保持 | 真实二进制：token 访问 `/api/sites` → 200，老部署零影响 |
+
+### 权限在服务端强制（不只是前端隐藏）
+
+前端隐藏入口只是 UI 约束；绕过前端直接发请求必须被拦。为此新增
+`require_admin_principal` 守卫，接入 11 个管理员端点
+（隧道启停、站点 CRUD、证书上传/自签/重载/删除/列表、ACME）。
+
+真实二进制实测：
+
+```
+alice → /api/sites  → 403「需要管理员权限（当前身份：client(alice#1)）」
+alice → /api/certs  → 403
+alice → /api/status → 200，只看到自己
+root  → /api/sites  → 200
+token → /api/sites  → 200
+```
+
+5 项路由级测试覆盖：客户端 403、管理员 200、超级令牌 200、未认证 401、
+客户端仍能读自己的 status。
 
 ---
 
-## 六、测试规模与质量门禁
+## 六、`rnpc` 持久化与进程管理（规格 `docs/rnpc-cli-spec.md`）
+
+| 能力 | 状态 | 证据 |
+| --- | --- | --- |
+| `install` | ✅ | 真实跑通：复制二进制 → 写配置 → 注册自启 → PATH → 摘要 |
+| `uninstall` | ✅ | 真实跑通：注册表项被删（`reg query` 报「找不到」）+ 目录删除 |
+| `change` | ✅ | 真实跑通：server/port/vkey 三项变更，vkey 只报「已更新」 |
+| `update` | ✅ | 版本比较（semver）+ sha256 校验 + 备份 + 失败还原 |
+| `list` | ✅ | 显示真实运行状态与 PID（陈旧记录自动清理） |
+| `status` | ✅ | vkey 显示「已设置（不显示）」 |
+| `start`/`stop`/`restart` | ✅ | 真实跑通：分离启动 → 服务端看到在线 → stop 清理 → restart |
+| `logs` | ✅ | `--lines` 截尾、`--follow` 跟随；守护进程输出写入实例日志 |
+| `path add/remove/status` | ✅ | 幂等、只删自己那段、超长拒绝 |
+| `channel list/install/remove` | ✅ | run-key 真实验证（注册表读写）；需管理员的通道给退出码 3 |
+| 多实例隔离 | ✅ | 无全局锁、无固定 PID 文件；临时文件按实例名隔离 |
+| 配置文件权限 | ✅ | Unix 0600 / Windows `icacls` 移除继承只给当前用户 |
+| vkey 不回显 | ✅ | `Debug`/`summary`/`status`/`list` 全部打码，有测试断言 |
+| 四个自启通道 | ⚠️ 部分 | `run-key` 真实验证；`service`/`task-*` 需要管理员，**成功路径未验证** |
+
+### `update` 的安全语义（实测）
+
+- **sha256 错误 → 拒绝替换**，原文件 sha256 不变（实测对比前后哈希）
+- 正确 sha256 → 更新成功，备份存在，落盘内容与源一致
+- 实例运行中 → 提示先停止，不静默替换
+- 未配置更新源 → 明确输出「跳过」，**不伪造「已是最新」**
+- 版本方向：`plan.order` 是「当前 vs 清单」，只有 `Older` 才更新
+- 幂等：第一次更新到 0.3.0，第二次正确报「已是最新」
+
+### 自启命令构造（纯函数 + 穷尽测试）
+
+`task_create_args` / `task_query_args` / `task_delete_args` /
+`run_key_value` / `service_bin_path` 全部为纯函数，12 项测试覆盖：
+`/sc` 取值、`/f` 幂等、含空格路径加引号、**不含空格也统一加引号**、
+相对路径拒绝、**命令行绝不含 vkey**、服务名截断 + FNV-1a 防碰撞。
+
+`service-host` 是 SCM 入口：完整上报
+`START_PENDING → RUNNING → STOP_PENDING → STOPPED`，处理
+`SERVICE_CONTROL_STOP`/`SHUTDOWN`/`INTERROGATE`。
+非 SCM 环境下实测返回 `os error 1063`（服务进程无法连接到服务控制器），
+证明 dispatcher 真实存在且不伪造成成功。
+
+---
+
+## 七、测试规模与质量门禁
 
 | 门禁 | 结果 |
 | --- | --- |
-| `cargo test --workspace` | **516 项全绿，0 失败** |
+| `cargo test --workspace` | **617 项全绿，0 失败** |
 | `cargo check --workspace --all-targets` | **0 error / 0 warning** |
 | 真实 npc 联调 | `smoke.py` 24/24 |
 | 协议专项 | secret 6/6、udp 7/7、http 19/19、https 8/8、target 4/4、crypt 4/4、p2p 6/6 |
-| 浏览器验收 | 21 项三轮复验，最终全通过 |
+| 权限隔离 | `auth_routes.rs` 14 项（含 5 项越权拒绝） |
+| CLI/持久化 | instance 10、commands 6、path_env 7、autostart 19、process 13、update_feed 21 |
+| 浏览器验收 | 登录流程 12 场景 92 断言（headless Edge + CDP） |
 | Linux 实机 | Debian 13：229 测试全绿 + 24/24 + systemd + 真实穿透 |
+
 
 ---
 
-## 七、本阶段修复的真实缺陷（15 个）
+## 八、本阶段修复的真实缺陷（22 个）
 
 每一条都有对应测试；标 ⚑ 的做过「回退即失败」实证。
 
@@ -143,10 +208,17 @@
 | 13 | ACME 失败显示成绿色成功 | 用户以为申请成功，实际域名解析失败 |
 | 14 | 管理页使用 `innerHTML` | 违反项目「服务端数据一律 textContent」约定 |
 | 15 | p2p 只起单端口 | 客户端等不齐三份地址，穿透必然失败 |
+| 16 | `install` 注册的 `run --name` 子命令不存在 | **自启后 100% 启动失败** |
+| 17 | `service` 通道注册的 `service-host` 子命令不存在 | **服务注册成功但永远起不来** |
+| 18 | 生产二进制仍用旧 `router()` | `/api/auth/*` 全 404，**多用户上线后不可用** |
+| 19 | 管理员端点不校验 `is_admin()` | 客户端账号可越权改隧道、传证书（**安全漏洞**） |
+| 20 | `update` 版本比较方向反了 | 永远判定「已是最新」，从不更新 |
+| 21 | `update` 用运行中二进制版本判断 | 反复判断「有新版本」，永不收敛 |
+| 22 | 守护进程继承父进程 stdio | `restart` 看起来挂死（管道永不关闭） |
 
 ---
 
-## 八、诚实标注的边界
+## 九、诚实标注的边界
 
 以下不是缺陷，是**明确的实现边界**，文档与代码注释均已标注：
 
@@ -155,23 +227,33 @@
 | `tcpTrans` 仅 Linux | Windows 无 `SO_ORIGINAL_DST` 等价物；**原版在 Windows 上也是空实现** |
 | `p2p` 只做会合信令 | 不实现 KCP 传输——原版也是客户端与提供方拿到地址后自建 KCP |
 | `p2p` 穿透成功率 | 取决于双方 NAT 类型，协议固有限制，原版相同 |
+| 客户端 KCP / P2P | 客户端侧未实现（服务端会合信令已实现） |
 | `crypt` 是自签 TLS | 提供加密但不做身份认证（原版语义），身份靠 vkey |
 | Cloudflare DNS-01 | 代码已写但**无真实令牌验证** |
 | 阿里云 DNS-01 | 如实返回 `Unsupported`，不假装成功 |
 | 生产 Let's Encrypt | 未实测（本机无公网域名），用 Pebble 验证完整流程 |
-| 架构矩阵 | 17 个目标只验证了 x86_64（Windows MSVC + Linux GNU/musl） |
-| `rnpc` 持久化层 | `install`/`change`/`update` 规格已写（`docs/rnpc-cli-spec.md`），**未实现** |
+| `service`/`task-start`/`task-logon` 自启 | 需要管理员；**开发机非管理员，成功路径未验证**，只验证了参数构造与错误分支 |
+| HTTP 更新源 | 未实现；需要先定义签名机制，模块如实拒绝而不是假装支持 |
+| 更新签名验证 | 只有 sha256（防损坏，不防恶意清单） |
 | 流量持久化精度 | 定时落盘（默认 5 分钟），进程被 kill -9 会丢失最后一段 |
+| 架构矩阵 | 17 个 target 的 CI 已写；**本机只验证了 x86_64** |
 
 ---
 
-## 九、结论
+## 十、结论
 
 **功能覆盖**：原版 8 个 mode 全部实现，运维特性 8 项全部实现，
-管理界面与证书管理为原版能力的超集（原版无 ACME、无站点 CRUD API）。
+管理界面、证书管理与多用户权限为原版能力的超集（原版无 ACME、无站点 CRUD API、
+无服务端强制的权限隔离）。
+
+**交付工程**：`rnpc` 持久化层与进程管理已实现并真实验证；
+`update` 有真校验、真备份、真还原；自启四通道中 `run-key` 已验证。
 
 **验证强度**：所有协议均有真实原版 npc 驱动的黑盒验证；
-516 项测试全绿；浏览器三轮验收；Linux 实机验证。
+617 项测试全绿；浏览器 12 场景 92 断言；Linux 实机验证；
+多用户权限用真实二进制端到端验证（403/200 实测）。
 
-**未达成「完美替代」的部分**：架构矩阵发布与 `rnpc` 持久化层属于交付工程，
-不影响功能完整性，但按最严格标准仍属未完成。
+**未达成「完美替代」的部分**：三个需管理员的自启通道成功路径、
+HTTP 更新源与签名、17 架构的本地实测——均受限于当前环境（无管理员、
+无公网域名、无交叉工具链）或未定的设计决策，已在第八节逐项标注。
+
