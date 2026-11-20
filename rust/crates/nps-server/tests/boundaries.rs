@@ -26,6 +26,7 @@ fn config(enabled: bool) -> ServerConfig {
         conf_register: false,
         conf_max_tunnels: 32,
         conf_listen_host: "127.0.0.1".into(),
+        ..Default::default()
     }
 }
 
@@ -82,6 +83,7 @@ async fn empty_deployment_starts_for_management_ui() {
         conf_register: false,
         conf_max_tunnels: 32,
         conf_listen_host: "127.0.0.1".into(),
+        ..Default::default()
     };
     let server = Server::start(cfg).await.unwrap();
     let snap = server.snapshot().await;

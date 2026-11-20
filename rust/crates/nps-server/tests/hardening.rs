@@ -41,6 +41,7 @@ fn config(listen_addr: &str) -> ServerConfig {
         conf_register: false,
         conf_max_tunnels: 32,
         conf_listen_host: "127.0.0.1".into(),
+        ..Default::default()
     }
 }
 

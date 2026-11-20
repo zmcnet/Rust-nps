@@ -28,6 +28,9 @@ mod server;
 pub mod snapshot;
 mod tunnel;
 
-pub use config::{ClientConfig, ServerConfig, TcpTunnelConfig};
+pub use config::{
+    ClientConfig, HttpRoute, HttpSiteConfig, ServerConfig, Socks5Config, Socks5User,
+    TcpTunnelConfig, TlsMode, UdpTunnelConfig,
+};
 pub use server::Server;
 pub use snapshot::{ClientSnapshot, ServerSnapshot, TunnelSnapshot};

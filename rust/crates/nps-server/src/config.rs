@@ -42,6 +42,10 @@ pub const DEFAULT_CONF_MAX_TUNNELS: usize = 32;
 pub const DEFAULT_CONF_LISTEN_HOST: &str = "0.0.0.0";
 /// 注册隧道允许的最小监听端口：拒绝特权端口（<1024）
 pub const CONF_MIN_LISTEN_PORT: u16 = 1024;
+/// UDP 来源地址的默认空闲回收时间（秒），对齐 Go 版的 10 分钟读超时
+pub const DEFAULT_UDP_IDLE_SECS: u64 = 600;
+/// 单条 UDP 隧道允许的最大并发来源数
+pub const DEFAULT_UDP_MAX_SESSIONS: usize = 512;
 
 /// 明令禁止的默认 vkey（Go 版安装向导里的示例值，绝不允许继续使用）
 const FORBIDDEN_VKEYS: &[&str] = &["123", "123456", "password", "vkey"];
@@ -75,6 +79,15 @@ pub struct ServerConfig {
     /// 默认 [`DEFAULT_CONF_LISTEN_HOST`]（`0.0.0.0`，与 Go 版一致）。
     #[serde(default = "default_conf_listen_host")]
     pub conf_listen_host: String,
+    /// UDP 隧道定义（对应 Go 版 `mode=udp`）
+    #[serde(default)]
+    pub udp_tunnels: Vec<UdpTunnelConfig>,
+    /// HTTP 域名站点（对应 Go 版 `Host` + `http_proxy_port`）
+    #[serde(default)]
+    pub http_sites: Vec<HttpSiteConfig>,
+    /// SOCKS5 代理监听（对应 Go 版 `mode=socks5`）
+    #[serde(default)]
+    pub socks5_listeners: Vec<Socks5Config>,
 }
 
 fn default_bridge_addr() -> String {
@@ -107,7 +120,133 @@ impl Default for ServerConfig {
             conf_register: false,
             conf_max_tunnels: default_conf_max_tunnels(),
             conf_listen_host: default_conf_listen_host(),
+            udp_tunnels: Vec::new(),
+            http_sites: Vec::new(),
+            socks5_listeners: Vec::new(),
         }
+    }
+}
+
+/// 一条 UDP 隧道（对应 Go 版 `mode=udp`）
+///
+/// 服务端在 `listen_addr` 上监听 UDP；每个来源地址 `(ip:port)` 会建立一条
+/// 独立的 mux 子流，子流内传原始 UDP 载荷。来源地址空闲超时后回收。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpTunnelConfig {
+    pub id: u32,
+    pub name: String,
+    /// 归属客户端
+    pub client_id: i32,
+    /// 服务端监听地址（UDP）
+    pub listen_addr: String,
+    /// 客户端侧拨号目标（如 `8.8.8.8:53`）
+    pub target_addr: String,
+    /// 是否随 server 启动而监听；默认 true
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// 单个来源地址的空闲回收时间（秒）。对齐 Go 版的 10 分钟。
+    #[serde(default = "default_udp_idle_secs")]
+    pub idle_timeout_secs: u64,
+    /// 该隧道允许的最大并发来源数；超出后丢弃新来源的包。
+    #[serde(default = "default_udp_max_sessions")]
+    pub max_sessions: usize,
+}
+
+fn default_udp_idle_secs() -> u64 {
+    DEFAULT_UDP_IDLE_SECS
+}
+
+fn default_udp_max_sessions() -> usize {
+    DEFAULT_UDP_MAX_SESSIONS
+}
+
+/// HTTP 站点（对应 Go 版 `Host`）
+///
+/// 服务端按请求的 `Host` 头选站点，再按路径前缀选目标，
+/// 通过 mux 子流把**原始 HTTP 字节**转发给客户端。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpSiteConfig {
+    pub id: u32,
+    pub name: String,
+    /// 归属客户端
+    pub client_id: i32,
+    /// 域名（不含端口；匹配时大小写不敏感，自动剥离请求里的端口）
+    pub domain: String,
+    /// 默认目标（`routes` 都不匹配时使用）
+    pub target_addr: String,
+    /// 路径前缀分流：`/api` → `127.0.0.1:8080`。按最长前缀匹配。
+    #[serde(default)]
+    pub routes: Vec<HttpRoute>,
+    /// 是否允许 WebSocket 升级；默认允许
+    #[serde(default = "default_enabled")]
+    pub websocket: bool,
+    /// 是否随 server 启动而监听；默认 true
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// TLS 模式：`off`（默认）/ `upload` / `self-signed` / `acme`
+    ///
+    /// **默认 `off`**：程序不会自动申请证书，必须由用户在管理端显式选择。
+    #[serde(default)]
+    pub tls_mode: TlsMode,
+    /// 是否把 HTTP 请求 301 跳到 HTTPS（仅 tls_mode != off 时有意义）
+    #[serde(default = "default_enabled")]
+    pub force_https: bool,
+}
+
+/// 一条路径前缀路由
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpRoute {
+    /// 路径前缀，必须以 `/` 开头
+    pub prefix: String,
+    /// 该前缀的目标地址
+    pub target_addr: String,
+}
+
+/// 站点 TLS 模式。默认 `Off` —— 程序绝不擅自申请证书。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsMode {
+    /// 不启用 TLS（纯 HTTP）
+    #[default]
+    Off,
+    /// 使用用户上传的证书文件
+    Upload,
+    /// 启动时生成自签证书（仅测试）
+    SelfSigned,
+    /// 由用户显式触发 ACME 申请
+    Acme,
+}
+
+/// SOCKS5 代理监听配置（对应 Go 版 `mode=socks5`）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Socks5Config {
+    pub id: u32,
+    pub name: String,
+    /// 归属客户端
+    pub client_id: i32,
+    /// 服务端监听地址
+    pub listen_addr: String,
+    /// 用户名密码认证；为空则只允许无认证
+    #[serde(default)]
+    pub users: Vec<Socks5User>,
+    /// 是否随 server 启动而监听；默认 true
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+/// SOCKS5 用户名密码（RFC 1929）
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Socks5User {
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for Socks5User {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Socks5User")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
     }
 }
 
@@ -224,6 +363,121 @@ impl ServerConfig {
                 );
             }
         }
+
+        self.validate_udp_tunnels(&client_ids)?;
+        self.validate_http_sites(&client_ids)?;
+        self.validate_socks5(&client_ids)?;
+        Ok(())
+    }
+
+    /// 校验 UDP 隧道
+    fn validate_udp_tunnels(&self, client_ids: &HashSet<i32>) -> Result<()> {
+        let mut ids = HashSet::new();
+        let mut listen_addrs = HashSet::new();
+        for t in &self.udp_tunnels {
+            if !ids.insert(t.id) {
+                bail!("UDP 隧道 id 重复: {}", t.id);
+            }
+            if !client_ids.contains(&t.client_id) {
+                bail!("UDP 隧道 {} 引用了不存在的客户端 {}", t.id, t.client_id);
+            }
+            if t.name.trim().is_empty() {
+                bail!("UDP 隧道 {} 的 name 不能为空", t.id);
+            }
+            let listen = parse_addr(&t.listen_addr).with_context(|| {
+                format!("UDP 隧道 {} 的 listen_addr 非法: {:?}", t.id, t.listen_addr)
+            })?;
+            validate_host_port(&t.target_addr).with_context(|| {
+                format!("UDP 隧道 {} 的 target_addr 非法: {:?}", t.id, t.target_addr)
+            })?;
+            if t.idle_timeout_secs == 0 {
+                bail!("UDP 隧道 {} 的 idle_timeout_secs 不能为 0", t.id);
+            }
+            if t.max_sessions == 0 {
+                bail!("UDP 隧道 {} 的 max_sessions 不能为 0", t.id);
+            }
+            if t.enabled && listen.port() != 0 && !listen_addrs.insert(listen) {
+                bail!("UDP 隧道 {} 的监听地址 {listen} 与其他 UDP 隧道冲突", t.id);
+            }
+        }
+        Ok(())
+    }
+
+    /// 校验 HTTP 站点
+    fn validate_http_sites(&self, client_ids: &HashSet<i32>) -> Result<()> {
+        let mut ids = HashSet::new();
+        let mut domains = HashSet::new();
+        for s in &self.http_sites {
+            if !ids.insert(s.id) {
+                bail!("HTTP 站点 id 重复: {}", s.id);
+            }
+            if !client_ids.contains(&s.client_id) {
+                bail!("HTTP 站点 {} 引用了不存在的客户端 {}", s.id, s.client_id);
+            }
+            let domain = s.domain.trim();
+            if domain.is_empty() {
+                bail!("HTTP 站点 {} 的 domain 不能为空", s.id);
+            }
+            // 域名不允许带端口/协议前缀，避免匹配歧义
+            if domain.contains(':') || domain.contains('/') {
+                bail!("HTTP 站点 {} 的 domain 不应包含端口或路径: {domain:?}", s.id);
+            }
+            if !domains.insert(domain.to_ascii_lowercase()) {
+                bail!("HTTP 站点 {} 的 domain 与其他站点重复: {domain}", s.id);
+            }
+            validate_host_port(&s.target_addr).with_context(|| {
+                format!("HTTP 站点 {} 的 target_addr 非法: {:?}", s.id, s.target_addr)
+            })?;
+            let mut prefixes = HashSet::new();
+            for r in &s.routes {
+                if !r.prefix.starts_with('/') {
+                    bail!("HTTP 站点 {} 的路由前缀必须以 / 开头: {:?}", s.id, r.prefix);
+                }
+                if !prefixes.insert(r.prefix.clone()) {
+                    bail!("HTTP 站点 {} 的路由前缀重复: {}", s.id, r.prefix);
+                }
+                validate_host_port(&r.target_addr).with_context(|| {
+                    format!(
+                        "HTTP 站点 {} 路由 {} 的 target_addr 非法: {:?}",
+                        s.id, r.prefix, r.target_addr
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 校验 SOCKS5 监听
+    fn validate_socks5(&self, client_ids: &HashSet<i32>) -> Result<()> {
+        let mut ids = HashSet::new();
+        let mut listen_addrs = HashSet::new();
+        for s in &self.socks5_listeners {
+            if !ids.insert(s.id) {
+                bail!("SOCKS5 监听 id 重复: {}", s.id);
+            }
+            if !client_ids.contains(&s.client_id) {
+                bail!("SOCKS5 监听 {} 引用了不存在的客户端 {}", s.id, s.client_id);
+            }
+            let listen = parse_addr(&s.listen_addr).with_context(|| {
+                format!("SOCKS5 监听 {} 的 listen_addr 非法: {:?}", s.id, s.listen_addr)
+            })?;
+            let mut users = HashSet::new();
+            for u in &s.users {
+                if u.username.is_empty() || u.password.is_empty() {
+                    bail!("SOCKS5 监听 {} 存在空用户名或空密码", s.id);
+                }
+                // RFC 1929：用户名与密码长度上限均为 255
+                if u.username.len() > 255 || u.password.len() > 255 {
+                    bail!("SOCKS5 监听 {} 的用户名或密码超过 255 字节", s.id);
+                }
+                if !users.insert(u.username.clone()) {
+                    bail!("SOCKS5 监听 {} 的用户名重复: {}", s.id, u.username);
+                }
+            }
+            if s.enabled && listen.port() != 0 && !listen_addrs.insert(listen) {
+                bail!("SOCKS5 监听 {} 的地址 {listen} 与其他监听冲突", s.id);
+            }
+        }
         Ok(())
     }
 
@@ -300,6 +554,7 @@ mod tests {
             conf_register: false,
             conf_max_tunnels: DEFAULT_CONF_MAX_TUNNELS,
             conf_listen_host: DEFAULT_CONF_LISTEN_HOST.into(),
+            ..Default::default()
         }
     }
 
@@ -452,5 +707,216 @@ mod tests {
             !one.contains("s3cret-key"),
             "ClientConfig Debug 泄漏了 vkey: {one}"
         );
+    }
+
+    // ---- UDP 隧道校验 ----
+
+    fn udp_tunnel(id: u32, client_id: i32, listen: &str, target: &str) -> UdpTunnelConfig {
+        UdpTunnelConfig {
+            id,
+            name: format!("udp{id}"),
+            client_id,
+            listen_addr: listen.to_owned(),
+            target_addr: target.to_owned(),
+            enabled: true,
+            idle_timeout_secs: DEFAULT_UDP_IDLE_SECS,
+            max_sessions: DEFAULT_UDP_MAX_SESSIONS,
+        }
+    }
+
+    #[test]
+    fn udp_tunnel_accepts_valid_config() {
+        let mut cfg = base();
+        cfg.udp_tunnels = vec![udp_tunnel(1, 1, "127.0.0.1:5353", "8.8.8.8:53")];
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn udp_tunnel_rejects_unknown_client() {
+        let mut cfg = base();
+        cfg.udp_tunnels = vec![udp_tunnel(1, 99, "127.0.0.1:5353", "8.8.8.8:53")];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("不存在的客户端"), "{err}");
+    }
+
+    #[test]
+    fn udp_tunnel_rejects_duplicate_id_and_listen() {
+        let mut cfg = base();
+        cfg.udp_tunnels = vec![
+            udp_tunnel(1, 1, "127.0.0.1:5353", "8.8.8.8:53"),
+            udp_tunnel(1, 1, "127.0.0.1:5354", "8.8.8.8:53"),
+        ];
+        assert!(cfg.validate().unwrap_err().to_string().contains("id 重复"));
+
+        let mut cfg = base();
+        cfg.udp_tunnels = vec![
+            udp_tunnel(1, 1, "127.0.0.1:5353", "8.8.8.8:53"),
+            udp_tunnel(2, 1, "127.0.0.1:5353", "1.1.1.1:53"),
+        ];
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("监听地址"));
+    }
+
+    #[test]
+    fn udp_tunnel_rejects_zero_limits() {
+        let mut cfg = base();
+        let mut t = udp_tunnel(1, 1, "127.0.0.1:5353", "8.8.8.8:53");
+        t.idle_timeout_secs = 0;
+        cfg.udp_tunnels = vec![t];
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("idle_timeout_secs"));
+
+        let mut cfg = base();
+        let mut t = udp_tunnel(1, 1, "127.0.0.1:5353", "8.8.8.8:53");
+        t.max_sessions = 0;
+        cfg.udp_tunnels = vec![t];
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_sessions"));
+    }
+
+    // ---- HTTP 站点校验 ----
+
+    fn http_site(id: u32, domain: &str) -> HttpSiteConfig {
+        HttpSiteConfig {
+            id,
+            name: format!("site{id}"),
+            client_id: 1,
+            domain: domain.to_owned(),
+            target_addr: "127.0.0.1:3000".to_owned(),
+            routes: Vec::new(),
+            websocket: true,
+            enabled: true,
+            tls_mode: TlsMode::Off,
+            force_https: true,
+        }
+    }
+
+    #[test]
+    fn http_site_accepts_valid_config() {
+        let mut cfg = base();
+        cfg.http_sites = vec![http_site(1, "app.example.com")];
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn http_site_rejects_domain_with_port_or_path() {
+        let mut cfg = base();
+        cfg.http_sites = vec![http_site(1, "app.example.com:8080")];
+        assert!(cfg.validate().unwrap_err().to_string().contains("端口或路径"));
+
+        let mut cfg = base();
+        cfg.http_sites = vec![http_site(1, "app.example.com/api")];
+        assert!(cfg.validate().unwrap_err().to_string().contains("端口或路径"));
+    }
+
+    #[test]
+    fn http_site_rejects_duplicate_domain_case_insensitive() {
+        let mut cfg = base();
+        cfg.http_sites = vec![http_site(1, "App.Example.com"), http_site(2, "app.example.com")];
+        assert!(cfg.validate().unwrap_err().to_string().contains("domain"));
+    }
+
+    #[test]
+    fn http_site_rejects_bad_route_prefix() {
+        let mut cfg = base();
+        let mut site = http_site(1, "app.example.com");
+        site.routes = vec![HttpRoute {
+            prefix: "api".to_owned(), // 缺前导 /
+            target_addr: "127.0.0.1:8080".to_owned(),
+        }];
+        cfg.http_sites = vec![site];
+        assert!(cfg.validate().unwrap_err().to_string().contains("以 / 开头"));
+    }
+
+    #[test]
+    fn http_site_tls_defaults_to_off() {
+        // 默认必须是 off —— 程序绝不擅自申请证书
+        let site = http_site(1, "a.example.com");
+        assert_eq!(site.tls_mode, TlsMode::Off);
+
+        // 反序列化缺省时同样是 off
+        let json = r#"{
+            "id": 1, "name": "s", "client_id": 1,
+            "domain": "a.example.com", "target_addr": "127.0.0.1:80"
+        }"#;
+        let parsed: HttpSiteConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.tls_mode, TlsMode::Off);
+        assert!(parsed.force_https);
+        assert!(parsed.websocket);
+    }
+
+    // ---- SOCKS5 校验 ----
+
+    fn socks5(id: u32) -> Socks5Config {
+        Socks5Config {
+            id,
+            name: format!("s5-{id}"),
+            client_id: 1,
+            listen_addr: "127.0.0.1:1080".to_owned(),
+            users: Vec::new(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn socks5_accepts_valid_config() {
+        let mut cfg = base();
+        cfg.socks5_listeners = vec![socks5(1)];
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn socks5_rejects_empty_credentials() {
+        let mut cfg = base();
+        let mut s = socks5(1);
+        s.users = vec![Socks5User {
+            username: "u".to_owned(),
+            password: String::new(),
+        }];
+        cfg.socks5_listeners = vec![s];
+        assert!(cfg.validate().unwrap_err().to_string().contains("空密码"));
+    }
+
+    #[test]
+    fn socks5_rejects_duplicate_username() {
+        let mut cfg = base();
+        let mut s = socks5(1);
+        s.users = vec![
+            Socks5User { username: "u".into(), password: "a".into() },
+            Socks5User { username: "u".into(), password: "b".into() },
+        ];
+        cfg.socks5_listeners = vec![s];
+        assert!(cfg.validate().unwrap_err().to_string().contains("用户名重复"));
+    }
+
+    #[test]
+    fn socks5_password_is_redacted_in_debug() {
+        let user = Socks5User {
+            username: "alice".to_owned(),
+            password: "top-secret-pw".to_owned(),
+        };
+        let rendered = format!("{user:?}");
+        assert!(!rendered.contains("top-secret-pw"), "Debug 泄漏密码: {rendered}");
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn new_sections_default_to_empty() {
+        // 旧配置（无新字段）必须仍能反序列化
+        let json = r#"{"bridge_addr":"127.0.0.1:8024","web_addr":"127.0.0.1:8080"}"#;
+        let cfg: ServerConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.udp_tunnels.is_empty());
+        assert!(cfg.http_sites.is_empty());
+        assert!(cfg.socks5_listeners.is_empty());
+        cfg.validate().unwrap();
     }
 }

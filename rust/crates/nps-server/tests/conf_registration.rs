@@ -33,6 +33,7 @@ fn config(conf_register: bool, max_tunnels: usize) -> ServerConfig {
         conf_register,
         conf_max_tunnels: max_tunnels,
         conf_listen_host: "127.0.0.1".into(),
+        ..Default::default()
     }
 }
 
