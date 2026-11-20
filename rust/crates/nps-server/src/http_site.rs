@@ -304,6 +304,36 @@ impl HttpSiteRouter {
         Ok(())
     }
 
+    /// 插入或替换同域名站点（配置文件模式的 `host` 帧重复上报时使用）。
+    ///
+    /// 替换保留原有并发槽位计数，避免重连时正在转发的请求被"清零"。
+    pub fn upsert(&mut self, site: HttpSite) -> Result<()> {
+        site.validate()?;
+        let normalized = normalize_host(&site.domain);
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| normalize_host(&e.site.domain) == normalized)
+        {
+            entry.site = site;
+            return Ok(());
+        }
+        self.entries.push(SiteEntry {
+            site,
+            active: Arc::new(AtomicUsize::new(0)),
+        });
+        Ok(())
+    }
+
+    /// 移除一个域名（配置文件模式注销站点时使用）；返回是否真的存在。
+    pub fn remove(&mut self, domain: &str) -> bool {
+        let normalized = normalize_host(domain);
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| normalize_host(&e.site.domain) != normalized);
+        self.entries.len() != before
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -525,6 +555,21 @@ impl HttpSiteServer {
     /// 读取当前站点表快照。
     pub async fn router(&self) -> tokio::sync::RwLockReadGuard<'_, HttpSiteRouter> {
         self.router.read().await
+    }
+
+    /// 动态插入/替换站点（配置文件模式 `host` 帧使用）。
+    ///
+    /// 只影响路由表；监听端口与并发限制不变。重复域名会**替换**配置，
+    /// 保留原并发计数。
+    pub async fn upsert_site(&self, site: HttpSite) -> Result<()> {
+        let mut router = self.router.write().await;
+        router.upsert(site)
+    }
+
+    /// 动态移除站点（配置文件模式注销时使用）；返回是否真的存在。
+    pub async fn remove_site(&self, domain: &str) -> bool {
+        let mut router = self.router.write().await;
+        router.remove(domain)
     }
 
     /// 当前活跃连接数
@@ -1779,5 +1824,28 @@ mod tests {
         drop(g2);
         assert_eq!(resolved.active(), 0);
         assert_eq!(router.active_total(), 0);
+    }
+
+    /// 配置模式重复上报同一域名时应替换配置而不是报错，且不丢并发计数。
+    #[test]
+    fn upsert_replaces_same_domain_and_keeps_slots() {
+        let mut router = HttpSiteRouter::new(vec![site("a.local", "127.0.0.1:1")]).unwrap();
+        let resolved = router.resolve("a.local", "/").unwrap();
+        let guard = resolved.try_acquire(4).unwrap();
+        assert_eq!(router.active_total(), 1);
+
+        router.upsert(site("A.LOCAL", "127.0.0.1:2")).unwrap();
+        assert_eq!(router.len(), 1);
+        assert_eq!(
+            router.resolve("a.local", "/").unwrap().target,
+            "127.0.0.1:2"
+        );
+        assert_eq!(router.active_total(), 1, "替换不能清零并发计数");
+
+        drop(guard);
+        assert_eq!(router.active_total(), 0);
+        assert!(router.remove("a.local"));
+        assert!(!router.remove("a.local"));
+        assert!(router.is_empty());
     }
 }
