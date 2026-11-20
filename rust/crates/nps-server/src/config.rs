@@ -105,6 +105,9 @@ pub struct ServerConfig {
     /// 数据根目录（ACME 账户密钥、证书落盘位置）。默认当前目录。
     #[serde(default)]
     pub data_dir: Option<String>,
+    /// 来源 IP 白名单（单 IP 或 CIDR）。空 = 全部允许。对应原版 `ip_limit`。
+    #[serde(default)]
+    pub ip_limit: Vec<String>,
     /// SOCKS5 代理监听（对应 Go 版 `mode=socks5`）
     #[serde(default)]
     pub socks5_listeners: Vec<Socks5Config>,
@@ -147,6 +150,7 @@ impl Default for ServerConfig {
             cert_dir: None,
             acme: Default::default(),
             data_dir: None,
+            ip_limit: Vec::new(),
             socks5_listeners: Vec::new(),
         }
     }
@@ -285,6 +289,14 @@ pub struct ClientConfig {
     pub name: String,
     /// 认证密钥（明文仅存在于服务端配置；桥内部只比较 md5）
     pub vkey: String,
+    /// 该客户端的总带宽上限（KB/s）。0 = 不限速。对应原版 `rate_limit`。
+    ///
+    /// 同一客户端的所有隧道**共享**这一个配额。
+    #[serde(default)]
+    pub rate_limit: u64,
+    /// 该客户端的总流量上限（KB）。0 = 不限。对应原版 `flow_limit`。
+    #[serde(default)]
+    pub flow_limit: u64,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -387,6 +399,12 @@ impl ServerConfig {
                     self.conf_max_tunnels
                 );
             }
+        }
+
+        // IP 白名单：非法条目要在启动时报错，而不是运行时静默失效
+        if !self.ip_limit.is_empty() {
+            crate::limit::IpAllowList::new(&self.ip_limit)
+                .context("ip_limit 配置非法")?;
         }
 
         self.validate_udp_tunnels(&client_ids)?;
@@ -575,6 +593,8 @@ mod tests {
             id,
             name: format!("c{id}"),
             vkey: vkey.into(),
+            rate_limit: 0,
+            flow_limit: 0,
         }
     }
 

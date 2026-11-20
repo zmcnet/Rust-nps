@@ -29,6 +29,8 @@ fn config(listen_addr: &str) -> ServerConfig {
             id: 1,
             name: "npc".into(),
             vkey: VKEY.into(),
+            rate_limit: 0,
+            flow_limit: 0,
         }],
         tunnels: vec![TcpTunnelConfig {
             id: 1,

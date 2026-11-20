@@ -335,6 +335,11 @@ impl HttpSiteRouter {
         self.entries.len() != before
     }
 
+    /// 当前全部站点（管理端展示用）。克隆一份，避免把内部结构暴露出去。
+    pub fn sites(&self) -> Vec<HttpSite> {
+        self.entries.iter().map(|e| e.site.clone()).collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

@@ -26,10 +26,12 @@ pub mod acme;
 mod conf;
 pub mod config;
 mod http_site;
+mod limit;
 mod server;
 pub mod snapshot;
 pub mod socks5;
 pub mod tls;
+pub mod target;
 mod tunnel;
 pub mod udp;
 
@@ -57,3 +59,8 @@ pub use tls::{
     TlsListener, TlsListenerConfig, TlsSession, ALPN_HTTP11, CERT_FILE, DEFAULT_HANDSHAKE_TIMEOUT,
     KEY_FILE, META_FILE,
 };
+pub use target::{
+    HealthCheckConfig, HealthCheckKind, HealthChecker, HealthState, TargetError, TargetPool,
+    DEFAULT_HEALTH_INTERVAL, DEFAULT_HEALTH_MAX_FAILED, DEFAULT_HEALTH_TIMEOUT,
+};
+pub use limit::{FlowCounter, IpAllowList, TokenBucket, BYTES_PER_KB};

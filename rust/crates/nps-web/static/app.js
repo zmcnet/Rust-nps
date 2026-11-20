@@ -253,6 +253,8 @@
         setConnStatus('ok', '已连接');
         dom.lastUpdated.textContent = '更新于 ' + formatTime(new Date());
         render();
+        refreshSites();
+        refreshCerts();
       })
       .catch(function (error) {
         if (error instanceof AuthError) {
@@ -587,6 +589,8 @@
     });
 
     bindNav();
+    bindSites();
+    bindCerts();
 
     var saved = '';
     try {
@@ -600,6 +604,344 @@
       showLogin('');
       dom.tokenInput.focus();
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // 站点管理
+  // -------------------------------------------------------------------------
+  var siteDom = {};
+  var certDom = {};
+  var acmeState = null;
+
+  function bindSites() {
+    siteDom.body = document.getElementById('sites-body');
+    siteDom.count = document.getElementById('sites-count');
+    siteDom.form = document.getElementById('site-form');
+    siteDom.domain = document.getElementById('site-domain');
+    siteDom.client = document.getElementById('site-client');
+    siteDom.target = document.getElementById('site-target');
+    siteDom.ws = document.getElementById('site-ws');
+    siteDom.status = document.getElementById('site-status');
+    if (!siteDom.form) return;
+
+    siteDom.form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      var domain = (siteDom.domain.value || '').trim();
+      var target = (siteDom.target.value || '').trim();
+      var clientId = parseInt(siteDom.client.value, 10);
+      if (!domain || !target || !isFinite(clientId)) {
+        setFormStatus(siteDom.status, 'err', '域名、客户端 ID、目标地址都必填');
+        return;
+      }
+      setFormStatus(siteDom.status, 'busy', '保存中…');
+      request('/api/sites', {
+        method: 'POST',
+        body: JSON.stringify({
+          domain: domain,
+          client_id: clientId,
+          target: target,
+          routes: [],
+          websocket: !!siteDom.ws.checked
+        })
+      })
+        .then(function (view) {
+          setFormStatus(siteDom.status, 'ok', '已保存：' + view.domain);
+          refreshSites();
+        })
+        .catch(function (error) {
+          setFormStatus(siteDom.status, 'err', describeError(error));
+        });
+    });
+  }
+
+  function refreshSites() {
+    if (!siteDom.body) return;
+    request('/api/sites')
+      .then(function (sites) {
+        renderSites(Array.isArray(sites) ? sites : []);
+      })
+      .catch(function () {
+        /* 轮询失败不打断主界面 */
+      });
+  }
+
+  function renderSites(sites) {
+    var body = siteDom.body;
+    if (siteDom.count) {
+      siteDom.count.textContent = sites.length ? '共 ' + sites.length + ' 个' : '';
+    }
+    while (body.firstChild) body.removeChild(body.firstChild);
+    if (!sites.length) {
+      appendEmptyRow(body, 7, '还没有站点。用下方表单添加第一个域名。');
+      return;
+    }
+    sites.forEach(function (site) {
+      var tr = document.createElement('tr');
+      appendCell(tr, site.domain);
+      appendCell(tr, '#' + site.client_id);
+      appendCell(tr, site.target);
+      var routes = (site.routes || []).map(function (r) {
+        return r.prefix + ' → ' + r.target;
+      });
+      appendCell(tr, routes.length ? routes.join('，') : '—');
+      appendCell(tr, site.websocket ? '允许' : '禁止');
+      appendCell(tr, '—');
+
+      var actions = document.createElement('td');
+      actions.className = 'actions-col';
+      var del = document.createElement('button');
+      del.className = 'btn btn-ghost btn-sm';
+      del.type = 'button';
+      del.textContent = '删除';
+      del.addEventListener('click', function () {
+        if (!window.confirm('删除站点 ' + site.domain + '？')) return;
+        request('/api/sites/' + encodeURIComponent(site.domain), { method: 'DELETE' })
+          .then(function () {
+            refreshSites();
+          })
+          .catch(function (error) {
+            setFormStatus(siteDom.status, 'err', describeError(error));
+          });
+      });
+      actions.appendChild(del);
+      tr.appendChild(actions);
+      body.appendChild(tr);
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // 证书管理
+  // -------------------------------------------------------------------------
+  function bindCerts() {
+    certDom.body = document.getElementById('certs-body');
+    certDom.count = document.getElementById('certs-count');
+    certDom.domain = document.getElementById('cert-domain');
+    certDom.pem = document.getElementById('cert-pem');
+    certDom.key = document.getElementById('cert-key');
+    certDom.status = document.getElementById('cert-status');
+    certDom.uploadBtn = document.getElementById('cert-upload-btn');
+    certDom.uploadPanel = document.getElementById('cert-upload-panel');
+    certDom.selfPanel = document.getElementById('cert-selfsigned-panel');
+    certDom.acmePanel = document.getElementById('cert-acme-panel');
+    certDom.selfDomain = document.getElementById('cert-self-domain');
+    certDom.selfBtn = document.getElementById('cert-self-btn');
+    certDom.acmeDomain = document.getElementById('cert-acme-domain');
+    certDom.acmeBtn = document.getElementById('cert-acme-btn');
+    certDom.acmeStatus = document.getElementById('cert-acme-status');
+    certDom.acmeWarn = document.getElementById('cert-acme-warn');
+    certDom.reloadBtn = document.getElementById('cert-reload-btn');
+    if (!certDom.body) return;
+
+    var modes = document.querySelectorAll('input[name="tls-mode"]');
+    Array.prototype.forEach.call(modes, function (radio) {
+      radio.addEventListener('change', switchCertMode);
+    });
+    switchCertMode();
+
+    if (certDom.uploadBtn) {
+      certDom.uploadBtn.addEventListener('click', function () {
+        var domain = (certDom.domain.value || '').trim();
+        var pem = certDom.pem.value || '';
+        var key = certDom.key.value || '';
+        if (!domain || !pem.trim() || !key.trim()) {
+          setFormStatus(certDom.status, 'err', '域名、证书、私钥都必填');
+          return;
+        }
+        setFormStatus(certDom.status, 'busy', '上传中…');
+        request('/api/certs/upload', {
+          method: 'POST',
+          body: JSON.stringify({ domain: domain, cert_pem: pem, key_pem: key })
+        })
+          .then(function (view) {
+            setFormStatus(certDom.status, 'ok', '已部署：' + view.domain);
+            certDom.key.value = '';
+            refreshCerts();
+          })
+          .catch(function (error) {
+            setFormStatus(certDom.status, 'err', describeError(error));
+          });
+      });
+    }
+
+    if (certDom.selfBtn) {
+      certDom.selfBtn.addEventListener('click', function () {
+        var domain = (certDom.selfDomain.value || '').trim();
+        if (!domain) {
+          setFormStatus(certDom.status, 'err', '请填域名');
+          return;
+        }
+        request('/api/certs/self-signed', {
+          method: 'POST',
+          body: JSON.stringify({ domain: domain })
+        })
+          .then(function (view) {
+            setFormStatus(certDom.status, 'ok', '已生成自签证书：' + view.domain);
+            refreshCerts();
+          })
+          .catch(function (error) {
+            setFormStatus(certDom.status, 'err', describeError(error));
+          });
+      });
+    }
+
+    if (certDom.acmeBtn) {
+      certDom.acmeBtn.addEventListener('click', function () {
+        var domain = (certDom.acmeDomain.value || '').trim();
+        if (!domain) {
+          setFormStatus(certDom.acmeStatus, 'err', '请填域名');
+          return;
+        }
+        if (!acmeState || !acmeState.available) {
+          setFormStatus(certDom.acmeStatus, 'err', 'ACME 服务不可用，请检查服务端配置');
+          return;
+        }
+        setFormStatus(certDom.acmeStatus, 'busy', '正在申请…');
+        request('/api/certs/acme-request', {
+          method: 'POST',
+          body: JSON.stringify({ domain: domain })
+        })
+          .then(function (result) {
+            setFormStatus(
+              certDom.acmeStatus,
+              'ok',
+              result && result.issued ? '证书已签发' : '已提交申请'
+            );
+            refreshCerts();
+          })
+          .catch(function (error) {
+            setFormStatus(certDom.acmeStatus, 'err', describeError(error));
+          });
+      });
+    }
+
+    if (certDom.reloadBtn) {
+      certDom.reloadBtn.addEventListener('click', function () {
+        request('/api/certs/reload', { method: 'POST' })
+          .then(function (result) {
+            setFormStatus(certDom.status, 'ok', '已重新加载 ' + (result.loaded || 0) + ' 张证书');
+            refreshCerts();
+          })
+          .catch(function (error) {
+            setFormStatus(certDom.status, 'err', describeError(error));
+          });
+      });
+    }
+
+    request('/api/acme')
+      .then(function (summary) {
+        acmeState = summary;
+        if (certDom.acmeWarn) {
+          if (!summary.available) {
+            certDom.acmeWarn.textContent = 'ACME 服务不可用。';
+          } else if (!summary.contact_email_set) {
+            certDom.acmeWarn.textContent =
+              '尚未配置联系邮箱（acme.contact_email），部分 CA 会拒绝申请。';
+          } else {
+            certDom.acmeWarn.textContent =
+              'CA：' + summary.provider + '　验证方式：' + summary.challenge +
+              '　自动续期：' + (summary.auto_renew ? '开启' : '关闭');
+          }
+        }
+      })
+      .catch(function () {});
+  }
+
+  function switchCertMode() {
+    var checked = document.querySelector('input[name="tls-mode"]:checked');
+    var mode = checked ? checked.value : 'upload';
+    if (certDom.uploadPanel) certDom.uploadPanel.hidden = mode !== 'upload';
+    if (certDom.selfPanel) certDom.selfPanel.hidden = mode !== 'self-signed';
+    if (certDom.acmePanel) certDom.acmePanel.hidden = mode !== 'acme';
+  }
+
+  function refreshCerts() {
+    if (!certDom.body) return;
+    request('/api/certs')
+      .then(function (certs) {
+        renderCerts(Array.isArray(certs) ? certs : []);
+      })
+      .catch(function () {});
+  }
+
+  function renderCerts(certs) {
+    var body = certDom.body;
+    if (certDom.count) {
+      certDom.count.textContent = certs.length ? '共 ' + certs.length + ' 张' : '';
+    }
+    while (body.firstChild) body.removeChild(body.firstChild);
+    if (!certs.length) {
+      appendEmptyRow(body, 7, '还没有证书。用下方表单上传或申请。');
+      return;
+    }
+    certs.forEach(function (cert) {
+      var tr = document.createElement('tr');
+      appendCell(tr, cert.domain);
+      appendCell(tr, cert.source);
+      appendCell(tr, cert.issuer || '—');
+      appendCell(tr, cert.not_after || '—');
+
+      var days = document.createElement('td');
+      days.className = 'num';
+      days.textContent = String(cert.days_remaining);
+      if (cert.expired) days.setAttribute('data-state', 'off');
+      else if (cert.days_remaining <= 14) days.setAttribute('data-state', 'warn');
+      tr.appendChild(days);
+
+      var stateCell = document.createElement('td');
+      if (cert.expired) stateCell.textContent = '已过期';
+      else if (cert.last_error) stateCell.textContent = '有错误：' + cert.last_error;
+      else stateCell.textContent = '正常';
+      tr.appendChild(stateCell);
+
+      var actions = document.createElement('td');
+      actions.className = 'actions-col';
+      var del = document.createElement('button');
+      del.className = 'btn btn-ghost btn-sm';
+      del.type = 'button';
+      del.textContent = '删除';
+      del.addEventListener('click', function () {
+        if (!window.confirm('删除 ' + cert.domain + ' 的证书？删除后该域名握手会被拒绝。')) return;
+        request('/api/certs/' + encodeURIComponent(cert.domain), { method: 'DELETE' })
+          .then(function () {
+            refreshCerts();
+          })
+          .catch(function (error) {
+            setFormStatus(certDom.status, 'err', describeError(error));
+          });
+      });
+      actions.appendChild(del);
+      tr.appendChild(actions);
+      body.appendChild(tr);
+    });
+  }
+
+  /// 纯 DOM 构造的空态行（项目约定：服务端数据一律走 textContent）。
+  function appendEmptyRow(body, colspan, text) {
+    var tr = document.createElement('tr');
+    tr.className = 'empty-row';
+    var td = document.createElement('td');
+    td.colSpan = colspan;
+    td.textContent = text;
+    tr.appendChild(td);
+    body.appendChild(tr);
+  }
+
+  function appendCell(row, text) {
+    var td = document.createElement('td');
+    td.textContent = text === undefined || text === null ? '' : String(text);
+    row.appendChild(td);
+  }
+
+  function setFormStatus(el, kind, text) {
+    if (!el) return;
+    el.textContent = text || '';
+    el.setAttribute('data-state', kind || '');
+  }
+
+  function describeError(error) {
+    if (!error) return '操作失败';
+    if (error.message === 'unauthorized') return '登录已失效，请重新登录';
+    return error.message || '操作失败';
   }
 
   if (document.readyState === 'loading') {

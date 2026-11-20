@@ -24,6 +24,8 @@
         <a href="#overview">总览</a>
         <a href="#clients">客户端</a>
         <a href="#tunnels">隧道</a>
+        <a href="#sites">站点</a>
+        <a href="#certs">证书</a>
         <a href="#about">说明</a>
       </nav>
 
@@ -128,6 +130,131 @@
         </table>
       </div>
       <p class="table-note">流量列的「发送」指发送至客户端，「接收」指接收自客户端，均为该隧道的累计值。</p>
+    </section>
+
+    <section class="section" id="sites" aria-labelledby="sites-title">
+      <div class="section-head">
+        <h2 id="sites-title">域名站点</h2>
+        <span class="muted" id="sites-count"></span>
+      </div>
+      <div class="card table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">域名</th>
+              <th scope="col">客户端</th>
+              <th scope="col">目标地址</th>
+              <th scope="col">路径分流</th>
+              <th scope="col">WebSocket</th>
+              <th scope="col">证书</th>
+              <th scope="col" class="actions-col">操作</th>
+            </tr>
+          </thead>
+          <tbody id="sites-body">
+            <tr class="empty-row"><td colspan="7">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <form class="card form" id="site-form" autocomplete="off">
+        <h3>新增 / 更新站点</h3>
+        <div class="form-row">
+          <label>域名<input id="site-domain" name="domain" placeholder="app.example.com" required></label>
+          <label>客户端 ID<input id="site-client" name="client_id" type="number" min="1" value="1" required></label>
+        </div>
+        <div class="form-row">
+          <label class="grow">目标地址<input id="site-target" name="target" placeholder="127.0.0.1:3000" required></label>
+          <label class="check"><input id="site-ws" name="websocket" type="checkbox" checked> 允许 WebSocket</label>
+        </div>
+        <p class="hint">同一域名再次提交即更新。路径分流在证书配置完成后再按需添加。</p>
+        <div class="form-actions">
+          <button class="btn" type="submit" id="site-submit">保存站点</button>
+          <span class="form-status" id="site-status" role="status" aria-live="polite"></span>
+        </div>
+      </form>
+    </section>
+
+    <section class="section" id="certs" aria-labelledby="certs-title">
+      <div class="section-head">
+        <h2 id="certs-title">SSL 证书</h2>
+        <span class="muted" id="certs-count"></span>
+      </div>
+      <div class="card table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">域名</th>
+              <th scope="col">来源</th>
+              <th scope="col">签发者</th>
+              <th scope="col">到期</th>
+              <th scope="col" class="num">剩余天数</th>
+              <th scope="col">状态</th>
+              <th scope="col" class="actions-col">操作</th>
+            </tr>
+          </thead>
+          <tbody id="certs-body">
+            <tr class="empty-row"><td colspan="7">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card form">
+        <h3>选择证书方式</h3>
+        <p class="hint">程序<strong>不会自动申请证书</strong>。只有你在这里点击按钮，才会真正联系 CA。</p>
+
+        <div class="tls-choices" role="radiogroup" aria-label="证书方式">
+          <label class="tls-choice">
+            <input type="radio" name="tls-mode" value="upload" checked>
+            <span><strong>上传已有证书</strong><br><small>粘贴 PEM 格式的证书链与私钥，即时生效</small></span>
+          </label>
+          <label class="tls-choice">
+            <input type="radio" name="tls-mode" value="self-signed">
+            <span><strong>生成自签证书</strong><br><small>仅用于测试；浏览器会提示不受信任</small></span>
+          </label>
+          <label class="tls-choice" id="acme-choice">
+            <input type="radio" name="tls-mode" value="acme">
+            <span><strong>向 Let's Encrypt 申请（免费）</strong><br><small id="acme-hint">需要域名解析到本机且 80/443 可达</small></span>
+          </label>
+        </div>
+
+        <div id="cert-upload-panel">
+          <div class="form-row">
+            <label class="grow">域名<input id="cert-domain" placeholder="app.example.com"></label>
+          </div>
+          <label>证书（PEM，含中间链）<textarea id="cert-pem" rows="5" placeholder="-----BEGIN CERTIFICATE-----"></textarea></label>
+          <label>私钥（PEM）<textarea id="cert-key" rows="4" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></label>
+          <p class="hint">私钥只在本浏览器与服务器之间传输一次，不会回显，也不会写入日志。</p>
+          <div class="form-actions">
+            <button class="btn" type="button" id="cert-upload-btn">上传并部署</button>
+            <span class="form-status" id="cert-status" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+
+        <div id="cert-selfsigned-panel" hidden>
+          <div class="form-row">
+            <label class="grow">域名<input id="cert-self-domain" placeholder="test.local"></label>
+          </div>
+          <div class="form-actions">
+            <button class="btn" type="button" id="cert-self-btn">生成自签证书</button>
+          </div>
+        </div>
+
+        <div id="cert-acme-panel" hidden>
+          <div class="form-row">
+            <label class="grow">域名<input id="cert-acme-domain" placeholder="app.example.com"></label>
+          </div>
+          <p class="hint" id="cert-acme-warn"></p>
+          <div class="form-actions">
+            <button class="btn" type="button" id="cert-acme-btn">开始申请</button>
+            <span class="form-status" id="cert-acme-status" role="status" aria-live="polite"></span>
+          </div>
+          <ol class="acme-steps" id="acme-steps"></ol>
+        </div>
+
+        <div class="form-actions">
+          <button class="btn btn-ghost" type="button" id="cert-reload-btn">从磁盘重新加载证书</button>
+        </div>
+      </div>
     </section>
 
     <section class="section" id="about" aria-labelledby="about-title">

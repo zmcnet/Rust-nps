@@ -10,6 +10,7 @@
 //!
 //! 动态隧道不持久化：`rnps` 重启即失效，客户端重连后会重新注册。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -101,12 +102,46 @@ impl Server {
             .local_addr()
             .context("读取桥实际绑定地址失败")?;
 
+        // ---- 按客户端组装流控（同一客户端的所有隧道共享一份配额）----
+        let ip_allow = Arc::new(
+            crate::limit::IpAllowList::new(&config.ip_limit)
+                .context("ip_limit 配置非法")?,
+        );
+        let mut client_rates: HashMap<i32, Arc<crate::limit::TokenBucket>> = HashMap::new();
+        let mut client_flows: HashMap<i32, Arc<crate::limit::FlowCounter>> = HashMap::new();
+        for c in &config.clients {
+            if c.rate_limit > 0 {
+                client_rates.insert(c.id, Arc::new(crate::limit::TokenBucket::new(c.rate_limit)));
+            }
+            if c.flow_limit > 0 {
+                client_flows.insert(c.id, Arc::new(crate::limit::FlowCounter::new(c.flow_limit)));
+            }
+        }
+        for c in config.clients.iter().filter(|c| c.rate_limit > 0) {
+            info!("客户端 {} 限速 {} KB/s", c.id, c.rate_limit);
+        }
+        for c in config.clients.iter().filter(|c| c.flow_limit > 0) {
+            info!("客户端 {} 流量上限 {} KB", c.id, c.flow_limit);
+        }
+        if !config.ip_limit.is_empty() {
+            info!("来源 IP 白名单已启用（{} 条）", config.ip_limit.len());
+        }
+
         let static_tunnels: Vec<Arc<Tunnel>> = config
             .tunnels
             .iter()
-            .cloned()
-            .map(Tunnel::new)
-            .map(Arc::new)
+            .map(|cfg| {
+                let pool = crate::target::TargetPool::parse(&cfg.target_addr)
+                    .map(Arc::new)
+                    .unwrap_or_else(|_| Arc::new(crate::target::TargetPool::single(&cfg.target_addr)));
+                Arc::new(Tunnel::with_controls(
+                    cfg.clone(),
+                    pool,
+                    client_rates.get(&cfg.client_id).cloned(),
+                    client_flows.get(&cfg.client_id).cloned(),
+                    ip_allow.clone(),
+                ))
+            })
             .collect();
 
         // 动态隧道 id 从静态隧道最大 id + 1 起分配，避免与管理端可见 id 冲突
@@ -588,6 +623,37 @@ impl Server {
     /// HTTPS 监听器（用于读取握手统计）。未启用时为 None。
     pub fn https_listener(&self) -> Option<Arc<crate::tls::TlsListener>> {
         self.inner.https_tls.clone()
+    }
+
+    /// 列出当前生效的站点（管理端展示用；不含任何密钥）。
+    pub async fn list_sites(&self) -> Vec<crate::http_site::HttpSite> {
+        match &self.inner.http {
+            Some(http) => http.router().await.sites().to_vec(),
+            None => Vec::new(),
+        }
+    }
+
+    /// 新增或更新一个站点（按域名）。立即生效，无需重启。
+    ///
+    /// 返回  表示域名非法或与已有站点冲突。
+    pub async fn upsert_site(&self, site: crate::http_site::HttpSite) -> Result<()> {
+        let http = self
+            .inner
+            .http
+            .as_ref()
+            .context("域名代理未启用（需配置 http_listen_addr 或 https_listen_addr）")?;
+        if self.is_shutdown() {
+            bail!("服务端已关闭，无法修改站点");
+        }
+        http.upsert_site(site).await
+    }
+
+    /// 删除一个站点（按域名）。返回是否真的删掉了。
+    pub async fn remove_site(&self, domain: &str) -> Result<bool> {
+        let Some(http) = self.inner.http.as_ref() else {
+            return Ok(false);
+        };
+        Ok(http.remove_site(domain).await)
     }
 
     /// ACME 服务（管理端用来触发申请/查询待办）。

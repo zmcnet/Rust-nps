@@ -113,10 +113,19 @@ pub(crate) struct Tunnel {
     op: Mutex<()>,
     /// 当前运行中的监听任务；`Some` 即"已启用"，内含实际绑定地址
     runtime: Mutex<Option<TunnelRun>>,
+    /// 多目标轮询池（含健康检查状态）
+    targets: Arc<crate::target::TargetPool>,
+    /// 限速（与同客户端其它隧道共享）
+    rate: Option<Arc<crate::limit::TokenBucket>>,
+    /// 流量上限（与同客户端其它隧道共享）
+    flow: Option<Arc<crate::limit::FlowCounter>>,
+    /// 来源 IP 白名单
+    ip_allow: Arc<crate::limit::IpAllowList>,
 }
 
 impl Tunnel {
     pub fn new(cfg: TcpTunnelConfig) -> Self {
+        let spec = cfg.target_addr.clone();
         Self {
             cfg,
             active_connections: AtomicU64::new(0),
@@ -125,6 +134,37 @@ impl Tunnel {
             last_error: Mutex::new(None),
             op: Mutex::new(()),
             runtime: Mutex::new(None),
+            // 解析失败时退化为单目标池（配置校验已保证 target_addr 合法）
+            targets: Arc::new(
+                crate::target::TargetPool::parse(&spec)
+                    .unwrap_or_else(|_| crate::target::TargetPool::single(&spec)),
+            ),
+            rate: None,
+            flow: None,
+            ip_allow: Arc::new(crate::limit::IpAllowList::default()),
+        }
+    }
+
+    /// 带上流控与多目标配置构造（由 `server.rs` 使用）。
+    pub fn with_controls(
+        cfg: TcpTunnelConfig,
+        targets: Arc<crate::target::TargetPool>,
+        rate: Option<Arc<crate::limit::TokenBucket>>,
+        flow: Option<Arc<crate::limit::FlowCounter>>,
+        ip_allow: Arc<crate::limit::IpAllowList>,
+    ) -> Self {
+        Self {
+            cfg,
+            active_connections: AtomicU64::new(0),
+            bytes_to_client: AtomicU64::new(0),
+            bytes_from_client: AtomicU64::new(0),
+            last_error: Mutex::new(None),
+            op: Mutex::new(()),
+            runtime: Mutex::new(None),
+            targets,
+            rate,
+            flow,
+            ip_allow,
         }
     }
 
@@ -308,6 +348,23 @@ impl Tunnel {
             return;
         }
 
+        // ---- 准入检查：IP 白名单 → 流量上限 ----
+        // 必须在建 mux 流之前做，否则超限请求会白白消耗 npc 侧的目标连接。
+        if !self.ip_allow.allows(peer.ip()) {
+            debug!("隧道 {}: 拒绝未授权来源 IP {}", self.cfg.id, peer.ip());
+            return;
+        }
+        if let Some(flow) = &self.flow {
+            if flow.exceeded() {
+                self.set_error("客户端流量已超限").await;
+                warn!(
+                    "隧道 {}: 客户端 {} 流量超限，拒绝来自 {} 的连接",
+                    self.cfg.id, self.cfg.client_id, peer
+                );
+                return;
+            }
+        }
+
         // 目标客户端离线 → 直接关闭外部连接，记录原因，不 panic
         let mux = match bridge.get_tunnel(self.cfg.client_id).await {
             Some(m) => m,
@@ -339,7 +396,17 @@ impl Tunnel {
         // 发送 Link 信息：int32 LE 长度 + JSON（对齐 Go `SendInfo(link, "")`）。
         // Link 帧是本次子流的第一帧，随后立即开始双向转发，不插入其他帧，
         // 因此不会吞掉首帧数据。
-        let mut link = nps_proto::Link::tcp(self.cfg.target_addr.clone(), peer.to_string());
+        // 多目标轮询：全离线时直接关闭外部连接（对应原版
+        // `all inward-bending targets are offline`）
+        let target = match self.targets.next() {
+            Ok(target) => target,
+            Err(e) => {
+                self.set_error(format!("无可用目标: {e}")).await;
+                warn!("隧道 {}: 无可用目标（{e}），拒绝来自 {} 的连接", self.cfg.id, peer);
+                return;
+            }
+        };
+        let mut link = nps_proto::Link::tcp(target, peer.to_string());
         link.option.timeout = TARGET_DIAL_TIMEOUT_NS;
         let link_json = match serde_json::to_vec(&link) {
             Ok(v) => v,
@@ -432,6 +499,13 @@ impl Tunnel {
                     }
                 },
             };
+            // 限速：与 cancel 竞争，避免低速配置下停用隧道要等一整个配额周期
+            if let Some(rate) = &tunnel.rate {
+                tokio::select! {
+                    _ = cancel.changed() => break,
+                    _ = rate.acquire(n) => {}
+                }
+            }
             if send.send_data(&buf[..n]).await.is_err() {
                 debug!("隧道 {}: 写 mux 失败（客户端可能已断开）", tunnel.cfg.id);
                 break;
@@ -439,6 +513,9 @@ impl Tunnel {
             tunnel
                 .bytes_to_client
                 .fetch_add(n as u64, Ordering::Relaxed);
+            if let Some(flow) = &tunnel.flow {
+                flow.add(n as u64, 0);
+            }
         }
         // 半关闭：告知 npc 外部不再发送数据
         send.close();
@@ -462,6 +539,12 @@ impl Tunnel {
                     None => break,
                 },
             };
+            if let Some(rate) = &tunnel.rate {
+                tokio::select! {
+                    _ = cancel.changed() => break,
+                    _ = rate.acquire(data.len()) => {}
+                }
+            }
             if writer.write_all(&data).await.is_err() {
                 debug!("隧道 {}: 写外部连接失败", tunnel.cfg.id);
                 break;
@@ -469,6 +552,9 @@ impl Tunnel {
             tunnel
                 .bytes_from_client
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
+            if let Some(flow) = &tunnel.flow {
+                flow.add(0, data.len() as u64);
+            }
             let _ = writer.flush().await;
         }
         let _ = writer.shutdown().await;

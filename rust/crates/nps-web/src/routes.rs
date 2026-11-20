@@ -21,7 +21,8 @@ use crate::backend::AdminBackend;
 const MIN_TOKEN_LEN: usize = 24;
 
 /// `/api` 请求体上限，状态变更请求只有一个布尔值。
-const API_BODY_LIMIT: usize = 16 * 1024;
+///  请求体上限。证书上传可能带上完整证书链，放宽到 256 KiB。
+const API_BODY_LIMIT: usize = 256 * 1024;
 
 const HTML_CACHE: &str = "no-store";
 const ASSET_CACHE: &str = "no-cache";
@@ -54,7 +55,17 @@ pub fn router_with_backend<B: AdminBackend>(
 
     let api = Router::new()
         .route("/status", get(get_status::<B>))
+        .route("/listeners", get(get_listeners::<B>))
         .route("/tunnels/{id}/state", post(set_tunnel_state::<B>))
+        .route("/sites", get(list_sites::<B>).post(upsert_site::<B>))
+        .route("/sites/{domain}", axum::routing::delete(remove_site::<B>))
+        .route("/certs", get(list_certs::<B>))
+        .route("/certs/upload", post(upload_cert::<B>))
+        .route("/certs/self-signed", post(self_signed_cert::<B>))
+        .route("/certs/reload", post(reload_certs::<B>))
+        .route("/certs/acme-request", post(acme_request::<B>))
+        .route("/certs/{domain}", axum::routing::delete(remove_cert::<B>))
+        .route("/acme", get(get_acme::<B>))
         .fallback(api_not_found)
         .layer(DefaultBodyLimit::max(API_BODY_LIMIT))
         .layer(middleware::from_fn_with_state(
@@ -425,4 +436,234 @@ fn asset(body: &'static str, content_type: &'static str, cache: &'static str) ->
         body,
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// 站点与证书 API
+// ---------------------------------------------------------------------------
+
+async fn get_listeners<B: AdminBackend>(State(state): State<WebState<B>>) -> Response {
+    Json(state.backend.listener_stats()).into_response()
+}
+
+async fn get_acme<B: AdminBackend>(State(state): State<WebState<B>>) -> Response {
+    Json(state.backend.acme_summary()).into_response()
+}
+
+async fn list_sites<B: AdminBackend>(State(state): State<WebState<B>>) -> Response {
+    Json(state.backend.list_sites().await).into_response()
+}
+
+async fn list_certs<B: AdminBackend>(State(state): State<WebState<B>>) -> Response {
+    Json(state.backend.list_certificates().await).into_response()
+}
+
+/// `POST /api/sites`，请求体见 [`SiteInput`]。
+async fn upsert_site<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let body = match require_json_body(&headers, body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let input: crate::backend::SiteInput = match serde_json::from_slice(&body) {
+        Ok(input) => input,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("站点 JSON 无效：{error}"),
+            );
+        }
+    };
+    match state.backend.upsert_site(input).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "站点写入失败");
+            error_response(StatusCode::BAD_REQUEST, &format!("{error:#}"))
+        }
+    }
+}
+
+async fn remove_site<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    Path(domain): Path<String>,
+) -> Response {
+    match state.backend.remove_site(domain.clone()).await {
+        Ok(true) => (StatusCode::OK, Json(json!({ "ok": true, "domain": domain }))).into_response(),
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "未找到该站点"),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "站点删除失败");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "站点删除失败")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct UploadCertPayload {
+    domain: String,
+    cert_pem: String,
+    key_pem: String,
+}
+
+/// `POST /api/certs/upload`：上传证书与私钥。
+///
+/// **私钥只在本次请求体内出现**：不回显、不记录到日志、不进响应。
+async fn upload_cert<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let body = match require_json_body(&headers, body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let payload: UploadCertPayload = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("证书 JSON 无效：{error}"),
+            );
+        }
+    };
+    if payload.cert_pem.trim().is_empty() || payload.key_pem.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "证书与私钥都不能为空");
+    }
+    match state
+        .backend
+        .upload_certificate(
+            payload.domain.trim().to_owned(),
+            payload.cert_pem,
+            payload.key_pem,
+        )
+        .await
+    {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(error) => {
+            // 只记录错误摘要，绝不把私钥写进日志
+            let detail = format!("{error:#}");
+            tracing::warn!(error = %detail, "证书上传失败");
+            error_response(StatusCode::BAD_REQUEST, &detail)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SelfSignedPayload {
+    domain: String,
+}
+
+async fn self_signed_cert<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let body = match require_json_body(&headers, body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let payload: SelfSignedPayload = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("请求 JSON 无效：{error}"),
+            );
+        }
+    };
+    match state
+        .backend
+        .generate_self_signed(payload.domain.trim().to_owned())
+        .await
+    {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "自签证书生成失败");
+            error_response(StatusCode::BAD_REQUEST, &format!("{error:#}"))
+        }
+    }
+}
+
+async fn reload_certs<B: AdminBackend>(State(state): State<WebState<B>>) -> Response {
+    match state.backend.reload_certificates().await {
+        Ok(count) => (StatusCode::OK, Json(json!({ "ok": true, "loaded": count }))).into_response(),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "证书重载失败");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "证书重载失败")
+        }
+    }
+}
+
+async fn remove_cert<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    Path(domain): Path<String>,
+) -> Response {
+    match state.backend.remove_certificate(domain.clone()).await {
+        Ok(true) => (StatusCode::OK, Json(json!({ "ok": true, "domain": domain }))).into_response(),
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "未找到该证书"),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "证书删除失败");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "证书删除失败")
+        }
+    }
+}
+
+/// 统一校验 `Content-Type` 并取出请求体。
+fn require_json_body(
+    headers: &HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Bytes, Response> {
+    if !is_json_content_type(headers) {
+        return Err(error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "请求必须使用 application/json",
+        ));
+    }
+    match body {
+        Ok(body) if body.is_empty() => Err(error_response(StatusCode::BAD_REQUEST, "请求体不能为空")),
+        Ok(body) => Ok(body),
+        Err(rejection) => Err(error_response(rejection.status(), "请求体读取失败")),
+    }
+}
+
+#[derive(Deserialize)]
+struct AcmeRequestPayload {
+    domain: String,
+}
+
+/// ：**用户显式发起**的 ACME 申请。
+///
+/// 这是全系统唯一会联系 CA 的 HTTP 入口。前端必须由用户点击「开始申请」
+/// 才会调用；后端不做任何自动触发。
+async fn acme_request<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let body = match require_json_body(&headers, body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let payload: AcmeRequestPayload = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("请求 JSON 无效：{error}"),
+            );
+        }
+    };
+    let domain = payload.domain.trim().to_owned();
+    if domain.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "域名不能为空");
+    }
+    match state.backend.request_acme_certificate(domain).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "ACME 申请失败");
+            error_response(StatusCode::BAD_REQUEST, &format!("{error:#}"))
+        }
+    }
 }

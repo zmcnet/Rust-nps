@@ -28,6 +28,8 @@ fn config(conf_register: bool, max_tunnels: usize) -> ServerConfig {
             id: 1,
             name: "npc-conf".into(),
             vkey: VKEY.into(),
+            rate_limit: 0,
+            flow_limit: 0,
         }],
         tunnels: Vec::new(),
         conf_register,

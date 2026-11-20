@@ -9,6 +9,9 @@ use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
 use nps_server::{ClientSnapshot, ServerSnapshot, TunnelSnapshot};
+use nps_web::{
+    AcmeIssueResult, AcmeSummary, CertView, ListenerView, SiteInput, SiteRouteView, SiteView,
+};
 use nps_web::{router_with_backend, AdminBackend};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -23,6 +26,8 @@ struct MockBackend {
 
 struct MockState {
     tunnels: Vec<TunnelRow>,
+    sites: Vec<SiteView>,
+    certs: Vec<CertView>,
 }
 
 struct TunnelRow {
@@ -68,6 +73,8 @@ impl MockBackend {
                         last_error: Some("client offline".to_string()),
                     },
                 ],
+                sites: Vec::new(),
+                certs: Vec::new(),
             })),
             fail_with: None,
         }
@@ -142,6 +149,141 @@ impl AdminBackend for MockBackend {
             .expect("路由层应先检查隧道是否存在");
         tunnel.enabled = enabled;
         Ok(())
+    }
+
+    // ---- 站点 ----
+
+    async fn list_sites(&self) -> Vec<SiteView> {
+        self.inner
+            .lock()
+            .expect("mock state poisoned")
+            .sites
+            .clone()
+    }
+
+    async fn upsert_site(&self, site: SiteInput) -> anyhow::Result<SiteView> {
+        if site.domain.trim().is_empty() {
+            anyhow::bail!("域名不能为空");
+        }
+        let view = SiteView {
+            domain: site.domain.trim().to_owned(),
+            client_id: site.client_id,
+            target: site.target.clone(),
+            routes: site.routes.clone(),
+            websocket: site.websocket,
+        };
+        let mut state = self.inner.lock().expect("mock state poisoned");
+        state.sites.retain(|s| s.domain != view.domain);
+        state.sites.push(view.clone());
+        Ok(view)
+    }
+
+    async fn remove_site(&self, domain: String) -> anyhow::Result<bool> {
+        let mut state = self.inner.lock().expect("mock state poisoned");
+        let before = state.sites.len();
+        state.sites.retain(|s| s.domain != domain);
+        Ok(state.sites.len() != before)
+    }
+
+    // ---- 证书 ----
+
+    async fn list_certificates(&self) -> Vec<CertView> {
+        self.inner
+            .lock()
+            .expect("mock state poisoned")
+            .certs
+            .clone()
+    }
+
+    async fn upload_certificate(
+        &self,
+        domain: String,
+        cert_pem: String,
+        key_pem: String,
+    ) -> anyhow::Result<CertView> {
+        if cert_pem.trim().is_empty() || key_pem.trim().is_empty() {
+            anyhow::bail!("证书与私钥都不能为空");
+        }
+        if !cert_pem.contains("BEGIN CERTIFICATE") {
+            anyhow::bail!("不是合法的 PEM 证书");
+        }
+        let view = fake_cert(&domain, "upload");
+        let mut state = self.inner.lock().expect("mock state poisoned");
+        state.certs.retain(|c| c.domain != domain);
+        state.certs.push(view.clone());
+        Ok(view)
+    }
+
+    async fn generate_self_signed(&self, domain: String) -> anyhow::Result<CertView> {
+        let view = fake_cert(&domain, "self-signed");
+        let mut state = self.inner.lock().expect("mock state poisoned");
+        state.certs.retain(|c| c.domain != domain);
+        state.certs.push(view.clone());
+        Ok(view)
+    }
+
+    async fn remove_certificate(&self, domain: String) -> anyhow::Result<bool> {
+        let mut state = self.inner.lock().expect("mock state poisoned");
+        let before = state.certs.len();
+        state.certs.retain(|c| c.domain != domain);
+        Ok(state.certs.len() != before)
+    }
+
+    async fn reload_certificates(&self) -> anyhow::Result<usize> {
+        Ok(self.inner.lock().expect("mock state poisoned").certs.len())
+    }
+
+    fn acme_summary(&self) -> AcmeSummary {
+        AcmeSummary {
+            available: true,
+            provider: "letsencrypt".to_owned(),
+            challenge: "http-01".to_owned(),
+            auto_renew: true,
+            contact_email_set: true,
+        }
+    }
+
+    fn listener_stats(&self) -> ListenerView {
+        ListenerView {
+            udp_tunnels: 1,
+            udp_active_flows: 3,
+            http_configured: true,
+            http_active_connections: 2,
+            http_served_requests: 42,
+            socks5_listeners: 1,
+            socks5_active_connections: 1,
+        }
+    }
+
+    async fn request_acme_certificate(
+        &self,
+        domain: String,
+    ) -> anyhow::Result<AcmeIssueResult> {
+        let view = fake_cert(&domain, "acme");
+        let mut state = self.inner.lock().expect("mock state poisoned");
+        state.certs.retain(|c| c.domain != domain);
+        state.certs.push(view);
+        Ok(AcmeIssueResult {
+            domain,
+            issued: true,
+            not_after: "2030-01-01T00:00:00Z".to_owned(),
+            reason: None,
+        })
+    }
+}
+
+fn fake_cert(domain: &str, source: &str) -> CertView {
+    CertView {
+        domain: domain.to_owned(),
+        source: source.to_owned(),
+        issuer: "CN=Test CA".to_owned(),
+        not_before: "2026-01-01T00:00:00Z".to_owned(),
+        not_after: "2030-01-01T00:00:00Z".to_owned(),
+        days_remaining: 365,
+        san: vec![domain.to_owned()],
+        fingerprint_sha256: "AA:BB:CC".to_owned(),
+        expired: false,
+        last_error: None,
     }
 }
 
@@ -328,10 +470,11 @@ async fn unknown_api_route_requires_auth_then_404() {
 
 #[tokio::test]
 async fn mutation_with_oversized_body_is_rejected() {
-    // 单个布尔值的请求远小于 16 KiB；超出上限应被请求体限制拒绝。
+    // 上限已放宽到 256 KiB（证书上传需要带完整证书链），
+    // 用 512 KiB 的请求体验证限制仍然生效。
     let huge = format!(
         r#"{{"enabled":true,"padding":"{}"}}"#,
-        "x".repeat(32 * 1024)
+        "x".repeat(512 * 1024)
     );
     let response = app(MockBackend::new())
         .oneshot(authed(post_json("/api/tunnels/9/state", &huge)))
@@ -627,4 +770,211 @@ async fn unknown_static_path_returns_html_404() {
             .and_then(|v| v.to_str().ok()),
         Some("text/html; charset=utf-8")
     );
+}
+
+// ---------------------------------------------------------------------------
+// 站点 API
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sites_list_requires_auth() {
+    let response = app(MockBackend::new())
+        .oneshot(get("/api/sites"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn sites_list_is_empty_initially() {
+    let response = app(MockBackend::new())
+        .oneshot(authed(get("/api/sites")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json.as_array().map(|a| a.len()), Some(0));
+}
+
+#[tokio::test]
+async fn site_can_be_created_listed_and_deleted() {
+    let backend = MockBackend::new();
+
+    let payload = serde_json::json!({
+        "domain": "app.example.com",
+        "client_id": 1,
+        "target": "127.0.0.1:3000",
+        "routes": [],
+        "websocket": true
+    });
+    let response = app(backend.clone())
+        .oneshot(authed(post_json("/api/sites", &payload.to_string())))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let view: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(view["domain"], "app.example.com");
+    assert_eq!(view["websocket"], true);
+
+    // 列表里能看到
+    let response = app(backend.clone())
+        .oneshot(authed(get("/api/sites")))
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let list: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list.as_array().map(|a| a.len()), Some(1));
+
+    // 删除
+    let response = app(backend.clone())
+        .oneshot(authed(axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/api/sites/app.example.com")
+            .body(Body::empty())
+            .unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app(backend)
+        .oneshot(authed(get("/api/sites")))
+        .await
+        .unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let list: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list.as_array().map(|a| a.len()), Some(0));
+}
+
+#[tokio::test]
+async fn site_with_empty_domain_is_rejected() {
+    let payload = serde_json::json!({
+        "domain": "   ",
+        "client_id": 1,
+        "target": "127.0.0.1:3000"
+    });
+    let response = app(MockBackend::new())
+        .oneshot(authed(post_json("/api/sites", &payload.to_string())))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn deleting_missing_site_is_404() {
+    let response = app(MockBackend::new())
+        .oneshot(authed(axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/api/sites/nope.example.com")
+            .body(Body::empty())
+            .unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// 证书 API
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn certs_list_requires_auth() {
+    let response = app(MockBackend::new())
+        .oneshot(get("/api/certs"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn cert_upload_rejects_empty_key() {
+    let payload = serde_json::json!({
+        "domain": "a.example.com",
+        "cert_pem": "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----",
+        "key_pem": "   "
+    });
+    let response = app(MockBackend::new())
+        .oneshot(authed(post_json("/api/certs/upload", &payload.to_string())))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn cert_upload_never_echoes_private_key() {
+    let key = "-----BEGIN PRIVATE KEY-----\nSUPERSECRETKEYMATERIAL\n-----END PRIVATE KEY-----";
+    let payload = serde_json::json!({
+        "domain": "a.example.com",
+        "cert_pem": "-----BEGIN CERTIFICATE-----\nCERTDATA\n-----END CERTIFICATE-----",
+        "key_pem": key
+    });
+    let response = app(MockBackend::new())
+        .oneshot(authed(post_json("/api/certs/upload", &payload.to_string())))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains("SUPERSECRETKEYMATERIAL"),
+        "响应体泄漏了私钥: {text}"
+    );
+    assert!(!text.contains("PRIVATE KEY"), "响应体出现了私钥标记");
+}
+
+#[tokio::test]
+async fn self_signed_cert_can_be_generated_and_removed() {
+    let backend = MockBackend::new();
+    let payload = serde_json::json!({ "domain": "test.local" });
+
+    let response = app(backend.clone())
+        .oneshot(authed(post_json(
+            "/api/certs/self-signed",
+            &payload.to_string(),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let view: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(view["source"], "self-signed");
+
+    let response = app(backend.clone())
+        .oneshot(authed(axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/api/certs/test.local")
+            .body(Body::empty())
+            .unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn acme_summary_is_exposed() {
+    let response = app(MockBackend::new())
+        .oneshot(authed(get("/api/acme")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["available"], true);
+    assert_eq!(json["provider"], "letsencrypt");
+    assert_eq!(json["challenge"], "http-01");
+}
+
+#[tokio::test]
+async fn listener_stats_are_exposed() {
+    let response = app(MockBackend::new())
+        .oneshot(authed(get("/api/listeners")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["udp_tunnels"], 1);
+    assert_eq!(json["http_served_requests"], 42);
+    assert_eq!(json["socks5_listeners"], 1);
 }

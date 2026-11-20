@@ -15,5 +15,8 @@ mod assets;
 mod backend;
 mod routes;
 
-pub use backend::AdminBackend;
+pub use backend::{
+    AcmeIssueResult, AcmeSummary, AdminBackend, CertView, ListenerView, SiteInput, SiteRouteView,
+    SiteView,
+};
 pub use routes::{router, router_with_backend};
