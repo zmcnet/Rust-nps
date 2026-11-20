@@ -732,6 +732,7 @@
     certDom.acmeBtn = document.getElementById('cert-acme-btn');
     certDom.acmeStatus = document.getElementById('cert-acme-status');
     certDom.acmeWarn = document.getElementById('cert-acme-warn');
+    certDom.acmeSteps = document.getElementById('acme-steps');
     certDom.reloadBtn = document.getElementById('cert-reload-btn');
     if (!certDom.body) return;
 
