@@ -53,14 +53,145 @@
    - 服务端：`Host` 模型（`Host`/`Location`/`Scheme`/`Target`），按 `Host` 头 + 路径前缀路由
    - 复用现有 mux：`Link.ConnType = "http"`，子流内传完整 HTTP 请求/响应
    - 支持 WebSocket 升级（`hijack`）
-3. **HTTPS 域名代理**
-   - SNI 解析（`ClientHello` 嗅探），按域名选证书或透传到客户端
-   - 默认自签证书 + 用户自定义证书路径
+3. **HTTPS 域名代理 + 证书管理**（详见下节）
 4. **SOCKS5**
    - CONNECT / BIND / UDP ASSOCIATE
    - 用户名密码认证（对应 `multi_account`）
 
 **验收标准**：每一项都用真实 Go `npc` 对接验证，并写入 `tools/interop/`。
+
+## 2.3 HTTPS 与证书管理（详细设计）
+
+### 定位
+
+`rnps` 内置 80/443 监听，自己完成 TLS 终结与证书生命周期管理。
+**目标不是做 Caddy**，只覆盖内网穿透场景真正需要的部分：
+
+- 用户已经有公网 IP 和域名（内网穿透的前提）
+- 需要把 `app.example.com` 直接指到家中的服务
+- 不想额外装 nginx/caddy 再配一遍反代
+
+**不做**：HTTP/2 推送、OCSP stapling 集群、多节点证书同步、WAF、缓存、gzip 预处理、
+复杂 rewrite 规则。这些交给专业的反代去做。
+
+### 三种证书来源
+
+| 模式 | 场景 | 实现 |
+| --- | --- | --- |
+| `acme` | 有公网 IP + 域名已解析 | `rustls-acme` 自动申请与续期 |
+| `upload` | 企业 CA / 已有证书 / 内网自签 | 面板上传 PEM，热加载 |
+| `self-signed` | 测试、内网 | 启动时生成，浏览器告警属预期 |
+
+### 三种 ACME 挑战
+
+| 挑战 | 要求 | 用途 |
+| --- | --- | --- |
+| `http-01` | 80 端口公网可达 | 默认，最通用 |
+| `tls-alpn-01` | 443 端口可达 | 80 被封时 |
+| `dns-01` | DNS API 凭据 | 泛域名 `*.example.com` |
+
+DNS-01 首期支持 Cloudflare（API Token）与阿里云 DNS（AccessKey），
+其它厂商留扩展点，不硬编码。
+
+### 数据模型
+
+```jsonc
+{
+  "web_listen": { "http": "0.0.0.0:80", "https": "0.0.0.0:443" },
+  "acme": {
+    "provider": "letsencrypt",       // letsencrypt | letsencrypt-staging | zerossl | custom
+    "directory_url": null,           // provider=custom 时必填
+    "email": "admin@example.com",
+    "challenge": "http-01",
+    "dns_provider": null,            // cloudflare | aliyun
+    "dns_credentials_env": "CF_DNS_API_TOKEN"
+  },
+  "sites": [
+    {
+      "id": 1,
+      "domain": "app.example.com",
+      "client_id": 1,
+      "target": "127.0.0.1:3000",
+      "routes": [                     // 可选，按路径前缀分流
+        { "prefix": "/api", "target": "127.0.0.1:8080" }
+      ],
+      "tls": {
+        "mode": "acme",
+        "force_https": true,
+        "hsts": false
+      },
+      "websocket": true,
+      "enabled": true
+    }
+  ]
+}
+```
+
+证书私钥**不写进配置文件**，单独存放：
+
+```
+<data_dir>/certs/<domain>/
+├─ cert.pem        叶子证书 + 中间证书链
+├─ key.pem         私钥（权限 0600，绝不入日志）
+└─ meta.json       签发者 / 到期时间 / 签发方式 / 上次续期结果
+```
+
+### 核心实现点
+
+1. **SNI 路由**：实现 `rustls::server::ResolvesServerCert`，按 SNI 查表；
+   未匹配域名直接拒绝握手（不返回默认证书，避免信息泄漏）。
+2. **证书热加载**：`ArcSwap<CertifiedKey>` 原子替换，续期不重启、不断连。
+3. **ACME 挑战服务**：80 端口上优先匹配 `/.well-known/acme-challenge/<token>`，
+   其余请求 301 到 HTTPS（`force_https` 时）。
+4. **TLS-ALPN-01**：在 443 的 ALPN 协商中同时宣告 `acme-tls/1` 与 `http/1.1`。
+5. **HTTP 转发**：解析请求行 + 头，按 `Host` 查 site，选 `routes` 前缀，
+   通过 mux 子流把**原始 HTTP 字节**转发给客户端，由客户端连目标。
+   这样客户端侧可以是任意语言/框架，不要求它会终止 HTTP。
+6. **WebSocket**：识别 `Upgrade: websocket`，之后转为双向字节流（不再解析 HTTP）。
+7. **续期**：到期前 30 天自动续；失败按 1h/6h/24h 退避重试并记录到 `meta.json`；
+   面板显示剩余天数与最近一次失败原因。
+8. **私钥保护**：只在内存解密；`Debug` 一律 `<redacted>`；任何错误信息不含路径以外的敏感内容。
+
+### 面板新增
+
+```
+站点管理
+├─ 站点列表：域名 / 客户端 / 目标 / 证书状态 / 到期天数 / 启用
+├─ 新增站点：域名、选客户端、填目标、选 TLS 模式
+├─ 路径分流：前缀 → 目标（可多条）
+├─ 一键申请证书（显示 ACME 进度：下单 → 验证 → 签发 → 部署）
+└─ 实时检测：DNS 解析是否正确、80/443 是否可达、握手是否成功
+
+证书管理
+├─ 证书列表：域名 / 签发者 / 到期 / 自动续期开关
+├─ 上传证书：粘贴 PEM 或上传文件，即时解析校验（含链完整性）
+├─ 手动续期 / 吊销
+└─ 私钥指纹展示（不显示私钥本身）
+```
+
+### 安全约束（必须有）
+
+1. 80/443 默认**不监听**，需显式配置 `web_listen` 才开启。
+2. 私钥文件权限 0600，且不随配置导出。
+3. ACME 账户密钥单独存放，同样 0600。
+4. 拒绝为未在 `sites` 中声明的域名签发证书（防滥用）。
+5. 面板上的证书操作需要管理令牌，且**不能**通过 API 读取私钥。
+6. `force_https` 默认开启；HSTS 默认关闭（避免用户误锁自己）。
+
+### 验收标准
+
+| 项 | 验证方式 |
+| --- | --- |
+| 证书上传与热加载 | 上传自签证书 → `openssl s_client` 握手成功 → 换证书 → 不重启即生效 |
+| HTTP 转发 | 真实 `npc` 接本地 Web 服务，`curl -H "Host: x"` 内容正确 |
+| WebSocket | `websocat` 或浏览器实测双向消息 |
+| ACME 申请 | 用 Pebble（Let's Encrypt 官方测试 CA）在本地跑完整流程 |
+| 续期逻辑 | 伪造临近到期证书，验证自动续期触发 |
+| SNI 拒绝 | 未声明域名握手失败，不返回任何证书 |
+
+> ACME 真实签发需要公网域名，开发阶段用 **Pebble** 做本地 ACME 服务器验证全流程，
+> 不依赖真实 Let's Encrypt 配额。
+
 
 ### 阶段 2.2：安全与流控
 
