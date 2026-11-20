@@ -12,9 +12,20 @@
 //!    **把对方地址互发给对方**（各发一个纯文本 `ip:port`）
 //! 5. 双方拿到地址后直连，服务端条目删除
 //!
-//! # 本实现
+//! # 重要：3 个连续端口
 //!
-//! 同样的协议、同样的超时与报文格式。服务端不解析、不转发任何业务数据。
+//! 原版 `server/server.go` 启动了**三个** `P2PServer`（`p2p_port`、
+//! `p2p_port+1`、`p2p_port+2`）。客户端 `handleP2PUdp` 会向这三个端口
+//! **各发一次**会合请求，收集到三个对端地址后合并成一条 KCP 连接
+//! （KCP 用多路 UDP 提高穿透率）。
+//!
+//! 因此 [`P2pRendezvous::spawn_three`] 一次起三个实例；
+//! 只起一个会让客户端永远等不到第三份地址而穿透失败。
+//!
+//! # 本实现范围
+//!
+//! 只做**信令**（会合），不实现 KCP 传输——客户端与提供方拿到彼此地址后
+//! 自行建立 KCP 连接，服务端不参与。
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -85,7 +96,18 @@ impl P2pRendezvous {
     }
 
     /// 在已绑定的 socket 上跑接收循环。
-    pub async fn serve(self: Arc<Self>, socket: Arc<UdpSocket>, mut cancel: watch::Receiver<bool>) {
+    pub async fn serve(self: Arc<Self>, socket: Arc<UdpSocket>, cancel: watch::Receiver<bool>) {
+        let own = Arc::new(AtomicU64::new(0));
+        self.serve_with_counter(socket, cancel, own).await;
+    }
+
+    /// 同上，但把配对计数累加到外部计数器（三端口共享一个总数）。
+    pub async fn serve_with_counter(
+        self: Arc<Self>,
+        socket: Arc<UdpSocket>,
+        mut cancel: watch::Receiver<bool>,
+        shared_paired: Arc<AtomicU64>,
+    ) {
         let bound = socket.local_addr().ok();
         info!("p2p 会合服务监听 {:?}（仅信令，不转发业务数据）", bound);
         let mut buf = vec![0u8; MAX_DATAGRAM];
@@ -111,8 +133,13 @@ impl P2pRendezvous {
                     continue;
                 }
             };
+            let before = self.paired.load(Ordering::Relaxed);
             if let Err(e) = self.handle_datagram(&socket, peer, text).await {
                 debug!("p2p: {e}");
+            }
+            let after = self.paired.load(Ordering::Relaxed);
+            if after > before {
+                shared_paired.fetch_add(after - before, Ordering::Relaxed);
             }
         }
         debug!("p2p 会合循环退出");
@@ -209,6 +236,42 @@ impl P2pRendezvous {
     pub async fn pending(&self) -> usize {
         self.entries.lock().await.len()
     }
+}
+
+/// 按原版语义启动**三个连续端口**的会合服务（`base`、`base+1`、`base+2`）。
+///
+/// 返回实际绑定地址与共享的取消信号。任一端口绑定失败都会整体失败
+/// （避免「只起了一两个」导致客户端永远等不齐三份地址）。
+pub async fn spawn_three(
+    base: SocketAddr,
+) -> Result<(Vec<SocketAddr>, watch::Sender<bool>, Arc<AtomicU64>)> {
+    let (tx, rx) = watch::channel(false);
+    let paired = Arc::new(AtomicU64::new(0));
+    let mut bound = Vec::with_capacity(3);
+
+    for offset in 0..3u16 {
+        let addr = SocketAddr::new(base.ip(), base.port().saturating_add(offset));
+        let svc = Arc::new(P2pRendezvous::new(addr));
+        let socket = Arc::new(
+            svc.bind()
+                .await
+                .with_context(|| format!("p2p 会合端口 {addr} 绑定失败"))?,
+        );
+        let actual = socket.local_addr()?;
+        bound.push(actual);
+
+        let shared_paired = paired.clone();
+        let rx = rx.clone();
+        tokio::spawn(async move {
+            svc.serve_with_counter(socket, rx, shared_paired).await;
+        });
+    }
+
+    info!(
+        "p2p 会合服务已启动三个端口 {:?}（对齐原版 p2p_port/+1/+2）",
+        bound
+    );
+    Ok((bound, tx, paired))
 }
 
 #[cfg(test)]

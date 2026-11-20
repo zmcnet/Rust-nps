@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,8 +71,8 @@ struct ServerInner {
     file_channels: Arc<crate::file_service::FileChannelRegistry>,
     /// secret 隧道注册表（md5(password) -> 隧道）
     secrets: Arc<crate::secret::SecretRegistry>,
-    /// p2p 会合服务；None = 未配置
-    p2p: Option<Arc<crate::p2p::P2pRendezvous>>,
+    /// p2p 会合服务配对计数（三端口共享）；None = 未配置
+    p2p_paired: Option<Arc<AtomicU64>>,
     /// p2p 取消信号
     p2p_cancel: Option<tokio::sync::watch::Sender<bool>>,
     /// SOCKS5 监听（配置里的 `socks5_listeners`）
@@ -299,19 +299,18 @@ impl Server {
             registry: secrets.clone(),
         }));
 
-        // ---- p2p 会合服务（仅信令）----
-        let (p2p, p2p_cancel) = match config.p2p_listen_addr.as_deref() {
+        // ---- p2p 会合服务（仅信令；原版需要**三个连续端口**）----
+        let (p2p_paired, p2p_cancel) = match config.p2p_listen_addr.as_deref() {
             Some(addr) => {
                 let listen: SocketAddr = addr
                     .trim()
                     .parse()
                     .with_context(|| format!("p2p_listen_addr 非法: {addr}"))?;
-                let svc = Arc::new(crate::p2p::P2pRendezvous::new(listen));
-                let socket = Arc::new(svc.bind().await?);
-                let (tx, rx) = tokio::sync::watch::channel(false);
-                let s = svc.clone();
-                tokio::spawn(async move { s.serve(socket, rx).await });
-                (Some(svc), Some(tx))
+                let (bound, tx, paired) = crate::p2p::spawn_three(listen)
+                    .await
+                    .context("p2p 会合服务启动失败")?;
+                info!("p2p 会合端口: {:?}", bound);
+                (Some(paired), Some(tx))
             }
             None => (None, None),
         };
@@ -664,7 +663,7 @@ impl Server {
                 file: file_tunnels_shared,
                 file_channels,
                 secrets,
-                p2p,
+                p2p_paired,
                 p2p_cancel,
                 socks5: socks5_servers,
                 bridge_task: Mutex::new(Some(bridge_task)),
@@ -707,8 +706,13 @@ impl Server {
             secret_matched: self.inner.secrets.matched(),
             secret_rejected: self.inner.secrets.rejected(),
             file_tunnels: self.inner.file.try_lock().map(|v| v.len()).unwrap_or(0),
-            p2p_enabled: self.inner.p2p.is_some(),
-            p2p_paired: self.inner.p2p.as_ref().map(|p| p.paired()).unwrap_or(0),
+            p2p_enabled: self.inner.p2p_paired.is_some(),
+            p2p_paired: self
+                .inner
+                .p2p_paired
+                .as_ref()
+                .map(|p| p.load(Ordering::Relaxed))
+                .unwrap_or(0),
             socks5_listeners: self.inner.socks5.len(),
             socks5_active_connections: self
                 .inner
