@@ -200,6 +200,15 @@ impl Tunnel {
             active_connections: self.active_connections.load(Ordering::Relaxed),
             bytes_to_client: self.bytes_to_client.load(Ordering::Relaxed),
             bytes_from_client: self.bytes_from_client.load(Ordering::Relaxed),
+            targets: self
+                .targets
+                .all_targets()
+                .into_iter()
+                .map(|t| {
+                    let healthy = !self.targets.is_offline(&t);
+                    crate::snapshot::TargetHealth { target: t, healthy }
+                })
+                .collect(),
             last_error: self.last_error.lock().await.clone(),
             bound_addr,
         }

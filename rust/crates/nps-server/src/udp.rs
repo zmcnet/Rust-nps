@@ -243,6 +243,7 @@ impl UdpTunnel {
             active_connections: self.active_flows(),
             bytes_to_client: self.bytes_to_client.load(Ordering::Relaxed),
             bytes_from_client: self.bytes_from_client.load(Ordering::Relaxed),
+            targets: Vec::new(),
             last_error: self.last_error.lock().await.clone(),
             bound_addr,
         }

@@ -45,4 +45,14 @@ pub struct TunnelSnapshot {
     /// 附加字段：监听器实际绑定地址（含 `:0` 分配结果），未启用时为空
     #[serde(default)]
     pub bound_addr: Option<String>,
+    /// 各目标的健康状态（仅在配置了多目标或健康检查时非空）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<TargetHealth>,
+}
+
+/// 单个目标的健康状态（管理端展示用）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetHealth {
+    pub target: String,
+    pub healthy: bool,
 }

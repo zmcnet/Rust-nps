@@ -132,6 +132,7 @@ impl AdminBackend for MockBackend {
                     bytes_from_client: tunnel.bytes_from_client,
                     last_error: tunnel.last_error.clone(),
                     bound_addr: None,
+                    targets: Vec::new(),
                 })
                 .collect(),
         }

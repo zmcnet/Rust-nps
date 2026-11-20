@@ -815,12 +815,23 @@
           body: JSON.stringify({ domain: domain })
         })
           .then(function (result) {
-            setFormStatus(
-              certDom.acmeStatus,
-              'ok',
-              result && result.issued ? '证书已签发' : '已提交申请'
-            );
-            refreshCerts();
+            // 后端把「预检/验证失败」设计成 200 + issued:false + reason，
+            // 不是 HTTP 错误。这里必须读 issued 与 reason，
+            // 否则会把失败显示成绿色成功（比不报错更危险）。
+            if (result && result.issued) {
+              setFormStatus(certDom.acmeStatus, 'ok', '证书已签发并部署');
+              refreshCerts();
+            } else {
+              var reason = (result && result.reason) || '申请未成功，请查看服务端日志';
+              setFormStatus(certDom.acmeStatus, 'err', '申请失败：' + reason);
+              // 把原因也写进步骤列表，便于长文本阅读
+              if (certDom.acmeSteps) {
+                certDom.acmeSteps.textContent = '';
+                var li = document.createElement('li');
+                li.textContent = reason;
+                certDom.acmeSteps.appendChild(li);
+              }
+            }
           })
           .catch(function (error) {
             setFormStatus(certDom.acmeStatus, 'err', describeError(error));
