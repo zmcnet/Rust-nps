@@ -246,19 +246,29 @@ async fn run_session(server: &str, vkey: &str, shutdown: &mut watch::Receiver<bo
         shutdown.clone(),
     ));
 
+    // `select!` 的胜出分支可能已经把对应 JoinHandle 轮询到完成；
+    // 之后再 await 同一个 JoinHandle 会 panic（"polled after completion"），
+    // 因此这里用标志记录「accept 任务是否已结束」再决定是否等待。
+    let mut accept_done = false;
     let reason = tokio::select! {
         _ = wait_for_shutdown(shutdown) => "收到退出信号".to_owned(),
         result = &mut health => format!("main 连接断开: {}", describe_health_end(result)),
-        result = &mut accept => match result {
-            Ok(reason) => reason,
-            Err(error) => format!("mux 接受任务异常: {error}"),
-        },
+        result = &mut accept => {
+            accept_done = true;
+            match result {
+                Ok(reason) => reason,
+                Err(error) => format!("mux 接受任务异常: {error}"),
+            }
+        }
     };
 
     // 先关 mux，让子流读端立即返回，避免 shutdown 时泵悬挂。
     mux.close();
     health.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(3), async { let _ = accept.await; }).await;
+    if !accept_done {
+        let _ =
+            tokio::time::timeout(Duration::from_secs(3), async { let _ = accept.await; }).await;
+    }
 
     debug!(reason = %reason, "客户端会话结束");
     SessionEnd {

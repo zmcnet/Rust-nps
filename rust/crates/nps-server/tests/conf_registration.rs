@@ -111,7 +111,10 @@ async fn free_port() -> u16 {
 }
 
 /// 假 npc 的数据面：main + chan，接受子流并把收到的数据回显
-async fn spawn_echo_npc(bridge: SocketAddr, ready: oneshot::Sender<()>) -> tokio::task::JoinHandle<()> {
+async fn spawn_echo_npc(
+    bridge: SocketAddr,
+    ready: oneshot::Sender<()>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut main = npc_handshake(bridge, b"main").await;
         tokio::spawn(async move {
@@ -192,7 +195,10 @@ async fn register_tcp_tunnel_is_visible_and_listening() {
     assert_eq!(t.listen_addr, format!("127.0.0.1:{port}"));
     assert_eq!(t.target_addr, target);
     assert!(t.enabled);
-    assert_eq!(t.bound_addr.as_deref(), Some(format!("127.0.0.1:{port}").as_str()));
+    assert_eq!(
+        t.bound_addr.as_deref(),
+        Some(format!("127.0.0.1:{port}").as_str())
+    );
 
     // 端口确实被占用（再绑一次应失败）
     assert!(
@@ -236,7 +242,10 @@ async fn duplicate_registration_is_idempotent() {
 
     let snap = server.snapshot().await;
     assert_eq!(snap.tunnels.len(), 1, "重复注册不应新增隧道");
-    assert_eq!(snap.tunnels[0].bound_addr.as_deref(), Some(format!("127.0.0.1:{port}").as_str()));
+    assert_eq!(
+        snap.tunnels[0].bound_addr.as_deref(),
+        Some(format!("127.0.0.1:{port}").as_str())
+    );
 
     server.shutdown().await;
 }
@@ -258,7 +267,10 @@ async fn tunnel_limit_is_enforced() {
     assert!(read_bool(&mut conn).await);
 
     send_frame(&mut conn, b"task", &task(p2, &target, "two")).await;
-    assert!(!read_bool(&mut conn).await, "超过 conf_max_tunnels 必须返回 false");
+    assert!(
+        !read_bool(&mut conn).await,
+        "超过 conf_max_tunnels 必须返回 false"
+    );
 
     assert_eq!(server.snapshot().await.tunnels.len(), 1);
     server.shutdown().await;
@@ -280,7 +292,10 @@ async fn port_conflict_returns_false_and_leaves_no_tunnel() {
     send_frame(&mut conn, b"task", &task(port, &target, "busy")).await;
     assert!(!read_bool(&mut conn).await, "端口冲突必须返回 false");
 
-    assert!(server.snapshot().await.tunnels.is_empty(), "失败注册不应留下隧道");
+    assert!(
+        server.snapshot().await.tunnels.is_empty(),
+        "失败注册不应留下隧道"
+    );
     drop(holder);
     server.shutdown().await;
 }
@@ -368,13 +383,19 @@ async fn status_returns_running_tunnel_remarks() {
     let mut st = npc_handshake(server.bridge_addr(), b"conf").await;
     assert!(!read_bool(&mut st).await);
     st.write_all(b"stus").await.unwrap();
-    st.write_all(nps_legacy::md5_hex(VKEY).as_bytes()).await.unwrap();
+    st.write_all(nps_legacy::md5_hex(VKEY).as_bytes())
+        .await
+        .unwrap();
 
     let body = nps_legacy::read_short_len_content(&mut st).await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     let mut names: Vec<&str> = text.split(SEQ).filter(|s| !s.is_empty()).collect();
     names.sort_unstable();
-    assert_eq!(names, vec!["alpha", "beta"], "stus 应返回运行中的隧道 remark");
+    assert_eq!(
+        names,
+        vec!["alpha", "beta"],
+        "stus 应返回运行中的隧道 remark"
+    );
 
     server.shutdown().await;
 }
@@ -429,6 +450,51 @@ async fn registered_tunnel_forwards_through_client_mux() {
     drop(ext);
     server.shutdown().await;
     npc.abort();
+}
+
+// ---------------------------------------------------------------------------
+// 12. shutdown 会关闭仍打开的 conf 会话（不遗留挂起任务）
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn shutdown_closes_open_conf_sessions() {
+    let server = Server::start(config(true, 8)).await.unwrap();
+    let mut conn = npc_handshake(server.bridge_addr(), b"conf").await;
+    assert!(!read_bool(&mut conn).await);
+
+    tokio::time::timeout(Duration::from_secs(5), server.shutdown())
+        .await
+        .expect("shutdown 不应被 conf 会话拖住");
+
+    let mut buf = [0u8; 1];
+    let r = tokio::time::timeout(Duration::from_secs(3), conn.read(&mut buf)).await;
+    match r {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        other => panic!("shutdown 后 conf 连接仍未关闭: {other:?}"),
+    }
+    // 幂等
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 13. 超长帧长度必须在分配前被拒，连接干净关闭（无 panic / 无 OOM）
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn oversized_frame_length_is_rejected() {
+    let server = Server::start(config(true, 8)).await.unwrap();
+    let mut conn = npc_handshake(server.bridge_addr(), b"conf").await;
+    assert!(!read_bool(&mut conn).await);
+
+    conn.write_all(b"task").await.unwrap();
+    conn.write_all(&i32::MAX.to_le_bytes()).await.unwrap();
+
+    let mut buf = [0u8; 1];
+    let r = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buf)).await;
+    match r {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        other => panic!("超长帧应导致连接关闭: {other:?}"),
+    }
+    assert!(server.snapshot().await.tunnels.is_empty());
+    server.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------

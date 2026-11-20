@@ -423,6 +423,55 @@ def run_split_port_tunnel(checks: Checks, rnpc: Path, root: Path, label: str,
         proc.stop()
 
 
+def start_direct_tunnel(checks: Checks, rnpc: Path, root: Path, label: str,
+                        vkey: str, bridge: int, listen: int,
+                        server_form: str, keep: bool = False):
+    """启动一个直连客户端（模式 1 或模式 2 的写法）。
+
+    `server_form` 为 "combined"（-server=host:port）或 "split"（-s host -p port）。
+    返回 Proc，由调用方负责断言与关闭。
+    """
+    if server_form == "combined":
+        args = [str(rnpc), f"-server=127.0.0.1:{bridge}", "-vkey", vkey]
+    else:
+        args = [str(rnpc), "-s", "127.0.0.1", "-p", str(bridge), "-vkey", vkey]
+    proc = Proc(f"{label}-{server_form}", args, root,
+                root / f"{label}-{server_form}.log")
+    up = wait_tunnel(listen, 30)
+    checks.expect(f"[{label}] {server_form} tunnel is up", up, f"listen={listen}")
+    if up:
+        digest = echo_sha256(listen, DATA_SIZE)
+        expected = hashlib.sha256(pattern(0x5EED, DATA_SIZE)).hexdigest()
+        checks.expect(f"[{label}] {server_form} 768 KiB sha256 matches",
+                      digest == expected, f"sha256={digest[:16]}...")
+    checks.expect(f"[{label}] {server_form} client running", proc.alive(),
+                  proc.tail(6))
+    checks.expect(f"[{label}] {server_form} vkey not in log",
+                  vkey not in proc.text())
+    if not keep:
+        proc.stop()
+    return proc
+
+
+def spawn_fixture(root: Path, nps: Path, name: str, vkey: str,
+                  echo: Echo) -> tuple[Proc, int, int]:
+    """起一个带私有客户端 + 一条预建 tcp 隧道的 Go nps 实例。
+
+    返回 (server_proc, bridge_port, listen_port)。
+    """
+    bridge, web, listen = free_port(), free_port(), free_port()
+    client = go_client_record(vkey, f"fixture-{name}", True)
+    task = go_task_record(client, 1, listen, echo.port, f"{name}-task")
+    exe = write_go_server(root / f"go-{name}", nps, bridge, web, "",
+                          [client], [task])
+    server = Proc(f"nps-{name}", [str(exe)], root / f"go-{name}",
+                  root / f"nps-{name}.log")
+    checks_ok = wait_port(bridge, 20)
+    if not checks_ok:
+        raise RuntimeError(f"fixture {name} bridge did not start on {bridge}")
+    return server, bridge, listen
+
+
 def run_mode4_ok(checks: Checks, rnpc: Path, root: Path, bridge: int,
                  public_vkey: str) -> None:
     proc = Proc("mode4-ok", [str(rnpc), "-s", "127.0.0.1", "-p", str(bridge)],
@@ -557,33 +606,42 @@ def main() -> int:
                 run_mode4_ok(checks, rnpc, root, bridge_a, public_vkey)
                 run_mode4_denied(checks, rnpc, root, bridge_a)
 
-                # ---------- server B: private client + pre-created tasks ----------
-                bridge_b, web_b, listen_priv = free_port(), free_port(), free_port()
-                listen_split = free_port()
-                client_b = go_client_record(secret, "verify-client", True)
-                tasks_b = [
-                    go_task_record(client_b, 1, listen_split, echo.port, "mode2-tcp"),
-                    go_task_record(client_b, 2, listen_priv, echo.port, "priv-tcp"),
-                ]
-                exe_b = write_go_server(root / "go-priv", nps, bridge_b, web_b,
-                                        "", [client_b], tasks_b)
-                server_b = Proc("nps-priv", [str(exe_b)], root / "go-priv",
-                                root / "nps-priv.log")
-                servers.append(server_b)
-                checks.expect("[server-priv] bridge listening", wait_port(bridge_b, 20),
-                              f"port={bridge_b}")
+                # ---------- 模式 1 / 模式 2：两种写法 + 多实例并发 ----------
+                # 两个独立 Go 实例、两个客户端同时在线：同时验证
+                # `-server=host:port` 与 `-s host -p port` 等价，以及多实例互不干扰。
+                server_m1, bridge_m1, listen_m1 = spawn_fixture(
+                    root, nps, "m1", secret, echo)
+                servers.append(server_m1)
+                server_m2, bridge_m2, listen_m2 = spawn_fixture(
+                    root, nps, "m2", secret, echo)
+                servers.append(server_m2)
 
-                # 模式 2：-s host -p port，服务服务端预配置的隧道
-                run_split_port_tunnel(checks, rnpc, root, "mode2", secret,
-                                      bridge_b, listen_split)
-                # 模式 3：同一服务端上的私有客户端（isPub=false）
+                client_m1 = start_direct_tunnel(
+                    checks, rnpc, root, "mode1", secret, bridge_m1, listen_m1,
+                    "combined", keep=True)
+                client_m2 = start_direct_tunnel(
+                    checks, rnpc, root, "mode2", secret, bridge_m2, listen_m2,
+                    "split", keep=True)
+                checks.expect("[multi-instance] two clients alive at the same time",
+                              client_m1.alive() and client_m2.alive(),
+                              f"m1={client_m1.alive()} m2={client_m2.alive()}")
+                checks.expect("[multi-instance] both tunnels serve concurrently",
+                              wait_tunnel(listen_m1, 10) and wait_tunnel(listen_m2, 10))
+                client_m1.stop()
+                client_m2.stop()
+
+                # ---------- 模式 3：私有客户端（isPub=false） ----------
+                listen_priv = free_port()
+                # 复用 m2 的服务端：客户端已断开，任务会被停掉，端口已释放；
+                # 这里让配置模式在同一个服务端上注册一条全新隧道。
                 run_config_tunnel(checks, rnpc, root, "mode3-priv", secret,
-                                  bridge_b, listen_priv, echo.port,
+                                  bridge_m2, listen_priv, echo.port,
                                   expect_assigned=False)
 
                 # 服务端进程仍然存活（没有因我们的客户端崩溃）
                 checks.expect("[server] Go nps still alive after all scenarios",
-                              server_a.alive() and server_b.alive())
+                              server_a.alive() and server_m1.alive()
+                              and server_m2.alive())
             finally:
                 echo.close()
     except Exception:  # noqa: BLE001 - surface everything in the report

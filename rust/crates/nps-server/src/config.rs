@@ -17,14 +17,14 @@
 //!     "listen_addr": "127.0.0.1:6000", "target_addr": "127.0.0.1:22",
 //!     "enabled": true
 //!   }],
-//!   "conf_register": true,
+//!   "conf_register": false,
 //!   "conf_max_tunnels": 32,
 //!   "conf_listen_host": "0.0.0.0"
 //! }
 //! ```
 //!
-//! `conf_*` 三个字段是**追加**能力（配置文件模式注册），默认全部关闭/保守：
-//! 默认 `conf_register=false`，收到老 npc 的 `conf` 连接会被立即关闭。
+//! `conf_*` 三个字段是**追加**能力（老 npc 配置文件模式注册），默认关闭/保守：
+//! `conf_register=false` 时收到 `conf` 连接会被立即关闭。
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -394,16 +394,63 @@ mod tests {
         assert!(!json.contains("admin_token"));
     }
 
+    /// 配置文件模式默认关闭（攻击面），并给出保守默认值
+    #[test]
+    fn conf_registration_defaults_are_off() {
+        let cfg: ServerConfig = serde_json::from_str(r#"{"clients":[]}"#).unwrap();
+        assert!(!cfg.conf_register, "conf 注册必须默认关闭");
+        assert_eq!(cfg.conf_max_tunnels, DEFAULT_CONF_MAX_TUNNELS);
+        assert_eq!(cfg.conf_listen_host, DEFAULT_CONF_LISTEN_HOST);
+        cfg.validate().unwrap();
+
+        // 关闭时不校验 conf_* 参数（即使写错也不影响启动）
+        let lenient: ServerConfig = serde_json::from_str(
+            r#"{"clients":[],"conf_listen_host":"not-an-ip","conf_max_tunnels":0}"#,
+        )
+        .unwrap();
+        lenient.validate().unwrap();
+    }
+
+    #[test]
+    fn conf_registration_validates_limits_when_enabled() {
+        let mut cfg = base();
+        cfg.conf_register = true;
+        cfg.conf_listen_host = "not-an-ip".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("conf_listen_host"), "{err}");
+
+        let mut cfg = base();
+        cfg.conf_register = true;
+        cfg.conf_max_tunnels = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = base();
+        cfg.conf_register = true;
+        cfg.conf_max_tunnels = 4097;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = base();
+        cfg.conf_register = true;
+        cfg.conf_listen_host = "127.0.0.1".into();
+        cfg.validate().unwrap();
+    }
+
     /// 配置结构的 `Debug` 输出不得包含 vkey（防止日志里意外落密钥）。
     #[test]
     fn debug_output_redacts_vkey() {
         let cfg = base();
         let rendered = format!("{cfg:?}");
-        assert!(!rendered.contains("s3cret-key"), "Debug 泄漏了 vkey: {rendered}");
+        assert!(
+            !rendered.contains("s3cret-key"),
+            "Debug 泄漏了 vkey: {rendered}"
+        );
         assert!(rendered.contains("<redacted>"), "未打码: {rendered}");
 
         // 单条记录同样打码
         let one = format!("{:?}", cfg.clients[0]);
-        assert!(!one.contains("s3cret-key"), "ClientConfig Debug 泄漏了 vkey: {one}");
+        assert!(
+            !one.contains("s3cret-key"),
+            "ClientConfig Debug 泄漏了 vkey: {one}"
+        );
     }
 }

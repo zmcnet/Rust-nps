@@ -140,9 +140,7 @@ impl ConfRegistry {
             return;
         }
         self.inner.active_sessions.fetch_add(1, Ordering::AcqRel);
-        debug!(
-            "配置文件模式会话开始 (clientId {client_id}, client {client_version}, from {peer})"
-        );
+        debug!("配置文件模式会话开始 (clientId {client_id}, client {client_version}, from {peer})");
 
         // ① isPub = false（1 字节 bool）。见模块注释：不动态创建客户端。
         if stream.write_all(&[0u8]).await.is_err() {
@@ -178,7 +176,11 @@ impl ConfRegistry {
                     };
                     match &outcome {
                         Ok(registered) => {
-                            let action = if registered.created { "注册" } else { "幂等复用" };
+                            let action = if registered.created {
+                                "注册"
+                            } else {
+                                "幂等复用"
+                            };
                             info!(
                                 "配置文件模式{action}隧道成功 (clientId {client_id}, tunnel {}, {})",
                                 registered.id, registered.describe
@@ -188,9 +190,7 @@ impl ConfRegistry {
                             warn!("配置文件模式注册隧道失败 (clientId {client_id}): {reason}");
                         }
                     }
-                    if write_bool(&mut stream, outcome.is_ok()).await.is_err()
-                        || outcome.is_err()
-                    {
+                    if write_bool(&mut stream, outcome.is_ok()).await.is_err() || outcome.is_err() {
                         // 对齐 Go `WriteAddFail`：失败后关闭连接
                         break;
                     }
@@ -218,7 +218,13 @@ impl ConfRegistry {
                     let mut digest = [0u8; 32];
                     let read = tokio::select! {
                         _ = closing.changed() => break,
-                        r = stream.read_exact(&mut digest) => r,
+                        r = tokio::time::timeout(
+                            CONF_IDLE_TIMEOUT,
+                            stream.read_exact(&mut digest),
+                        ) => match r {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        },
                     };
                     if read.is_err() {
                         break;
@@ -452,7 +458,12 @@ async fn read_frame(
 ) -> Option<Vec<u8>> {
     let len = tokio::select! {
         _ = closing.changed() => return None,
-        r = nps_legacy::read_len_i32(stream) => r.ok()?,
+        r = tokio::time::timeout(CONF_IDLE_TIMEOUT, nps_legacy::read_len_i32(stream)) => {
+            match r {
+                Ok(r) => r.ok()?,
+                Err(_) => return None,
+            }
+        }
     };
     if len <= 0 || len as usize > MAX_CONF_FRAME {
         return None;
@@ -460,7 +471,12 @@ async fn read_frame(
     let mut buf = vec![0u8; len as usize];
     tokio::select! {
         _ = closing.changed() => None,
-        r = stream.read_exact(&mut buf) => r.ok().map(|_| buf),
+        r = tokio::time::timeout(CONF_IDLE_TIMEOUT, stream.read_exact(&mut buf)) => {
+            match r {
+                Ok(r) => r.ok().map(|_| buf),
+                Err(_) => None,
+            }
+        }
     }
 }
 

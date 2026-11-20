@@ -349,7 +349,7 @@ pub async fn negotiate_vkey(server: &str) -> Result<String, RegistrationError> {
         Ok(vkey) => return Ok(vkey),
         Err(error) if !error.is_denial() => return Err(error),
         Err(error) => {
-            debug!(reason = %error, "rgst 注册未被服务端接受，改用 public_vkey 注册");
+            info!(reason = %error, "rgst 注册未被服务端接受，改用 public_vkey 注册");
             let public_vkey = public_vkey_from_env();
             match register_public(server, &public_vkey, "rust-npsc").await {
                 Ok(vkey) => Ok(vkey),

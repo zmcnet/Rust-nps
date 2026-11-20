@@ -65,11 +65,12 @@ impl ActiveGuard {
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         // 饱和自减：即便外部误把计数清零，也只会停在 0，不会回绕成 u64::MAX
-        let _ = self.0.active_connections.try_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |v| Some(v.saturating_sub(1)),
-        );
+        let _ = self
+            .0
+            .active_connections
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 }
 

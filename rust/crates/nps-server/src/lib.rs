@@ -22,8 +22,8 @@
 //! - `shutdown()`：停所有隧道（含 conf 注册的）与桥，断开全部连接，
 //!   等待后台任务退出；幂等。
 
-pub mod config;
 mod conf;
+pub mod config;
 mod server;
 pub mod snapshot;
 mod tunnel;
