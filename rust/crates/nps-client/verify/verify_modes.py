@@ -472,6 +472,37 @@ def spawn_fixture(root: Path, nps: Path, name: str, vkey: str,
     return server, bridge, listen
 
 
+def run_unsupported_mode_config(checks: Checks, rnpc: Path, root: Path,
+                                vkey: str, bridge: int) -> None:
+    """配置文件里只有 udp 隧道：必须明确告警并跳过，不能伪造成功。"""
+    config = {
+        "common": {"server_addr": "127.0.0.1", "server_port": bridge,
+                   "vkey": vkey, "remark": "udp-only"},
+        "tasks": [{"remark": "dns", "mode": "udp", "server_port": free_port(),
+                   "target_addr": "8.8.8.8:53"}],
+    }
+    path = root / "udp-only.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    proc = Proc("udp-only", [str(rnpc), "-config", str(path)], root,
+                root / "udp-only.log")
+    try:
+        deadline = time.monotonic() + 20
+        text = ""
+        while time.monotonic() < deadline:
+            text = proc.text()
+            if "已连接服务端" in text or not proc.alive():
+                break
+            time.sleep(0.2)
+        checks.expect("[mode3-udp] unsupported mode is announced",
+                      "暂不支持" in text and "udp" in text, proc.tail(10))
+        checks.expect("[mode3-udp] no fake success log",
+                      "tcp 隧道已在服务端注册" not in text)
+        checks.expect("[mode3-udp] client keeps running (skips, not aborts)",
+                      proc.alive(), proc.tail(8))
+    finally:
+        proc.stop()
+
+
 def run_mode4_ok(checks: Checks, rnpc: Path, root: Path, bridge: int,
                  public_vkey: str) -> None:
     proc = Proc("mode4-ok", [str(rnpc), "-s", "127.0.0.1", "-p", str(bridge)],
@@ -605,6 +636,8 @@ def main() -> int:
                                   expect_assigned=True)
                 run_mode4_ok(checks, rnpc, root, bridge_a, public_vkey)
                 run_mode4_denied(checks, rnpc, root, bridge_a)
+                run_unsupported_mode_config(checks, rnpc, root, public_vkey,
+                                            bridge_a)
 
                 # ---------- 模式 1 / 模式 2：两种写法 + 多实例并发 ----------
                 # 两个独立 Go 实例、两个客户端同时在线：同时验证

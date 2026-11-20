@@ -344,10 +344,9 @@ pub async fn register_public(
 ///
 /// 两条路都失败时把**两个**原因都带上，便于定位；不重试。
 pub async fn negotiate_vkey(server: &str) -> Result<String, RegistrationError> {
-    let rgst_result = register(server, DEFAULT_REGISTER_HOURS).await;
-    match rgst_result {
-        Ok(vkey) => return Ok(vkey),
-        Err(error) if !error.is_denial() => return Err(error),
+    match register(server, DEFAULT_REGISTER_HOURS).await {
+        Ok(vkey) => Ok(vkey),
+        Err(error) if !error.is_denial() => Err(error),
         Err(error) => {
             info!(reason = %error, "rgst 注册未被服务端接受，改用 public_vkey 注册");
             let public_vkey = public_vkey_from_env();

@@ -118,10 +118,10 @@ where
     // ⑥ 读校验结果
     let mut status = [0u8; 4];
     read_exact(stream, &mut status).await?;
-    if &status == nps_proto::VERIFY_EER.as_bytes() {
+    if status == nps_proto::VERIFY_EER.as_bytes() {
         return Err(HandshakeError::VkeyRejected);
     }
-    if &status != nps_proto::VERIFY_SUCCESS.as_bytes() {
+    if status != nps_proto::VERIFY_SUCCESS.as_bytes() {
         return Err(HandshakeError::BadStatus(status));
     }
 

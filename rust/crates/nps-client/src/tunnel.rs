@@ -127,17 +127,12 @@ pub async fn handle_stream(mut stream: MuxStream) -> Result<(), TunnelError> {
     // 下行：mux -> 目标。服务端关闭子流时立即结束；写入失败也结束。
     let down_counter = down_total.clone();
     let mut down = tokio::spawn(async move {
-        loop {
-            match recv.recv_data().await {
-                Some(chunk) => {
-                    if let Err(error) = tcp_writer.write_all(&chunk).await {
-                        debug!(%error, "写入目标失败，结束下行");
-                        break;
-                    }
-                    down_counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                }
-                None => break,
+        while let Some(chunk) = recv.recv_data().await {
+            if let Err(error) = tcp_writer.write_all(&chunk).await {
+                debug!(%error, "写入目标失败，结束下行");
+                break;
             }
+            down_counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
         }
         let _ = tcp_writer.shutdown().await;
     });

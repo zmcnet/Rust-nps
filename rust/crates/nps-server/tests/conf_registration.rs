@@ -453,7 +453,7 @@ async fn registered_tunnel_forwards_through_client_mux() {
 }
 
 // ---------------------------------------------------------------------------
-// 12. shutdown 会关闭仍打开的 conf 会话（不遗留挂起任务）
+// 11. shutdown 会关闭仍打开的 conf 会话（不遗留挂起任务）
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn shutdown_closes_open_conf_sessions() {
@@ -476,7 +476,7 @@ async fn shutdown_closes_open_conf_sessions() {
 }
 
 // ---------------------------------------------------------------------------
-// 13. 超长帧长度必须在分配前被拒，连接干净关闭（无 panic / 无 OOM）
+// 12. 超长帧长度必须在分配前被拒，连接干净关闭（无 panic / 无 OOM）
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn oversized_frame_length_is_rejected() {
@@ -498,7 +498,35 @@ async fn oversized_frame_length_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// 11. 同一 vkey 的多个 conf 连接可以并行注册不同隧道（多实例基础）
+// 13. 管理端停用后，客户端重新注册同一条隧道会重新启用（仍是同一条）
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn re_registration_reenables_admin_disabled_tunnel() {
+    let server = Server::start(config(true, 8)).await.unwrap();
+    let port = free_port().await;
+    let target = format!("127.0.0.1:{}", free_port().await);
+
+    let mut conn = npc_handshake(server.bridge_addr(), b"conf").await;
+    assert!(!read_bool(&mut conn).await);
+    send_frame(&mut conn, b"task", &task(port, &target, "toggle")).await;
+    assert!(read_bool(&mut conn).await);
+
+    let id = server.snapshot().await.tunnels[0].id;
+    server.set_tunnel_enabled(id, false).await.unwrap();
+    assert!(!server.snapshot().await.tunnels[0].enabled);
+
+    send_frame(&mut conn, b"task", &task(port, &target, "toggle")).await;
+    assert!(read_bool(&mut conn).await, "重新注册应成功并恢复监听");
+    let snap = server.snapshot().await;
+    assert_eq!(snap.tunnels.len(), 1, "不应新建隧道");
+    assert!(snap.tunnels[0].enabled);
+    assert_eq!(snap.tunnels[0].id, id);
+
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 14. 同一 vkey 的多个 conf 连接可以并行注册不同隧道（多实例基础）
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn two_conf_sessions_register_independent_tunnels() {

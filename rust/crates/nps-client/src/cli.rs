@@ -430,7 +430,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Command, CliError> {
-        parse_args(args.iter().map(|value| OsString::from(value)))
+        parse_args(args.iter().map(OsString::from))
     }
 
     fn run(args: &[&str]) -> RunConfig {

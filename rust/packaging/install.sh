@@ -17,6 +17,10 @@
 
 set -euo pipefail
 
+# Debian/Ubuntu 上 useradd/groupadd 位于 /usr/sbin，而普通用户或 sudo 的
+# secure_path 未必包含它。显式补进 PATH，避免"命令找不到"。
+PATH="/usr/local/sbin:/usr/sbin:/sbin:${PATH}"
+
 BINARY_SRC="${1:-}"
 BIN_DEST="/usr/local/bin/rnps"
 CONF_DIR="/etc/nps"
