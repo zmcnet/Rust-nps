@@ -78,6 +78,10 @@ struct Inner {
     http: Option<Arc<crate::http_site::HttpSiteServer>>,
     /// 各客户端的子流包装方式（来自 ClientConfig 的 crypt/compress）
     client_wraps: Arc<std::collections::HashMap<i32, crate::crypt::StreamWrap>>,
+    /// 文件服务隧道表
+    file_tunnels: Arc<Mutex<Vec<Arc<crate::file_service::FileTunnel>>>>,
+    /// file 通道登记表
+    file_channels: Arc<crate::file_service::FileChannelRegistry>,
     /// md5(vkey) -> client id，仅用于 `stus` 帧校验归属（不写日志、不进快照）
     verify: Arc<std::collections::HashMap<String, i32>>,
     /// 注册隧道的监听 IP（客户端只上报端口）
@@ -100,6 +104,8 @@ impl ConfRegistry {
         udp_tunnels: Arc<Mutex<Vec<Arc<crate::udp::UdpTunnel>>>>,
         http: Option<Arc<crate::http_site::HttpSiteServer>>,
         client_wraps: Arc<std::collections::HashMap<i32, crate::crypt::StreamWrap>>,
+        file_tunnels: Arc<Mutex<Vec<Arc<crate::file_service::FileTunnel>>>>,
+        file_channels: Arc<crate::file_service::FileChannelRegistry>,
         verify: Arc<std::collections::HashMap<String, i32>>,
         listen_host: IpAddr,
         max_tunnels: usize,
@@ -112,6 +118,8 @@ impl ConfRegistry {
                 udp_tunnels,
                 http,
                 client_wraps,
+                file_tunnels,
+                file_channels,
                 verify,
                 listen_host,
                 max_tunnels,
@@ -295,8 +303,9 @@ impl ConfRegistry {
         match info.mode.as_str() {
             "" | "tcp" => self.register_tcp_task(bridge, client_id, info).await,
             "udp" => self.register_udp_task(bridge, client_id, info).await,
+            "file" => self.register_file_task(bridge, client_id, info).await,
             other => Err(format!(
-                "暂不支持 mode={other:?}（当前支持 tcp / udp）"
+                "暂不支持 mode={other:?}（当前支持 tcp / udp / file）"
             )),
         }
     }
@@ -306,6 +315,129 @@ impl ConfRegistry {
     /// 对齐 Go `bridge.go` 的 `NEW_TASK` 处理：原版对每个端口调 `s.OpenTask <- tl`，
     /// 即**真的创建监听器**（`NewMode` 按 `mode` 选 `UdpModeServer`），
     /// 所以这里也必须真正建 UDP 监听，而不是只回 true。
+    /// 注册一条文件服务隧道（`mode=file`）。
+    ///
+    /// 与 TCP 注册的差异：**没有 target_addr**（文件由 npc 侧的
+    /// `http.FileServer` 提供），只需监听端口并把 file 通道交出去。
+    async fn register_file_task(
+        &self,
+        bridge: &Bridge,
+        client_id: i32,
+        info: &TaskInfo,
+    ) -> Result<Registered, String> {
+        let ports = parse_ports(&info.ports, info.port);
+        if ports.is_empty() {
+            return Err("server_port 缺失或非法".to_owned());
+        }
+        if ports.len() > 1 {
+            return Err(format!(
+                "多端口任务未支持（收到 {} 个端口，请拆成多个配置段）",
+                ports.len()
+            ));
+        }
+        let port = ports[0];
+        if port < CONF_MIN_LISTEN_PORT {
+            return Err(format!(
+                "端口 {port} 是特权端口（<{CONF_MIN_LISTEN_PORT}），拒绝监听"
+            ));
+        }
+        let name = display_name(&info.remark, port);
+        if name.is_empty() {
+            return Err("隧道名（remark）清洗后为空".to_owned());
+        }
+        let listen = SocketAddr::new(self.inner.listen_host, port);
+
+        let _serial = self.inner.register_op.lock().await;
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            return Err("服务端正在关闭".to_owned());
+        }
+
+        let existing = self.inner.file_tunnels.lock().await.clone();
+
+        // ① 幂等：同 client + 同 remark + 同端口
+        if let Some(prev) = existing.iter().find(|t| {
+            t.cfg.client_id == client_id
+                && t.cfg.name == name
+                && parse_listen_addr(&t.cfg.listen_addr).map(|a| a.port()) == Some(port)
+        }) {
+            let id = t_id_file(prev);
+            if prev.is_listening().await {
+                return Ok(Registered {
+                    id,
+                    created: false,
+                    describe: format!("{listen}/file（已在运行）"),
+                });
+            }
+            prev.start(bridge.clone())
+                .await
+                .map_err(|e| format!("重新启动文件隧道 {id} 失败: {e:#}"))?;
+            return Ok(Registered {
+                id,
+                created: false,
+                describe: format!("{listen}/file（重新启动）"),
+            });
+        }
+
+        // ② 端口冲突（同时检查 TCP 与文件隧道）
+        let tcp_existing = self.inner.tunnels.lock().await.clone();
+        for t in &tcp_existing {
+            if parse_listen_addr(&t.cfg.listen_addr) == Some(listen) && t.is_listening().await {
+                return Err(format!(
+                    "端口 {listen} 已被隧道 {} ({}) 占用",
+                    t.id(),
+                    t.cfg.name
+                ));
+            }
+        }
+        for t in &existing {
+            if parse_listen_addr(&t.cfg.listen_addr) == Some(listen) && t.is_listening().await {
+                return Err(format!(
+                    "端口 {listen} 已被文件隧道 {} ({}) 占用",
+                    t_id_file(t),
+                    t.cfg.name
+                ));
+            }
+        }
+
+        // ③ 上限
+        if existing.len() + tcp_existing.len() >= self.inner.max_tunnels {
+            return Err(format!(
+                "隧道总数已达上限 {}（conf_max_tunnels）",
+                self.inner.max_tunnels
+            ));
+        }
+
+        // ④ 建隧道并启动
+        let id = self
+            .inner
+            .next_id
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+            .map_err(|_| "隧道 id 已耗尽".to_owned())?;
+        let tunnel = Arc::new(crate::file_service::FileTunnel::with_registry(
+            crate::file_service::FileTunnelConfig {
+                id,
+                name: name.clone(),
+                client_id,
+                listen_addr: listen.to_string(),
+                enabled: true,
+                target_addr: String::new(),
+                local_path: info.local_path.clone(),
+                strip_pre: info.strip_pre.clone(),
+            },
+            self.inner.file_channels.clone(),
+        ));
+        let bound = tunnel
+            .start(bridge.clone())
+            .await
+            .map_err(|e| format!("文件监听 {listen} 失败: {e:#}"))?;
+        self.inner.file_tunnels.lock().await.push(tunnel);
+        Ok(Registered {
+            id,
+            created: true,
+            describe: format!("{bound}/file（local_path={}）", info.local_path),
+        })
+    }
+
     async fn register_udp_task(
         &self,
         bridge: &Bridge,
@@ -675,6 +807,12 @@ struct TaskInfo {
     target_addr: String,
     #[serde(default, rename = "Target")]
     target: Option<TargetInfo>,
+    /// 文件服务的本地路径（`mode=file` 用）
+    #[serde(default, rename = "LocalPath")]
+    local_path: String,
+    /// 文件服务的 URL 前缀（`mode=file` 用）
+    #[serde(default, rename = "StripPre")]
+    strip_pre: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -842,6 +980,11 @@ fn same_udp_identity(
 
 /// 取 UDP 隧道 id（`UdpTunnel::id()` 已有，这里只是让调用处更简洁）
 fn t_id(t: &crate::udp::UdpTunnel) -> u32 {
+    t.id()
+}
+
+/// 取文件隧道 id
+fn t_id_file(t: &crate::file_service::FileTunnel) -> u32 {
     t.id()
 }
 

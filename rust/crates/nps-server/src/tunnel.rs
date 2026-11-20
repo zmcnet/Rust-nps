@@ -267,6 +267,8 @@ pub(crate) struct Tunnel {
 }
 
 impl Tunnel {
+    /// 简易构造（仅测试用；生产路径走 `with_controls` 以携带流控与包装配置）。
+    #[cfg(test)]
     pub fn new(cfg: TcpTunnelConfig) -> Self {
         let spec = cfg.target_addr.clone();
         Self {
@@ -693,94 +695,98 @@ impl Tunnel {
 
     /// 在已包装的子流上跑双向转发。
     ///
-    /// 与明文路径的区别：明文路径用 `MuxSendHalf`/`MuxRecvHalf` 分别驱动两个泵，
-    /// 这里因为包装层（TLS / snappy）需要一个统一的读写对象，改为：
-    /// - 读方向：外部 -> 包装流（`AsyncWrite`）
-    /// - 写方向：包装流（`AsyncRead`）-> 外部
+    /// # 为什么用「单任务 select!」而不是 `tokio::io::split` + 两个 spawn
+    ///
+    /// `tokio::io::split` 内部用 `BiLock`：读半与写半共享同一把锁。
+    /// 对 `TlsStream` 这种「读时要能写、写时要能读」的协议（TLS 有握手/告警帧、
+    /// snappy 有块边界）会互相阻塞。实测表现为：TLS 握手成功，
+    /// 但之后 30 秒内双向零字节（死锁），随后连接超时被关。
+    ///
+    /// 改为单任务内 `select!` 双向推进：读外部 → 写包装流，读包装流 → 写外部。
+    /// 两个方向都在同一任务里，不存在锁竞争。
     async fn run_wrapped<W>(
         self: Arc<Self>,
         stream: TcpStream,
-        wrapped: W,
+        mut wrapped: W,
         mut cancel: watch::Receiver<bool>,
     ) where
         W: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let (ext_r, mut ext_w) = stream.into_split();
-        let (wrap_r, wrap_w) = tokio::io::split(wrapped);
+        let (mut ext_r, mut ext_w) = stream.into_split();
+        let mut ext_buf = vec![0u8; COPY_BUF];
+        let mut wrap_buf = vec![0u8; COPY_BUF];
+        let mut ext_open = true;
+        let mut wrap_open = true;
 
-        // 上行：外部 -> 包装流
-        let up_tunnel = self.clone();
-        let mut up_cancel = cancel.clone();
-        let mut up_r = ext_r;
-        let mut up_w = wrap_w;
-        let up = tokio::spawn(async move {
-            let mut buf = vec![0u8; COPY_BUF];
-            loop {
-                let n = tokio::select! {
-                    _ = up_cancel.changed() => break,
-                    r = up_r.read(&mut buf) => match r {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(_) => break,
-                    },
-                };
-                if let Some(rate) = &up_tunnel.rate {
-                    tokio::select! {
-                        _ = up_cancel.changed() => break,
-                        _ = rate.acquire(n) => {}
+        loop {
+            if *cancel.borrow() {
+                break;
+            }
+
+            tokio::select! {
+                biased;
+
+                _ = cancel.changed() => break,
+
+                // 上行：外部 -> 包装流（仅在外部仍开时读）
+                r = ext_r.read(&mut ext_buf), if ext_open => {
+                    match r {
+                        Ok(0) => {
+                            ext_open = false;
+                            // 外部 EOF：半关闭包装流的写侧
+                            let _ = wrapped.shutdown().await;
+                            if !wrap_open { break; }
+                        }
+                        Ok(n) => {
+                            if let Some(rate) = &self.rate {
+                                rate.acquire(n).await;
+                            }
+                            if wrapped.write_all(&ext_buf[..n]).await.is_err() {
+                                break;
+                            }
+                            let _ = wrapped.flush().await;
+                            self.bytes_to_client.fetch_add(n as u64, Ordering::Relaxed);
+                            if let Some(flow) = &self.flow {
+                                flow.add(n as u64, 0);
+                            }
+                        }
+                        Err(_) => {
+                            ext_open = false;
+                            if !wrap_open { break; }
+                        }
                     }
                 }
-                if up_w.write_all(&buf[..n]).await.is_err() {
-                    break;
-                }
-                up_tunnel.bytes_to_client.fetch_add(n as u64, Ordering::Relaxed);
-                if let Some(flow) = &up_tunnel.flow {
-                    flow.add(n as u64, 0);
-                }
-            }
-            let _ = up_w.shutdown().await;
-        });
 
-        // 下行：包装流 -> 外部
-        let down_tunnel = self.clone();
-        let mut down_r = wrap_r;
-        let down = tokio::spawn(async move {
-            let mut buf = vec![0u8; COPY_BUF];
-            loop {
-                let n = tokio::select! {
-                    _ = cancel.changed() => break,
-                    r = down_r.read(&mut buf) => match r {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(_) => break,
-                    },
-                };
-                if let Some(rate) = &down_tunnel.rate {
-                    tokio::select! {
-                        _ = cancel.changed() => break,
-                        _ = rate.acquire(n) => {}
+                // 下行：包装流 -> 外部（仅在包装流仍开时读）
+                r = wrapped.read(&mut wrap_buf), if wrap_open => {
+                    match r {
+                        Ok(0) => {
+                            wrap_open = false;
+                            if !ext_open { break; }
+                        }
+                        Ok(n) => {
+                            if let Some(rate) = &self.rate {
+                                rate.acquire(n).await;
+                            }
+                            if ext_w.write_all(&wrap_buf[..n]).await.is_err() {
+                                break;
+                            }
+                            let _ = ext_w.flush().await;
+                            self.bytes_from_client.fetch_add(n as u64, Ordering::Relaxed);
+                            if let Some(flow) = &self.flow {
+                                flow.add(0, n as u64);
+                            }
+                        }
+                        Err(_) => {
+                            wrap_open = false;
+                            if !ext_open { break; }
+                        }
                     }
                 }
-                if ext_w.write_all(&buf[..n]).await.is_err() {
-                    break;
-                }
-                down_tunnel.bytes_from_client.fetch_add(n as u64, Ordering::Relaxed);
-                if let Some(flow) = &down_tunnel.flow {
-                    flow.add(0, n as u64);
-                }
-                let _ = ext_w.flush().await;
             }
-            let _ = ext_w.shutdown().await;
-        });
-
-        let mut up = Pump::new(up);
-        let mut down = Pump::new(down);
-        tokio::select! {
-            _ = &mut up.task => {}
-            _ = &mut down.task => {}
         }
-        drop(up);
-        drop(down);
+
+        let _ = ext_w.shutdown().await;
         debug!("隧道 {}: 包装连接结束", self.cfg.id);
     }
 

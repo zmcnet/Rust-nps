@@ -178,22 +178,33 @@ def run_case(server_bin: str, npc_bin: str, crypt: bool, compress: bool, payload
             bad(f"{tag}: npc 未上线（可能握手失败）")
             return False
 
-        # npc 上线 ≠ 隧道监听器就绪：conf 注册建监听、npc 建 chan 都要时间。
-        # 这里探到端口可连为止（最多 15s），否则 TLS 握手会在半就绪状态下超时。
-        listen_ready = False
-        deadline = time.time() + 15
+        # npc 上线 ≠ 隧道监听器就绪。这里用 /api/status 判断（**不用 TCP 探测**：
+        # 探测会建立一次真实子流并立刻关闭，实测会把第一条 crypt 连接消耗掉，
+        # 导致后续传输超时——这是测试手段的副作用，不是实现缺陷）。
+        tunnel_ready = False
+        deadline = time.time() + 20
         while time.time() < deadline:
             try:
-                with socket.create_connection(("127.0.0.1", listen), timeout=1):
-                    listen_ready = True
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{web}/api/status",
+                    headers={"Authorization": f"Bearer {env['NPS_ADMIN_TOKEN']}"},
+                )
+                with urllib.request.urlopen(req, timeout=2) as rsp:
+                    snap = json.loads(rsp.read())
+                if any(
+                    t.get("enabled") and t.get("bound_addr")
+                    for t in snap.get("tunnels", [])
+                ):
+                    tunnel_ready = True
                     break
-            except OSError:
-                time.sleep(0.2)
-        if not listen_ready:
-            bad(f"{tag}: 隧道端口 {listen} 未就绪")
+            except Exception:
+                pass
+            time.sleep(0.3)
+        if not tunnel_ready:
+            bad(f"{tag}: 隧道未就绪（/api/status 无 enabled 隧道）")
             return False
-        # 端口刚开时 npc 侧可能还在建 mux 会话，给它一点时间
-        time.sleep(1.5)
+        # 端口刚开时 npc 侧可能还在建 mux 会话
+        time.sleep(2.0)
 
         data_bytes = os.urandom(payload)
 

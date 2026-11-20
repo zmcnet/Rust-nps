@@ -65,6 +65,10 @@ struct ServerInner {
     flow_cancel: Option<tokio::sync::watch::Sender<bool>>,
     /// 流量落盘任务句柄（关闭时等待它写完）
     flow_task: Mutex<Option<JoinHandle<()>>>,
+    /// 文件服务隧道
+    file: Arc<Mutex<Vec<Arc<crate::file_service::FileTunnel>>>>,
+    /// file 通道登记表（bridge 收到的 file mux 存这里）
+    file_channels: Arc<crate::file_service::FileChannelRegistry>,
     /// SOCKS5 监听（配置里的 `socks5_listeners`）
     socks5: Vec<Arc<crate::socks5::Socks5Server>>,
     bridge_task: Mutex<Option<JoinHandle<()>>>,
@@ -245,6 +249,14 @@ impl Server {
         let bridge =
             Bridge::new(move |md5_hex_vkey: &str| verify_for_bridge.get(md5_hex_vkey).copied());
 
+        // ---- file 通道登记表 ----
+        let file_channels = Arc::new(crate::file_service::FileChannelRegistry::new());
+        let file_tunnels_for_conf: Arc<Mutex<Vec<Arc<crate::file_service::FileTunnel>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        bridge.set_file_handler(Arc::new(FileChannelSink {
+            registry: file_channels.clone(),
+        }));
+
         // ---- 3. HTTP 域名代理（先于 conf 创建：conf 的 host 帧要 upsert 进来）----
         //
         // 只要配置了 `http_listen_addr` 就创建（站点表可为空），
@@ -384,6 +396,8 @@ impl Server {
                 udp_tunnels_shared.clone(),
                 http.clone(),
                 Arc::new(client_wraps.clone()),
+                file_tunnels_for_conf.clone(),
+                file_channels.clone(),
                 verify,
                 listen_host,
                 config.conf_max_tunnels,
@@ -476,6 +490,36 @@ impl Server {
             socks5_servers.push(s);
         }
 
+        // ---- 9. 文件服务隧道：先全部绑定，失败则整体回滚 ----
+        let file_tunnels_shared = file_tunnels_for_conf.clone();
+        let mut file_bound: Vec<(
+            Arc<crate::file_service::FileTunnel>,
+            tokio::net::TcpListener,
+        )> = Vec::new();
+        for cfg in config.file_tunnels.iter().filter(|t| t.enabled) {
+            let t = Arc::new(crate::file_service::FileTunnel::with_registry(
+                cfg.clone(),
+                file_channels.clone(),
+            ));
+            match t.bind().await {
+                Ok(listener) => file_bound.push((t, listener)),
+                Err(e) => {
+                    return Err(e.context(format!(
+                        "文件隧道 {} ({}) 绑定失败",
+                        cfg.id, cfg.listen_addr
+                    )));
+                }
+            }
+        }
+        for (t, listener) in file_bound {
+            let bound = t
+                .start_with_listener(bridge.clone(), listener)
+                .await
+                .with_context(|| format!("文件隧道 {} 启动失败", t.id()))?;
+            info!("文件隧道 {} 监听 {}", t.id(), bound);
+            file_tunnels_shared.lock().await.push(t);
+        }
+
         let clients = config
             .clients
             .iter()
@@ -558,6 +602,8 @@ impl Server {
                 health_cancel,
                 flow_cancel,
                 flow_task: Mutex::new(Some(flow_task)),
+                file: file_tunnels_shared,
+                file_channels,
                 socks5: socks5_servers,
                 bridge_task: Mutex::new(Some(bridge_task)),
                 shutdown,
@@ -627,6 +673,11 @@ impl Server {
         // UDP 隧道复用同一快照契约（字段一致）
         let udp_list = self.inner.udp.lock().await.clone();
         for t in &udp_list {
+            tunnels.push(t.snapshot().await);
+        }
+        // 文件服务隧道
+        let file_list = self.inner.file.lock().await.clone();
+        for t in &file_list {
             tunnels.push(t.snapshot().await);
         }
 
@@ -734,6 +785,13 @@ impl Server {
             s.shutdown().await;
         }
 
+        // 停文件服务隧道
+        let file_list = self.inner.file.lock().await.clone();
+        for t in &file_list {
+            t.shutdown().await;
+        }
+        self.inner.file_channels.clear();
+
         // 再关桥（同时通过 closing 广播让 conf 注册会话退出）
         self.inner.bridge.shutdown().await;
         if let Some(conf) = &self.inner.conf {
@@ -808,5 +866,16 @@ impl Server {
 
     pub fn is_shutdown(&self) -> bool {
         self.inner.shutdown.load(Ordering::Acquire)
+    }
+}
+
+/// 把桥收到的 `file` 通道登记进 `FileChannelRegistry`。
+struct FileChannelSink {
+    registry: Arc<crate::file_service::FileChannelRegistry>,
+}
+
+impl nps_legacy::bridge::FileChannelHandler for FileChannelSink {
+    fn handle(&self, client_id: i32, mux: Arc<nps_legacy::mux::MuxSession>) {
+        self.registry.register_and_watch(client_id, mux);
     }
 }

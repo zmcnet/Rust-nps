@@ -105,6 +105,14 @@ pub trait ConfSessionHandler: Send + Sync {
     fn handle(&self, session: ConfSession) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
+/// `file`（WORK_FILE）通道处理器：桥把已建好的 mux 会话交给上层登记。
+///
+/// 原版 `bridge.go` 的 `WORK_FILE` 分支把这条 mux 存为客户端独立的 `file`
+/// 通道（与 `chan` 平行），文件服务隧道从它开子流。
+pub trait FileChannelHandler: Send + Sync {
+    fn handle(&self, client_id: i32, mux: std::sync::Arc<crate::mux::MuxSession>);
+}
+
 /// signal（main）连接的一代
 struct SignalState {
     gen: u64,
@@ -157,6 +165,8 @@ struct BridgeShared {
     /// 配置文件模式（`conf`）会话处理器。
     ///
     /// 默认未设置：收到 `conf` 连接直接关闭（该能力默认不对外开放）。
+    /// `file` 通道处理器（文件服务用）。未设置时收到 `file` 连接直接关闭。
+    file_handler: std::sync::OnceLock<std::sync::Arc<dyn FileChannelHandler>>,
     /// 只在启动阶段由上层设置一次，因此用 `OnceLock` 而不是 `Mutex`。
     conf_handler: OnceLock<Arc<dyn ConfSessionHandler>>,
     /// 常驻接收端。
@@ -188,6 +198,7 @@ impl Bridge {
                 closing: AtomicBool::new(false),
                 close_tx,
                 conf_handler: OnceLock::new(),
+                file_handler: OnceLock::new(),
                 _close_keepalive: close_keepalive,
             }),
         }
@@ -210,6 +221,13 @@ impl Bridge {
     }
 
     /// 是否已安装 `conf` 会话处理器
+    /// 设置 `file` 通道处理器（文件服务用）。只允许设置一次。
+    pub fn set_file_handler(&self, handler: Arc<dyn FileChannelHandler>) {
+        if self.shared.file_handler.set(handler).is_err() {
+            tracing::warn!("file 通道处理器已设置，忽略重复设置");
+        }
+    }
+
     pub fn has_conf_handler(&self) -> bool {
         self.shared.conf_handler.get().is_some()
     }
@@ -269,7 +287,20 @@ impl Bridge {
                     let _ = stream.shutdown().await;
                 }
             },
-            b"rgst" | b"sert" | b"p2pm" | b"file" => {
+            b"file" => match self.shared.file_handler.get() {
+                Some(handler) => {
+                    // 文件通道是独立的 mux 会话（与 chan 平行）
+                    let mux = std::sync::Arc::new(crate::mux::MuxSession::new(stream));
+                    handler.handle(client_id, mux);
+                }
+                None => {
+                    debug!(
+                        "file 通道未启用，关闭 file 连接 (clientId {client_id} from {peer})"
+                    );
+                    let _ = stream.shutdown().await;
+                }
+            },
+            b"rgst" | b"sert" | b"p2pm" => {
                 warn!("连接类型 {conn_type:?} P0 暂未支持 (clientId {client_id})");
             }
             other => {

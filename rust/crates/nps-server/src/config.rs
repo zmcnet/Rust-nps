@@ -111,6 +111,9 @@ pub struct ServerConfig {
     /// 累计流量落盘间隔（分钟）。0 = 不落盘。对应原版 `flow_store_interval`。
     #[serde(default = "default_flow_store_interval")]
     pub flow_store_interval: u64,
+    /// 文件服务隧道（对应原版 `mode=file`）
+    #[serde(default)]
+    pub file_tunnels: Vec<crate::file_service::FileTunnelConfig>,
     /// SOCKS5 代理监听（对应 Go 版 `mode=socks5`）
     #[serde(default)]
     pub socks5_listeners: Vec<Socks5Config>,
@@ -158,6 +161,7 @@ impl Default for ServerConfig {
             acme: Default::default(),
             data_dir: None,
             ip_limit: Vec::new(),
+            file_tunnels: Vec::new(),
             flow_store_interval: default_flow_store_interval(),
             socks5_listeners: Vec::new(),
         }
@@ -466,9 +470,37 @@ impl ServerConfig {
                 .context("ip_limit 配置非法")?;
         }
 
+        self.validate_file_tunnels(&client_ids, &tunnel_ids, &mut listen_addrs)?;
         self.validate_udp_tunnels(&client_ids)?;
         self.validate_http_sites(&client_ids)?;
         self.validate_socks5(&client_ids)?;
+        Ok(())
+    }
+
+    /// 校验文件服务隧道
+    fn validate_file_tunnels(
+        &self,
+        client_ids: &HashSet<i32>,
+        tunnel_ids: &HashSet<u32>,
+        listen_addrs: &mut HashMap<SocketAddr, u32>,
+    ) -> Result<()> {
+        let mut file_ids = HashSet::new();
+        for t in &self.file_tunnels {
+            if !file_ids.insert(t.id) || tunnel_ids.contains(&t.id) {
+                bail!("文件隧道 id {} 重复（或与 TCP 隧道冲突）", t.id);
+            }
+            if !client_ids.contains(&t.client_id) {
+                bail!("文件隧道 {} 引用了不存在的客户端 {}", t.id, t.client_id);
+            }
+            let listen = parse_addr(&t.listen_addr).with_context(|| {
+                format!("文件隧道 {} 的 listen_addr 非法: {:?}", t.id, t.listen_addr)
+            })?;
+            if t.enabled && listen.port() != 0 {
+                if let Some(other) = listen_addrs.insert(listen, t.id) {
+                    bail!("文件隧道 {} 与隧道 {} 监听了同一地址 {}", t.id, other, listen);
+                }
+            }
+        }
         Ok(())
     }
 
