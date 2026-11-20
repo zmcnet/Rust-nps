@@ -85,6 +85,11 @@ pub struct ServerConfig {
     /// HTTP 域名站点（对应 Go 版 `Host` + `http_proxy_port`）
     #[serde(default)]
     pub http_sites: Vec<HttpSiteConfig>,
+    /// HTTP 域名代理的监听地址（对应 Go 版 `http_proxy_ip:http_proxy_port`）。
+    ///
+    /// **默认 `None`（不监听）**：只有配置了站点并显式给出监听地址才开启。
+    #[serde(default)]
+    pub http_listen_addr: Option<String>,
     /// SOCKS5 代理监听（对应 Go 版 `mode=socks5`）
     #[serde(default)]
     pub socks5_listeners: Vec<Socks5Config>,
@@ -122,6 +127,7 @@ impl Default for ServerConfig {
             conf_listen_host: default_conf_listen_host(),
             udp_tunnels: Vec::new(),
             http_sites: Vec::new(),
+            http_listen_addr: None,
             socks5_listeners: Vec::new(),
         }
     }
@@ -405,6 +411,19 @@ impl ServerConfig {
 
     /// 校验 HTTP 站点
     fn validate_http_sites(&self, client_ids: &HashSet<i32>) -> Result<()> {
+        // 有站点就必须有监听地址，否则站点永远无法访问
+        if !self.http_sites.is_empty() {
+            let addr = self.http_listen_addr.as_deref().unwrap_or("").trim();
+            if addr.is_empty() {
+                bail!("配置了 HTTP 站点但缺少 http_listen_addr（域名代理需要监听地址）");
+            }
+            parse_addr(addr)
+                .with_context(|| format!("http_listen_addr 非法: {addr:?}"))?;
+        } else if let Some(addr) = self.http_listen_addr.as_deref() {
+            parse_addr(addr.trim())
+                .with_context(|| format!("http_listen_addr 非法: {addr:?}"))?;
+        }
+
         let mut ids = HashSet::new();
         let mut domains = HashSet::new();
         for s in &self.http_sites {
@@ -800,40 +819,53 @@ mod tests {
         }
     }
 
+    /// 有站点时必须配 http_listen_addr，这里统一补上
+    fn with_http_sites(mut cfg: ServerConfig, sites: Vec<HttpSiteConfig>) -> ServerConfig {
+        cfg.http_sites = sites;
+        cfg.http_listen_addr = Some("127.0.0.1:0".into());
+        cfg
+    }
+
     #[test]
-    fn http_site_accepts_valid_config() {
+    fn http_site_requires_listen_addr_when_sites_present() {
         let mut cfg = base();
         cfg.http_sites = vec![http_site(1, "app.example.com")];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("http_listen_addr"), "{err}");
+    }
+
+    #[test]
+    fn http_site_accepts_valid_config() {
+        let cfg = with_http_sites(base(), vec![http_site(1, "app.example.com")]);
         cfg.validate().unwrap();
     }
 
     #[test]
     fn http_site_rejects_domain_with_port_or_path() {
-        let mut cfg = base();
-        cfg.http_sites = vec![http_site(1, "app.example.com:8080")];
+        let cfg = with_http_sites(base(), vec![http_site(1, "app.example.com:8080")]);
         assert!(cfg.validate().unwrap_err().to_string().contains("端口或路径"));
 
-        let mut cfg = base();
-        cfg.http_sites = vec![http_site(1, "app.example.com/api")];
+        let cfg = with_http_sites(base(), vec![http_site(1, "app.example.com/api")]);
         assert!(cfg.validate().unwrap_err().to_string().contains("端口或路径"));
     }
 
     #[test]
     fn http_site_rejects_duplicate_domain_case_insensitive() {
-        let mut cfg = base();
-        cfg.http_sites = vec![http_site(1, "App.Example.com"), http_site(2, "app.example.com")];
+        let cfg = with_http_sites(
+            base(),
+            vec![http_site(1, "App.Example.com"), http_site(2, "app.example.com")],
+        );
         assert!(cfg.validate().unwrap_err().to_string().contains("domain"));
     }
 
     #[test]
     fn http_site_rejects_bad_route_prefix() {
-        let mut cfg = base();
         let mut site = http_site(1, "app.example.com");
         site.routes = vec![HttpRoute {
             prefix: "api".to_owned(), // 缺前导 /
             target_addr: "127.0.0.1:8080".to_owned(),
         }];
-        cfg.http_sites = vec![site];
+        let cfg = with_http_sites(base(), vec![site]);
         assert!(cfg.validate().unwrap_err().to_string().contains("以 / 开头"));
     }
 

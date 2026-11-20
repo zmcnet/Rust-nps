@@ -41,6 +41,14 @@ struct ServerInner {
     tunnels: Arc<Mutex<Vec<Arc<Tunnel>>>>,
     /// 配置文件模式注册表；`None` = 该能力关闭
     conf: Option<Arc<ConfRegistry>>,
+    /// UDP 隧道（配置里的 `udp_tunnels`）
+    udp: Vec<Arc<crate::udp::UdpTunnel>>,
+    /// HTTP 域名代理；`None` = 未配置站点
+    http: Option<Arc<crate::http_site::HttpSiteServer>>,
+    /// HTTP 域名代理的取消信号
+    http_cancel: Option<tokio::sync::watch::Sender<bool>>,
+    /// SOCKS5 监听（配置里的 `socks5_listeners`）
+    socks5: Vec<Arc<crate::socks5::Socks5Server>>,
     bridge_task: Mutex<Option<JoinHandle<()>>>,
     /// 关闭流程已开始 / 已完成
     shutdown: Arc<AtomicBool>,
@@ -53,6 +61,18 @@ struct ServerInner {
 #[derive(Clone)]
 pub struct Server {
     inner: Arc<ServerInner>,
+}
+
+/// 各监听面的运行时统计（管理端展示用，不含任何密钥）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListenerStats {
+    pub udp_tunnels: usize,
+    pub udp_active_flows: u64,
+    pub http_configured: bool,
+    pub http_active_connections: u64,
+    pub http_served_requests: u64,
+    pub socks5_listeners: usize,
+    pub socks5_active_connections: u64,
 }
 
 impl Server {
@@ -156,6 +176,93 @@ impl Server {
             drop(guard);
         }
 
+        // ---- 6. UDP 隧道：先全部绑定，失败则整体回滚 ----
+        let mut udp_tunnels: Vec<Arc<crate::udp::UdpTunnel>> = Vec::new();
+        let mut udp_bound: Vec<(Arc<crate::udp::UdpTunnel>, tokio::net::UdpSocket)> = Vec::new();
+        for cfg in config.udp_tunnels.iter().filter(|t| t.enabled) {
+            let t = Arc::new(crate::udp::UdpTunnel::new(cfg.clone()));
+            match t.bind().await {
+                Ok(socket) => udp_bound.push((t, socket)),
+                Err(e) => {
+                    drop(udp_bound);
+                    return Err(e.context(format!(
+                        "UDP 隧道 {} ({}) 绑定失败",
+                        cfg.id, cfg.listen_addr
+                    )));
+                }
+            }
+        }
+        for (t, socket) in udp_bound {
+            let bound_addr = t
+                .start_with_socket(bridge.clone(), socket)
+                .await
+                .with_context(|| format!("UDP 隧道 {} 启动失败", t.id()))?;
+            info!("UDP 隧道 {} 监听 {}", t.id(), bound_addr);
+            udp_tunnels.push(t);
+        }
+
+        // ---- 7. HTTP 域名代理：先绑定，失败则整体回滚 ----
+        let (http, http_cancel) = if config.http_sites.is_empty() {
+            (None, None)
+        } else {
+            let listen = format!("{}:{}", config.conf_listen_host.trim(), 0);
+            let _ = listen; // 端口由用户在 http_listen_addr 指定，见下
+            match config.http_listen_addr.as_deref() {
+                Some(addr) => {
+                    let proxy_cfg = crate::http_site::HttpProxyConfig::from_server_config(
+                        &config,
+                        addr,
+                    );
+                    let server = crate::http_site::HttpSiteServer::new(bridge.clone(), proxy_cfg)?;
+                    let listener = server.bind().await?;
+                    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                    let s = server.clone();
+                    tokio::spawn(async move { s.serve(listener, cancel_rx).await });
+                    (Some(server), Some(cancel_tx))
+                }
+                None => {
+                    warn!(
+                        "配置了 {} 个 HTTP 站点但未设置 http_listen_addr，域名代理不会监听",
+                        config.http_sites.len()
+                    );
+                    (None, None)
+                }
+            }
+        };
+
+        // ---- 8. SOCKS5：先全部绑定，失败则整体回滚 ----
+        let mut socks5_servers: Vec<Arc<crate::socks5::Socks5Server>> = Vec::new();
+        let mut socks5_bound: Vec<(
+            Arc<crate::socks5::Socks5Server>,
+            TcpListener,
+        )> = Vec::new();
+        for cfg in config.socks5_listeners.iter().filter(|s| s.enabled) {
+            let s = Arc::new(crate::socks5::Socks5Server::new(cfg.clone(), bridge.clone()));
+            match s.bind().await {
+                Ok(listener) => socks5_bound.push((s, listener)),
+                Err(e) => {
+                    drop(socks5_bound);
+                    drop(udp_tunnels);
+                    if let Some(c) = &http_cancel {
+                        let _ = c.send(true);
+                    }
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "SOCKS5 监听 {} ({}) 绑定失败",
+                        cfg.id, cfg.listen_addr
+                    )));
+                }
+            }
+        }
+        for (s, listener) in socks5_bound {
+            let this = s.clone();
+            tokio::spawn(async move {
+                if let Err(e) = this.serve_on(listener).await {
+                    warn!("SOCKS5 accept 循环异常退出: {e}");
+                }
+            });
+            socks5_servers.push(s);
+        }
+
         let clients = config
             .clients
             .iter()
@@ -173,6 +280,10 @@ impl Server {
                 clients,
                 tunnels,
                 conf,
+                udp: udp_tunnels,
+                http,
+                http_cancel,
+                socks5: socks5_servers,
                 bridge_task: Mutex::new(Some(bridge_task)),
                 shutdown,
                 shutdown_done: AtomicBool::new(false),
@@ -184,6 +295,34 @@ impl Server {
     /// 桥实际绑定地址（`bridge_addr` 配 `:0` 时返回系统分配的端口）
     pub fn bridge_addr(&self) -> SocketAddr {
         self.inner.bridge_addr
+    }
+
+    /// 各监听面的运行时统计（供管理端展示；不含任何密钥）。
+    pub fn listeners(&self) -> ListenerStats {
+        ListenerStats {
+            udp_tunnels: self.inner.udp.len(),
+            udp_active_flows: self.inner.udp.iter().map(|t| t.active_flows()).sum(),
+            http_configured: self.inner.http.is_some(),
+            http_active_connections: self
+                .inner
+                .http
+                .as_ref()
+                .map(|h| h.active_connections())
+                .unwrap_or(0),
+            http_served_requests: self
+                .inner
+                .http
+                .as_ref()
+                .map(|h| h.served_requests())
+                .unwrap_or(0),
+            socks5_listeners: self.inner.socks5.len(),
+            socks5_active_connections: self
+                .inner
+                .socks5
+                .iter()
+                .map(|s| s.active_connections())
+                .sum(),
+        }
     }
 
     /// 生成状态快照。**不含 vkey / 密文 / token**。
@@ -270,6 +409,21 @@ impl Server {
             t.disable().await;
         }
         drop(_register_guard);
+
+        // 停 UDP 隧道（关闭 socket 并回收全部来源映射）
+        for t in &self.inner.udp {
+            t.shutdown().await;
+        }
+
+        // 停 HTTP 域名代理（广播取消，accept 循环退出后 abort 连接任务）
+        if let Some(cancel) = &self.inner.http_cancel {
+            let _ = cancel.send(true);
+        }
+
+        // 停 SOCKS5 监听
+        for s in &self.inner.socks5 {
+            s.shutdown().await;
+        }
 
         // 再关桥（同时通过 closing 广播让 conf 注册会话退出）
         self.inner.bridge.shutdown().await;
