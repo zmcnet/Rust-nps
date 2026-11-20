@@ -50,6 +50,12 @@ struct ServerInner {
     http: Option<Arc<crate::http_site::HttpSiteServer>>,
     /// HTTP 域名代理的取消信号
     http_cancel: Option<tokio::sync::watch::Sender<bool>>,
+    /// HTTPS 域名代理（TLS 终止层）；None = 未配置 https_listen_addr
+    https_tls: Option<Arc<crate::tls::TlsListener>>,
+    /// 证书存储（管理端上传 / ACME 共用）
+    certs: Option<Arc<crate::tls::CertificateStore>>,
+    /// HTTPS accept 循环的取消信号
+    https_cancel: Option<tokio::sync::watch::Sender<bool>>,
     /// SOCKS5 监听（配置里的 `socks5_listeners`）
     socks5: Vec<Arc<crate::socks5::Socks5Server>>,
     bridge_task: Mutex<Option<JoinHandle<()>>>,
@@ -137,7 +143,105 @@ impl Server {
         let bridge =
             Bridge::new(move |md5_hex_vkey: &str| verify_for_bridge.get(md5_hex_vkey).copied());
 
-        // ---- 3. 配置文件模式（默认关闭）----
+        // ---- 3. HTTP 域名代理（先于 conf 创建：conf 的 host 帧要 upsert 进来）----
+        //
+        // 只要配置了 `http_listen_addr` 就创建（站点表可为空），
+        // 因为 `conf` 的 host 帧会在运行时动态 upsert 站点。
+        //
+        // 注意：只配 `https_listen_addr` 时也必须创建解析器 ——
+        // HTTPS 路径复用同一个 `HttpSiteServer`，只是不监听 80 端口。
+        let (http, http_cancel) = if config.http_sites.is_empty() && config.http_listen_addr.is_none()
+        {
+            (None, None)
+        } else {
+            let listen_for_cfg = config
+                .http_listen_addr
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1:0".to_owned());
+            let proxy_cfg =
+                crate::http_site::HttpProxyConfig::from_server_config(&config, &listen_for_cfg);
+            let server = crate::http_site::HttpSiteServer::new(bridge.clone(), proxy_cfg)?;
+
+            match config.http_listen_addr.as_deref() {
+                Some(addr) => {
+                    let listener = tokio::net::TcpListener::bind(addr)
+                        .await
+                        .with_context(|| format!("HTTP 域名代理无法监听 {addr}"))?;
+                    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                    let s = server.clone();
+                    tokio::spawn(async move { s.serve(listener, cancel_rx).await });
+                    (Some(server), Some(cancel_tx))
+                }
+                None => (Some(server), None),
+            }
+        };
+
+        // ---- 3.5 HTTPS 域名代理（TLS 终止 + SNI 路由）----
+        //
+        // 只在显式配置 https_listen_addr 时启用。证书来自 cert_dir，
+        // 程序**不会**自动申请证书；tls_mode=SelfSigned 的站点在此生成自签证书，
+        // Upload / Acme 需要用户先通过管理端或 ACME 流程放好证书。
+        let (certs, https_tls, https_cancel) = match config.https_listen_addr.as_deref() {
+            Some(addr) => {
+                let cert_root = config
+                    .cert_dir
+                    .clone()
+                    .unwrap_or_else(|| "certs".to_owned());
+                let store = crate::tls::CertificateStore::open(&cert_root).with_context(|| {
+                    format!("证书目录无法使用: {cert_root}（可用 cert_dir 指定其它位置）")
+                })?;
+
+                // 自签证书是「用户选择 self-signed」的显式意图，可以在此生成；
+                // Upload / Acme 一律不自动生成，缺证书就在握手时拒绝该域名。
+                for site in config
+                    .http_sites
+                    .iter()
+                    .filter(|s| s.tls_mode == crate::config::TlsMode::SelfSigned)
+                {
+                    if store.get(&site.domain).is_none() {
+                        store.put_self_signed(&site.domain).with_context(|| {
+                            format!("为 {} 生成自签证书失败", site.domain)
+                        })?;
+                        info!("已为 {} 生成自签证书（仅测试用途）", site.domain);
+                    }
+                }
+
+                let tls = crate::tls::TlsListener::new(store.resolver())?;
+                let listener = tls.bind(addr).await?;
+                let bound = listener.local_addr().ok();
+                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+                // 握手成功后把解密流交给 HTTP 层复用同一套解析逻辑。
+                // 每个连接共享 accept 循环的取消信号，shutdown 时一并退出。
+                let http_for_tls = http.clone();
+                let tls_task = tls.clone();
+                let conn_cancel = cancel_tx.subscribe();
+                tokio::spawn(async move {
+                    tls_task
+                        .serve(listener, cancel_rx, move |session| {
+                            let http = http_for_tls.clone();
+                            let cancel = conn_cancel.clone();
+                            async move {
+                                match http {
+                                    Some(http) => {
+                                        let peer = session.peer;
+                                        http.serve_stream(session.stream, peer, cancel).await;
+                                    }
+                                    None => {
+                                        warn!("收到 HTTPS 连接但未配置 HTTP 域名代理，已丢弃");
+                                    }
+                                }
+                            }
+                        })
+                        .await;
+                });
+                info!("HTTPS 域名代理监听 {:?}（证书目录 {}）", bound, cert_root);
+                (Some(store), Some(tls), Some(cancel_tx))
+            }
+            None => (None, None, None),
+        };
+
+        // ---- 4. 配置文件模式（默认关闭）----
         let shutdown = Arc::new(AtomicBool::new(false));
         let udp_tunnels_shared: Arc<Mutex<Vec<Arc<crate::udp::UdpTunnel>>>> =
             Arc::new(Mutex::new(Vec::new()));
@@ -150,6 +254,7 @@ impl Server {
             let registry = Arc::new(ConfRegistry::new(
                 tunnels.clone(),
                 udp_tunnels_shared.clone(),
+                http.clone(),
                 verify,
                 listen_host,
                 config.conf_max_tunnels,
@@ -208,34 +313,6 @@ impl Server {
         let udp_tunnels: Vec<Arc<crate::udp::UdpTunnel>> =
             udp_tunnels_shared.lock().await.clone();
 
-        // ---- 7. HTTP 域名代理：先绑定，失败则整体回滚 ----
-        let (http, http_cancel) = if config.http_sites.is_empty() {
-            (None, None)
-        } else {
-            let listen = format!("{}:{}", config.conf_listen_host.trim(), 0);
-            let _ = listen; // 端口由用户在 http_listen_addr 指定，见下
-            match config.http_listen_addr.as_deref() {
-                Some(addr) => {
-                    let proxy_cfg = crate::http_site::HttpProxyConfig::from_server_config(
-                        &config,
-                        addr,
-                    );
-                    let server = crate::http_site::HttpSiteServer::new(bridge.clone(), proxy_cfg)?;
-                    let listener = server.bind().await?;
-                    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-                    let s = server.clone();
-                    tokio::spawn(async move { s.serve(listener, cancel_rx).await });
-                    (Some(server), Some(cancel_tx))
-                }
-                None => {
-                    warn!(
-                        "配置了 {} 个 HTTP 站点但未设置 http_listen_addr，域名代理不会监听",
-                        config.http_sites.len()
-                    );
-                    (None, None)
-                }
-            }
-        };
 
         // ---- 8. SOCKS5：先全部绑定，失败则整体回滚 ----
         let mut socks5_servers: Vec<Arc<crate::socks5::Socks5Server>> = Vec::new();
@@ -290,6 +367,9 @@ impl Server {
                 udp: udp_tunnels_shared,
                 http,
                 http_cancel,
+                https_tls,
+                certs,
+                https_cancel,
                 socks5: socks5_servers,
                 bridge_task: Mutex::new(Some(bridge_task)),
                 shutdown,
@@ -438,6 +518,11 @@ impl Server {
             let _ = cancel.send(true);
         }
 
+        // 停 HTTPS 域名代理
+        if let Some(cancel) = &self.inner.https_cancel {
+            let _ = cancel.send(true);
+        }
+
         // 停 SOCKS5 监听
         for s in &self.inner.socks5 {
             s.shutdown().await;
@@ -464,6 +549,16 @@ impl Server {
         }
         self.inner.shutdown_done.store(true, Ordering::Release);
         info!("Rust-nps 服务端已关闭");
+    }
+
+    /// 证书存储（管理端上传 / 查询 / ACME 部署共用）。未启用 HTTPS 时为 None。
+    pub fn certificate_store(&self) -> Option<Arc<crate::tls::CertificateStore>> {
+        self.inner.certs.clone()
+    }
+
+    /// HTTPS 监听器（用于读取握手统计）。未启用时为 None。
+    pub fn https_listener(&self) -> Option<Arc<crate::tls::TlsListener>> {
+        self.inner.https_tls.clone()
     }
 
     pub fn is_shutdown(&self) -> bool {

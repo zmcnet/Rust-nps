@@ -90,6 +90,14 @@ pub struct ServerConfig {
     /// **默认 `None`（不监听）**：只有配置了站点并显式给出监听地址才开启。
     #[serde(default)]
     pub http_listen_addr: Option<String>,
+    /// HTTPS 域名代理的监听地址（对应 Go 版 `https_proxy_port`，通常 443）。
+    ///
+    /// **默认 `None`（不监听）**：HTTPS 需要证书，用户显式配置才开启。
+    #[serde(default)]
+    pub https_listen_addr: Option<String>,
+    /// 证书根目录。默认 `<配置目录>/certs`。
+    #[serde(default)]
+    pub cert_dir: Option<String>,
     /// SOCKS5 代理监听（对应 Go 版 `mode=socks5`）
     #[serde(default)]
     pub socks5_listeners: Vec<Socks5Config>,
@@ -128,6 +136,8 @@ impl Default for ServerConfig {
             udp_tunnels: Vec::new(),
             http_sites: Vec::new(),
             http_listen_addr: None,
+            https_listen_addr: None,
+            cert_dir: None,
             socks5_listeners: Vec::new(),
         }
     }
@@ -411,17 +421,23 @@ impl ServerConfig {
 
     /// 校验 HTTP 站点
     fn validate_http_sites(&self, client_ids: &HashSet<i32>) -> Result<()> {
-        // 有站点就必须有监听地址，否则站点永远无法访问
+        // 有站点就必须至少有一个监听地址（HTTP 或 HTTPS），否则站点永远无法访问
         if !self.http_sites.is_empty() {
-            let addr = self.http_listen_addr.as_deref().unwrap_or("").trim();
-            if addr.is_empty() {
-                bail!("配置了 HTTP 站点但缺少 http_listen_addr（域名代理需要监听地址）");
+            let http = self.http_listen_addr.as_deref().unwrap_or("").trim();
+            let https = self.https_listen_addr.as_deref().unwrap_or("").trim();
+            if http.is_empty() && https.is_empty() {
+                bail!(
+                    "配置了 HTTP 站点但缺少监听地址（http_listen_addr 或 https_listen_addr 至少给一个）"
+                );
             }
-            parse_addr(addr)
-                .with_context(|| format!("http_listen_addr 非法: {addr:?}"))?;
-        } else if let Some(addr) = self.http_listen_addr.as_deref() {
+        }
+        if let Some(addr) = self.http_listen_addr.as_deref() {
             parse_addr(addr.trim())
                 .with_context(|| format!("http_listen_addr 非法: {addr:?}"))?;
+        }
+        if let Some(addr) = self.https_listen_addr.as_deref() {
+            parse_addr(addr.trim())
+                .with_context(|| format!("https_listen_addr 非法: {addr:?}"))?;
         }
 
         let mut ids = HashSet::new();

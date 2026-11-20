@@ -74,6 +74,8 @@ struct Inner {
     tunnels: Arc<Mutex<Vec<Arc<Tunnel>>>>,
     /// 与 Server 共享的 UDP 隧道表（conf 注册的 UDP 任务追加到这里）
     udp_tunnels: Arc<Mutex<Vec<Arc<crate::udp::UdpTunnel>>>>,
+    /// HTTP 域名代理（conf 的 host 帧 upsert 到这里）；None = 域名代理未启用
+    http: Option<Arc<crate::http_site::HttpSiteServer>>,
     /// md5(vkey) -> client id，仅用于 `stus` 帧校验归属（不写日志、不进快照）
     verify: Arc<std::collections::HashMap<String, i32>>,
     /// 注册隧道的监听 IP（客户端只上报端口）
@@ -94,6 +96,7 @@ impl ConfRegistry {
     pub(crate) fn new(
         tunnels: Arc<Mutex<Vec<Arc<Tunnel>>>>,
         udp_tunnels: Arc<Mutex<Vec<Arc<crate::udp::UdpTunnel>>>>,
+        http: Option<Arc<crate::http_site::HttpSiteServer>>,
         verify: Arc<std::collections::HashMap<String, i32>>,
         listen_host: IpAddr,
         max_tunnels: usize,
@@ -104,6 +107,7 @@ impl ConfRegistry {
             inner: Arc::new(Inner {
                 tunnels,
                 udp_tunnels,
+                http,
                 verify,
                 listen_host,
                 max_tunnels,
@@ -200,13 +204,21 @@ impl ConfRegistry {
                     }
                 }
                 b"host" => {
-                    // 域名代理本阶段未实现：吃掉帧保持协议同步，然后如实返回失败。
-                    let _ = read_frame(&mut stream, &mut closing).await;
-                    warn!(
-                        "配置文件模式的域名代理（host）尚未实现，返回失败 (clientId {client_id})"
-                    );
-                    let _ = write_bool(&mut stream, false).await;
-                    break;
+                    // 域名代理注册：解析 Host 帧并 upsert 到站点表。
+                    // 对齐 Go `getConfig` 的 `NEW_HOST` 分支（`file.GetDb().NewHost`）。
+                    let outcome = match read_frame(&mut stream, &mut closing).await {
+                        Some(body) => self.register_host(client_id, &body).await,
+                        None => break,
+                    };
+                    match &outcome {
+                        Ok(desc) => info!("配置文件模式注册域名成功 (clientId {client_id}, {desc})"),
+                        Err(reason) => {
+                            warn!("配置文件模式注册域名失败 (clientId {client_id}): {reason}")
+                        }
+                    }
+                    if write_bool(&mut stream, outcome.is_ok()).await.is_err() || outcome.is_err() {
+                        break;
+                    }
                 }
                 b"conf" => {
                     // NEW_CONF 只在 isPub=true 时由客户端发送；本实现不创建客户端。
@@ -403,6 +415,74 @@ impl ConfRegistry {
         })
     }
 
+    /// 注册一条域名代理站点（`host` 帧）。
+    ///
+    /// 对齐 Go `getConfig` 的 `NEW_HOST`：解析 `file.Host`，挂到当前已鉴权客户端名下。
+    /// `Scheme=="https"` 需要 TLS 终结，本阶段如实拒绝而不是假装成功。
+    async fn register_host(&self, client_id: i32, body: &[u8]) -> Result<String, String> {
+        let http = self
+            .inner
+            .http
+            .as_ref()
+            .ok_or_else(|| "域名代理未启用（需要 http_listen_addr）".to_owned())?;
+
+        let info: HostInfo =
+            serde_json::from_slice(body).map_err(|e| format!("host 帧 JSON 解析失败: {e}"))?;
+
+        let domain = info.host.trim().to_ascii_lowercase();
+        if domain.is_empty() {
+            return Err("host 帧缺少 Host 字段".to_owned());
+        }
+        if domain.contains(':') || domain.contains('/') {
+            return Err(format!("Host 不应包含端口或路径: {domain:?}"));
+        }
+        if info.scheme.eq_ignore_ascii_case("https") {
+            return Err("域名代理暂不支持 https scheme（需 TLS 终结，尚未启用）".to_owned());
+        }
+        let target = info
+            .target
+            .as_ref()
+            .map(|t| t.target_str.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "host 帧缺少 Target.TargetStr".to_owned())?;
+        // 多目标只取第一个（原版支持轮询，本阶段未实现）
+        let target = target
+            .split(['\n', ','])
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .ok_or_else(|| "host 帧的 Target.TargetStr 为空".to_owned())?
+            .to_owned();
+        crate::config::validate_host_port(&target)
+            .map_err(|e| format!("目标地址非法: {e:#}"))?;
+
+        let location = if info.location.trim().is_empty() {
+            "/".to_owned()
+        } else {
+            info.location.trim().to_owned()
+        };
+        if !location.starts_with('/') {
+            return Err(format!("Location 必须以 / 开头: {location:?}"));
+        }
+
+        let mut site = crate::http_site::HttpSite::new(&domain, client_id, &target);
+        if location != "/" {
+            site = site.with_routes(vec![crate::config::HttpRoute {
+                prefix: location.clone(),
+                target_addr: target.clone(),
+            }]);
+        }
+        http.upsert_site(site)
+            .await
+            .map_err(|e| format!("站点 upsert 失败: {e:#}"))?;
+
+        let remark = if info.remark.trim().is_empty() {
+            domain.clone()
+        } else {
+            info.remark.trim().to_owned()
+        };
+        Ok(format!("{domain}{location} -> {target}（{remark}）"))
+    }
+
     async fn register_tcp_task(
         &self,
         bridge: &Bridge,
@@ -579,6 +659,23 @@ struct TargetInfo {
     /// `target_addr` / `target_port`（config 解析后逗号会变成换行）
     #[serde(default, rename = "TargetStr")]
     target_str: String,
+}
+
+/// 原版 `file.Host`（无 json tag，字段名即 JSON 键）
+#[derive(Debug, Default, Deserialize)]
+struct HostInfo {
+    #[serde(default, rename = "Host")]
+    host: String,
+    /// 路径前缀，默认 `/`
+    #[serde(default, rename = "Location")]
+    location: String,
+    /// `http` / `https` / `all`
+    #[serde(default, rename = "Scheme")]
+    scheme: String,
+    #[serde(default, rename = "Remark")]
+    remark: String,
+    #[serde(default, rename = "Target")]
+    target: Option<TargetInfo>,
 }
 
 /// 读一个 `flag` 之后的帧体：int32 LE 长度 + 内容。

@@ -13,3 +13,43 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+# ---- ACME 证书申请（模块 `acme`）----
+# 纯 Rust ACME 客户端：JWS / nonce / order / finalize 由它处理。
+# 明确用 ring 作为密码学后端（不启用 aws-lc-rs，避免 Windows 上额外的 CMake/NASM 依赖）。
+instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "ring", "rcgen"] }
+# 生成账户密钥、CSR 与 tls-alpn-01 用的临时自签证书。
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+# 自带 HTTPS 客户端：可替换根证书（Pebble 测试 CA）+ 统计 ACME 网络请求次数。
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "tls12", "ring"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+http = "1"
+bytes = { workspace = true }
+# tls-alpn-01 的 ALPN 服务；测试里用它校验 Pebble 根 CA 签发的证书。
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+# 读证书 notAfter / SAN（续期判断与报告用）
+x509-parser = "0.18"
+# 生产环境的公共信任根（Pebble 测试时通过 extra_trust_roots 注入）
+webpki-roots = "1"
+# 证书指纹（SHA-256）。ring 已经是 rustls 的后端，这里只是直接引用它的 digest
+ring = "0.17"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+# 集成测试（tests/acme.rs）直接用到下面这些：起 Pebble、拼 HTTPS 客户端、读证书
+instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "ring", "rcgen"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "tls12", "ring"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+http = "1"
+bytes = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+x509-parser = "0.18"
+# 集成测试里构造「过期 / 未生效」证书需要指定 notBefore / notAfter；
+# time 已在依赖图里（rcgen / x509-parser 都用），这里只是直接引用。
+time = "0.3"

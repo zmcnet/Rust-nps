@@ -22,18 +22,26 @@
 //! - `shutdown()`：停所有隧道（含 conf 注册的）与桥，断开全部连接，
 //!   等待后台任务退出；幂等。
 
+pub mod acme;
 mod conf;
 pub mod config;
 mod http_site;
 mod server;
 pub mod snapshot;
 pub mod socks5;
+pub mod tls;
 mod tunnel;
 pub mod udp;
 
 pub use config::{
     ClientConfig, HttpRoute, HttpSiteConfig, ServerConfig, Socks5Config, Socks5User,
     TcpTunnelConfig, TlsMode, UdpTunnelConfig,
+};
+pub use acme::{
+    AcmeClient, AcmeConfig, AcmeError, AcmeErrorKind, AcmeEvent, AcmeEvents, AcmeProvider,
+    AcmeService, AcmeStage, CertificateRequest, ChallengeKind, ChallengeStore, DnsProvider,
+    DnsRecord, Http01Responder, IssuedCertificate, NetworkAudit, RenewalPolicy, RenewalTarget,
+    RequestSource, TlsAlpnResponder, CHALLENGE_PATH_PREFIX,
 };
 pub use http_site::{
     HttpProxyConfig, HttpSite, HttpSiteRouter, HttpSiteServer, ResolvedSite, SiteGuard,
@@ -43,4 +51,9 @@ pub use snapshot::{ClientSnapshot, ServerSnapshot, TunnelSnapshot};
 pub use udp::{
     UdpTunnel, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_FLOWS, DEFAULT_PER_FLOW_QUEUE, UDP_RECV_BUF,
     UDP_WRITE_CHUNK,
+};
+pub use tls::{
+    generate_self_signed, CertInfo, CertMeta, CertSource, CertificateStore, SniResolver,
+    TlsListener, TlsListenerConfig, TlsSession, ALPN_HTTP11, CERT_FILE, DEFAULT_HANDSHAKE_TIMEOUT,
+    KEY_FILE, META_FILE,
 };

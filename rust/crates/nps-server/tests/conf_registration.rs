@@ -377,13 +377,14 @@ async fn unknown_mode_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. host（域名代理）与 NEW_CONF 诚实返回 false，不伪造成功
+// 8. host 帧注册域名站点；NEW_CONF 仍诚实返回 false
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn host_and_new_conf_are_rejected_without_faking_success() {
+async fn host_frame_registers_site_and_new_conf_is_rejected() {
     let server = Server::start(config(true, 8)).await.unwrap();
     let target = format!("127.0.0.1:{}", free_port().await);
 
+    // ① 未配置 http_listen_addr 时，host 必须如实失败（域名代理未启用）
     let mut conn = npc_handshake(server.bridge_addr(), b"conf").await;
     assert!(!read_bool(&mut conn).await);
     send_frame(
@@ -392,14 +393,59 @@ async fn host_and_new_conf_are_rejected_without_faking_success() {
         &json!({"Id": 0, "Host": "a.example.com", "Target": {"TargetStr": target}}),
     )
     .await;
-    assert!(!read_bool(&mut conn).await, "host 必须返回 false");
+    assert!(
+        !read_bool(&mut conn).await,
+        "域名代理未启用时 host 必须返回 false"
+    );
 
+    // ② NEW_CONF 仍然拒绝（isPub=false，本实现不动态建客户端）
     let mut conn = npc_handshake(server.bridge_addr(), b"conf").await;
     assert!(!read_bool(&mut conn).await);
     send_frame(&mut conn, b"conf", &json!({"Id": 0, "Remark": "pub"})).await;
     assert!(!read_bool(&mut conn).await, "NEW_CONF 必须返回 false");
 
     assert!(server.snapshot().await.tunnels.is_empty());
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 8b. 启用域名代理后，host 帧真的注册站点且能路由
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn host_frame_registers_site_when_http_enabled() {
+    let mut cfg = config(true, 8);
+    cfg.http_listen_addr = Some("127.0.0.1:0".into());
+    let server = Server::start(cfg).await.unwrap();
+    let target = format!("127.0.0.1:{}", free_port().await);
+
+    let mut conn = npc_handshake(server.bridge_addr(), b"conf").await;
+    assert!(!read_bool(&mut conn).await);
+    send_frame(
+        &mut conn,
+        b"host",
+        &json!({
+            "Host": "site.example.com",
+            "Location": "/",
+            "Scheme": "http",
+            "Target": {"TargetStr": target}
+        }),
+    )
+    .await;
+    assert!(read_bool(&mut conn).await, "启用域名代理后 host 必须成功");
+
+    // https scheme 必须如实拒绝（需要 TLS 终结，尚未启用）
+    send_frame(
+        &mut conn,
+        b"host",
+        &json!({
+            "Host": "secure.example.com",
+            "Scheme": "https",
+            "Target": {"TargetStr": target}
+        }),
+    )
+    .await;
+    assert!(!read_bool(&mut conn).await, "https scheme 必须返回 false");
+
     server.shutdown().await;
 }
 

@@ -51,7 +51,6 @@ use nps_legacy::mux::{MuxRecvHalf, MuxSendHalf};
 use nps_legacy::Bridge;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedReadHalf;
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
@@ -59,7 +58,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::{
-    parse_addr, validate_host_port, HttpRoute, HttpSiteConfig as SiteConfig, TlsMode,
+    parse_addr, validate_host_port, HttpRoute, HttpSiteConfig as SiteConfig,
 };
 
 /// 请求/响应头允许的最大字节数（含终止空行）
@@ -119,12 +118,14 @@ impl HttpSite {
 
     /// 从服务端配置里挑出**纯 HTTP** 站点（`enabled` 且 `tls_mode == off`）。
     ///
-    /// HTTPS / 证书相关站点由独立的 TLS 模块负责，本模块只做明文 HTTP。
+    /// 站点是否走 TLS 由**监听端口**决定（80 明文 / 443 TLS），
+    /// 因此这里不按 `tls_mode` 过滤 —— 否则 HTTPS 站点永远进不了路由表，
+    /// 握手成功后请求一律 404。
     pub fn collect_http_sites(config: &crate::config::ServerConfig) -> Vec<HttpSite> {
         config
             .http_sites
             .iter()
-            .filter(|site| site.enabled && site.tls_mode == TlsMode::Off)
+            .filter(|site| site.enabled)
             .map(HttpSite::from_site_config)
             .collect()
     }
@@ -638,7 +639,22 @@ impl HttpSiteServer {
         cancel: watch::Receiver<bool>,
     ) {
         let _ = stream.set_nodelay(true);
-        let (read_half, mut write_half) = stream.into_split();
+        self.serve_stream(stream, peer, cancel).await
+    }
+
+    /// 处理一条已建立（可能是 TLS 解密后）的字节流。
+    ///
+    /// HTTPS 层握手成功后把 [`crate::tls::TlsSession`] 的流交到这里，
+    /// 复用同一套 HTTP 解析与转发逻辑，避免两套实现漂移。
+    pub async fn serve_stream<S>(
+        self: Arc<Self>,
+        stream: S,
+        peer: std::net::SocketAddr,
+        cancel: watch::Receiver<bool>,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    {
+        let (read_half, mut write_half) = tokio::io::split(stream);
         let mut client = Buffered::new(read_half, self.idle_timeout);
 
         loop {
@@ -750,16 +766,20 @@ impl HttpSiteServer {
 
     /// 处理单个请求（一次子流）。返回是否保持客户端连接。
     #[allow(clippy::too_many_arguments)]
-    async fn serve_one(
+    async fn serve_one<S, W>(
         &self,
-        client: &mut Buffered<OwnedReadHalf>,
-        write_half: &mut OwnedWriteHalf,
+        client: &mut Buffered<S>,
+        write_half: &mut W,
         request: &RequestHead,
         head_bytes: &[u8],
         site: &ResolvedSite,
         peer: std::net::SocketAddr,
         upgrade: bool,
-    ) -> std::result::Result<Outcome, ServeError> {
+    ) -> std::result::Result<Outcome, ServeError>
+    where
+        S: ChunkSource + Send + Unpin,
+        W: tokio::io::AsyncWrite + Unpin + Send,
+    {
         // 升级请求用 tcp 子流：npc 只做 Dial + 双向拷贝，升级后的帧原样透传
         let conn_type = if upgrade { nps_proto::CONN_TCP } else { "http" };
         let (mut send, recv) = self
@@ -1281,6 +1301,28 @@ impl ChunkSource for OwnedReadHalf {
     }
 }
 
+/// 泛型读半边（HTTPS 解密流走这条路径）。
+///
+/// 与 [`OwnedReadHalf`] 的实现逐行对应，只是底层类型由 TLS 层决定。
+impl<S> ChunkSource for tokio::io::ReadHalf<S>
+where
+    S: tokio::io::AsyncRead + Send,
+{
+    #[allow(clippy::manual_async_fn)]
+    fn next_chunk(&mut self) -> impl std::future::Future<Output = Option<Vec<u8>>> + Send + '_ {
+        async move {
+            let mut buf = vec![0u8; COPY_BUF];
+            match self.read(&mut buf).await {
+                Ok(0) | Err(_) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some(buf)
+                }
+            }
+        }
+    }
+}
+
 impl ChunkSource for MuxRecvHalf {
     #[allow(clippy::manual_async_fn)]
     fn next_chunk(&mut self) -> impl std::future::Future<Output = Option<Vec<u8>>> + Send + '_ {
@@ -1436,11 +1478,14 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 /// 按 `Content-Length` 从客户端读体并写入子流。
-async fn forward_length(
-    client: &mut Buffered<OwnedReadHalf>,
+async fn forward_length<S>(
+    client: &mut Buffered<S>,
     send: &mut MuxSendHalf,
     length: u64,
-) -> std::result::Result<(), HttpError> {
+) -> std::result::Result<(), HttpError>
+where
+    S: ChunkSource + Send + Unpin,
+{
     let mut remaining = length;
     while remaining > 0 {
         let want = remaining.min(COPY_BUF as u64) as usize;
@@ -1457,10 +1502,13 @@ async fn forward_length(
 }
 
 /// 按 chunked 帧从客户端读体并**原样**写入子流（保持合法分块格式）。
-async fn forward_chunked(
-    client: &mut Buffered<OwnedReadHalf>,
+async fn forward_chunked<S>(
+    client: &mut Buffered<S>,
     send: &mut MuxSendHalf,
-) -> std::result::Result<(), HttpError> {
+) -> std::result::Result<(), HttpError>
+where
+    S: ChunkSource + Send + Unpin,
+{
     loop {
         let line = client.read_line(8 * 1024).await?;
         let size = parse_chunk_size(&line)?;
@@ -1515,11 +1563,15 @@ fn parse_chunk_size(line: &[u8]) -> std::result::Result<u64, HttpError> {
 }
 
 /// 把 `n` 字节原样从响应子流写入客户端。
-async fn copy_exact<S: ChunkSource + Send + Unpin>(
+async fn copy_exact<S, W>(
     src: &mut Buffered<S>,
-    dst: &mut OwnedWriteHalf,
+    dst: &mut W,
     length: u64,
-) -> std::result::Result<(), HttpError> {
+) -> std::result::Result<(), HttpError>
+where
+    S: ChunkSource + Send + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut remaining = length;
     while remaining > 0 {
         let want = remaining.min(COPY_BUF as u64) as usize;
@@ -1536,10 +1588,14 @@ async fn copy_exact<S: ChunkSource + Send + Unpin>(
 }
 
 /// chunked 响应：解析帧边界并原样转发。
-async fn copy_chunked<S: ChunkSource + Send + Unpin>(
+async fn copy_chunked<S, W>(
     src: &mut Buffered<S>,
-    dst: &mut OwnedWriteHalf,
-) -> std::result::Result<(), HttpError> {
+    dst: &mut W,
+) -> std::result::Result<(), HttpError>
+where
+    S: ChunkSource + Send + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     loop {
         let line = src.read_line(8 * 1024).await?;
         let size = parse_chunk_size(&line)?;
@@ -1581,10 +1637,14 @@ async fn copy_chunked<S: ChunkSource + Send + Unpin>(
 }
 
 /// 读到对端关闭（Connection: close 语义）。
-async fn copy_until_eof<S: ChunkSource + Send + Unpin>(
+async fn copy_until_eof<S, W>(
     src: &mut Buffered<S>,
-    dst: &mut OwnedWriteHalf,
-) -> std::result::Result<(), HttpError> {
+    dst: &mut W,
+) -> std::result::Result<(), HttpError>
+where
+    S: ChunkSource + Send + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     loop {
         let chunk = src.next_chunk().await;
         if chunk.is_empty() {
@@ -1597,12 +1657,15 @@ async fn copy_until_eof<S: ChunkSource + Send + Unpin>(
 }
 
 /// 升级为裸字节流后双向转发，直到任一方向结束。
-async fn relay_bidirectional(
-    client: &mut Buffered<OwnedReadHalf>,
-    client_out: &mut OwnedWriteHalf,
+async fn relay_bidirectional<S, W>(
+    client: &mut Buffered<S>,
+    client_out: &mut W,
     target: &mut Buffered<MuxRecvHalf>,
     target_out: &mut MuxSendHalf,
-) {
+) where
+    S: ChunkSource + Send + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
     let up = async {
         let buffered = client.take_buffered();
         if !buffered.is_empty() && target_out.send_data(&buffered).await.is_err() {
@@ -1640,7 +1703,10 @@ async fn relay_bidirectional(
     }
 }
 
-async fn send_error(w: &mut OwnedWriteHalf, status: u16, reason: &str) -> io::Result<()> {
+async fn send_error<W>(w: &mut W, status: u16, reason: &str) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let body = format!("{status} {reason}\n");
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
