@@ -51,7 +51,15 @@ pub fn router_with_backend<B: AdminBackend>(
     admin_token: String,
 ) -> anyhow::Result<Router> {
     let token = Arc::<str>::from(validate_token(admin_token)?);
-    let state = WebState { backend, token };
+    let state = WebState {
+        backend,
+        token,
+        // 账号表默认空：只有 NPS_ADMIN_TOKEN 可用（现有部署行为不变）。
+        // 需要用户名密码登录时由 `router_with_accounts` 注入。
+        accounts: Arc::new(crate::auth::AccountStore::empty()),
+        sessions: Arc::new(crate::auth::SessionStore::with_default_ttl()),
+        throttle: Arc::new(crate::auth::LoginThrottle::with_defaults()),
+    };
 
     let api = Router::new()
         .route("/status", get(get_status::<B>))
@@ -87,6 +95,94 @@ pub fn router_with_backend<B: AdminBackend>(
     Ok(app)
 }
 
+/// 与 [`router`] 相同，但启用用户名密码登录。
+///
+/// `accounts` 为空时等价于 [`router`]（只允许 `NPS_ADMIN_TOKEN`）。
+pub fn router_with_accounts(
+    server: nps_server::Server,
+    admin_token: String,
+    accounts: crate::auth::AccountStore,
+) -> anyhow::Result<Router> {
+    router_with_accounts_and_backend(server, admin_token, accounts)
+}
+
+/// 与 [`router_with_accounts`] 相同，但接受任意 [`AdminBackend`]（供测试）。
+pub fn router_with_accounts_and_backend<B: AdminBackend>(
+    backend: B,
+    admin_token: String,
+    accounts: crate::auth::AccountStore,
+) -> anyhow::Result<Router> {
+    let token = Arc::<str>::from(validate_token(admin_token)?);
+    let state = WebState {
+        backend,
+        token,
+        accounts: Arc::new(accounts),
+        sessions: Arc::new(crate::auth::SessionStore::with_default_ttl()),
+        throttle: Arc::new(crate::auth::LoginThrottle::with_defaults()),
+    };
+
+    let api = Router::new()
+        .route("/status", get(get_status::<B>))
+        .route("/listeners", get(get_listeners::<B>))
+        .route("/whoami", get(whoami::<B>))
+        .route(
+            "/tunnels/{id}/state",
+            post(set_tunnel_state::<B>),
+        )
+        .route(
+            "/sites",
+            get(list_sites::<B>).post(upsert_site::<B>),
+        )
+        .route(
+            "/sites/{domain}",
+            axum::routing::delete(remove_site::<B>),
+        )
+        .route("/certs", get(list_certs::<B>))
+        .route("/certs/upload", post(upload_cert::<B>))
+        .route(
+            "/certs/self-signed",
+            post(self_signed_cert::<B>),
+        )
+        .route("/certs/reload", post(reload_certs::<B>))
+        .route(
+            "/certs/acme-request",
+            post(acme_request::<B>),
+        )
+        .route(
+            "/certs/{domain}",
+            axum::routing::delete(remove_cert::<B>),
+        )
+        .route("/acme", get(get_acme::<B>))
+        .fallback(api_not_found)
+        .layer(DefaultBodyLimit::max(API_BODY_LIMIT))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin::<B>,
+        ))
+        .with_state(state.clone());
+
+    // 登录端点**不**走 require_admin（否则无法登录）
+    let login = Router::new()
+        .route("/login", post(login_handler::<B>))
+        .route("/logout", post(logout_handler::<B>))
+        .fallback(api_not_found)
+        .layer(DefaultBodyLimit::max(API_BODY_LIMIT))
+        .with_state(state);
+
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/index.html", get(index))
+        .route("/assets/app.css", get(app_css))
+        .route("/assets/app.js", get(app_js))
+        .route("/favicon.svg", get(favicon))
+        .fallback(static_not_found)
+        .nest("/api/auth", login)
+        .nest("/api", api)
+        .layer(middleware::from_fn(security_headers));
+
+    Ok(app)
+}
+
 fn validate_token(raw: String) -> anyhow::Result<String> {
     let token = raw.trim();
     if token.len() < MIN_TOKEN_LEN {
@@ -101,8 +197,14 @@ fn validate_token(raw: String) -> anyhow::Result<String> {
 #[derive(Clone)]
 struct WebState<B> {
     backend: B,
-    /// 管理令牌。刻意不实现 `Debug`，避免误打印。
+    /// 超级管理员令牌（`NPS_ADMIN_TOKEN`）。刻意不实现 `Debug`，避免误打印。
     token: Arc<str>,
+    /// 账号表（用户名密码登录）。为空表示只允许 token。
+    accounts: Arc<crate::auth::AccountStore>,
+    /// 会话表
+    sessions: Arc<crate::auth::SessionStore>,
+    /// 登录失败限流
+    throttle: Arc<crate::auth::LoginThrottle>,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,17 +225,22 @@ async fn require_admin<B: AdminBackend>(
         return response;
     }
 
-    if !authorized(request.headers(), &state.token) {
-        let mut response = error_response(StatusCode::UNAUTHORIZED, "未授权：缺少或无效的管理令牌");
-        response.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Bearer realm=\"nps-admin\""),
-        );
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static(API_CACHE));
-        return response;
-    }
+    // 鉴权：先比超级管理员 token，再查会话令牌
+    let principal = match resolve_principal(request.headers(), &state) {
+        Some(p) => p,
+        None => {
+            let mut response =
+                error_response(StatusCode::UNAUTHORIZED, "未授权：缺少或无效的凭证");
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"nps-admin\""),
+            );
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static(API_CACHE));
+            return response;
+        }
+    };
 
     let mut response = next.run(request).await;
     response
@@ -164,6 +271,23 @@ async fn security_headers(request: AxumRequest, next: Next) -> Response {
         );
     }
     response
+}
+
+/// 解析请求主体：`NPS_ADMIN_TOKEN` 优先，其次会话令牌。
+fn resolve_principal<B>(
+    headers: &HeaderMap,
+    state: &WebState<B>,
+) -> Option<crate::auth::Principal> {
+    let value = headers.get(header::AUTHORIZATION)?;
+    let value = value.to_str().ok()?;
+    let provided = bearer_credentials(value)?;
+
+    // 1) 超级管理员 token（常量时间比较）
+    if constant_time_eq(provided.as_bytes(), state.token.as_bytes()) {
+        return Some(crate::auth::Principal::Admin);
+    }
+    // 2) 会话令牌
+    state.sessions.verify(provided)
 }
 
 fn authorized(headers: &HeaderMap, expected: &str) -> bool {
@@ -272,8 +396,21 @@ fn split_authority(authority: &str) -> Option<(String, Option<u16>)> {
 // API 处理
 // ---------------------------------------------------------------------------
 
-async fn get_status<B: AdminBackend>(State(state): State<WebState<B>>) -> Response {
-    let snapshot = state.backend.snapshot().await;
+/// `GET /api/status`：按当前主体过滤。
+///
+/// 客户端账号只能看到自己的 client 与隧道；管理员看全部。
+async fn get_status<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    headers: HeaderMap,
+) -> Response {
+    let principal = resolve_principal(&headers, &state);
+    let mut snapshot = state.backend.snapshot().await;
+    if let Some(p) = principal.as_ref() {
+        if let Some(visible) = p.visible_clients() {
+            snapshot.clients.retain(|c| visible.contains(&c.id));
+            snapshot.tunnels.retain(|t| visible.contains(&t.client_id));
+        }
+    }
     Json(snapshot).into_response()
 }
 
@@ -666,4 +803,130 @@ async fn acme_request<B: AdminBackend>(
             error_response(StatusCode::BAD_REQUEST, &format!("{error:#}"))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 登录 / 登出 / 身份查询
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct LoginPayload {
+    username: String,
+    password: String,
+}
+
+/// `POST /api/auth/login`：用户名密码换会话令牌。
+///
+/// 安全要点：
+/// - 按 IP 限流（60 秒 10 次失败锁定）
+/// - 密码比较在 `AccountStore` 内做常量时间比较
+/// - 响应与日志都**不回显**密码或会话令牌（令牌只在成功响应体里返回一次）
+async fn login_handler<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let body = match require_json_body(&headers, body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let payload: LoginPayload = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "请求 JSON 无效，应为 {\"username\":\"...\",\"password\":\"...\"}",
+            )
+        }
+    };
+
+    // 限流用的 IP：优先 X-Forwarded-For 首个（反代场景），否则用占位
+    let ip = client_ip(&headers);
+
+    if !state.throttle.check(ip) {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "登录失败次数过多，请稍后再试",
+        );
+    }
+
+    if !state.accounts.is_enabled() {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "未启用用户名密码登录（仅支持管理令牌）",
+        );
+    }
+
+    match state.accounts.authenticate(&payload.username, &payload.password) {
+        Some(principal) => {
+            state.throttle.record_success(ip);
+            let token = state.sessions.create(principal.clone());
+            tracing::info!(principal = %principal.display(), "登录成功");
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "token": token,
+                    "is_admin": principal.is_admin(),
+                })),
+            )
+                .into_response()
+        }
+        None => {
+            state.throttle.record_failure(ip);
+            // 不区分「用户不存在」与「密码错误」
+            tracing::warn!(username_len = payload.username.len(), "登录失败");
+            error_response(StatusCode::UNAUTHORIZED, "用户名或密码错误")
+        }
+    }
+}
+
+/// `POST /api/auth/logout`：撤销当前会话令牌。
+async fn logout_handler<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    headers: HeaderMap,
+) -> Response {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(bearer_credentials)
+        .map(str::to_owned);
+    match token {
+        Some(t) if state.sessions.revoke(&t) => {
+            (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+        }
+        _ => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+    }
+}
+
+/// `GET /api/whoami`：返回当前主体信息（供前端决定显示什么）。
+async fn whoami<B: AdminBackend>(
+    State(state): State<WebState<B>>,
+    headers: HeaderMap,
+) -> Response {
+    match resolve_principal(&headers, &state) {
+        Some(principal) => Json(json!({
+            "principal": principal.display(),
+            "is_admin": principal.is_admin(),
+            "visible_clients": principal.visible_clients(),
+        }))
+        .into_response(),
+        None => error_response(StatusCode::UNAUTHORIZED, "未授权"),
+    }
+}
+
+/// 取客户端 IP（用于登录限流）。
+///
+/// 优先 `X-Forwarded-For` 首个值（反向代理场景），否则退回连接地址占位。
+fn client_ip(headers: &HeaderMap) -> std::net::IpAddr {
+    if let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = value.split(',').next() {
+            if let Ok(ip) = first.trim().parse() {
+                return ip;
+            }
+        }
+    }
+    // 无法确定时用全零地址（所有此类请求共享一个限流桶，
+    // 宁可更严格也不放过暴力破解）
+    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
 }

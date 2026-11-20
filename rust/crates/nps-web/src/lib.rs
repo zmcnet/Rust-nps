@@ -12,11 +12,15 @@
 //! - 前端只把令牌放在 `sessionStorage`，不向本服务以外的地址发起请求。
 
 mod assets;
+mod auth;
 mod backend;
 mod routes;
 
+pub use auth::{AccountStore, LoginThrottle, Principal, SessionStore};
 pub use backend::{
     AcmeIssueResult, AcmeSummary, AdminBackend, CertView, ListenerView, SiteInput, SiteRouteView,
     SiteView,
 };
-pub use routes::{router, router_with_backend};
+pub use routes::{
+    router, router_with_accounts, router_with_accounts_and_backend, router_with_backend,
+};

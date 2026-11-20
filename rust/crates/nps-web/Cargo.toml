@@ -7,6 +7,7 @@ description = "NPS Rust 管理界面：内嵌静态资源 + 只读状态 / 隧�
 publish = false
 
 [dependencies]
+ring.workspace = true
 anyhow = { workspace = true }
 axum = { workspace = true }
 nps-server = { path = "../nps-server" }
