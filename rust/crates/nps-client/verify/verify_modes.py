@@ -564,8 +564,10 @@ def cli_checks(checks: Checks, rnpc: Path, root: Path, vkey: str) -> None:
     checks.expect("[cli] size error is explicit", "1 MiB" in out, out[-160:])
 
     code, out = run_cli([str(rnpc), "install"], root)
-    checks.expect("[cli] reserved subcommand -> exit 2", code == 2, f"exit={code}")
-    checks.expect("[cli] reserved subcommand says 尚未实现", "尚未实现" in out)
+    checks.expect("[cli] install without required options -> exit 2",
+                  code == 2, f"exit={code}")
+    checks.expect("[cli] install without options names -server",
+                  "-server" in out, out[-200:])
 
     code, out = run_cli([str(rnpc), "bogus-cmd"], root)
     checks.expect("[cli] unknown subcommand -> exit 2", code == 2, f"exit={code}")

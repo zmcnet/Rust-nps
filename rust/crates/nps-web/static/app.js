@@ -2,8 +2,8 @@
  * NPS · Rust 管理台前端。
  *
  * 约束（与后端约定一致）：
- * - 用户名密码登录优先使用 HttpOnly 会话 Cookie（fetch 一律 credentials: 'same-origin'）；
- *   若后端在登录响应里返回会话令牌（当前实现），则存 sessionStorage 并以 Bearer 发送；
+ * - 登录成功后把后端返回的会话令牌存 sessionStorage，之后所有请求以
+ *   Authorization: Bearer 发送（后端只接受 Bearer，不使用 Cookie 通道）；
  * - 超级管理员令牌（NPS_ADMIN_TOKEN）只存 sessionStorage，关闭标签页即失效；
  * - 任何 API 返回 401 都立刻回到登录页并清空本地状态，绝不停留在半加载界面；
  * - 只请求当前站点的 /api，不加载任何外部资源；

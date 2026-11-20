@@ -1,20 +1,22 @@
-//! Rust-nps 服务端：配置、运行状态与 **TCP 隧道**服务。
+//! Rust-nps 服务端：配置、运行状态与转发服务。
 //!
-//! 定位：个人 / 小团队自部署，轻内嵌 UI，过渡期兼容老 npc。
+//! 定位：个人 / 小团队自部署，轻内嵌 UI，兼容老 npc（Go 版）。
 //! 本 crate 只是库（二进制入口由上层组装，产物名 `rnps`），提供：
 //! - [`ServerConfig`]：JSON 配置（不含 admin token；所有 vkey 必须显式配置）
 //! - [`Server`]：启动 / 快照 / 单隧道启停 / 关闭
-//! - 外部 TCP → 老 npc 反向拨号的转发链路
-//! - 可选的**配置文件模式注册**：老 npc 用 `-config=npc.conf` 上报隧道，
-//!   服务端自动建监听（[`ServerConfig::conf_register`]，默认关闭）
+//! - 外部连接 → 老 npc 反向拨号的转发链路：TCP / UDP / HTTP(S) 域名代理 /
+//!   SOCKS5 / 文件 / secret / p2p 会合信令 / conf 配置注册
 //!
 //! # 能力边界
-//! 这是 **TCP 兼容 P0**，不是全功能 NPS：
-//! - 仅 `tcp` 隧道；UDP / HTTP(S) / SOCKS5 / P2P / 文件服务 / 配置下发均未实现
-//! - 桥的 `main`（健康上报）与 `chan`（mux 数据面）两种连接被处理
-//! - `conf` 连接在 `conf_register=true` 时处理 `task` / `stus`，
-//!   `host`（域名代理）如实返回失败；`rgst` / `sert` / `p2pm` / `file` 未实现
+//! 原版 8 个 mode 中 7 个已完整实现，逐项证据见 `docs/PHASE2-ACCEPTANCE.md`。
+//! 已知的实现边界：
+//! - `tcpTrans` 仅有 [`transparent::original_dst`] 探测层（仅 Linux），
+//!   **未接入任何转发路径**
+//! - 限速 / 流量上限 / IP 白名单目前只作用于 TCP 隧道转发路径
+//! - `conf` 注册支持 `task`（tcp/udp/file）、`host`（站点）与 `stus` 查询；
+//!   `rgst` / `p2pm` 未实现
 //! - 注册隧道只存内存：重启即失效，不做持久化
+//! - `crypt` 是自签 TLS（不做身份认证，身份靠 vkey），`compress` 是 snappy framed
 //!
 //! # 停用与关闭的连接语义
 //! - `set_tunnel_enabled(id, false)`：关闭监听器（端口立即释放），并断开该隧道

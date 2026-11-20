@@ -5,18 +5,18 @@
 
 ## 先说清楚能力边界
 
-这个版本是 **TCP 兼容预览版**，不是原版 NPS 的全功能替代：
+服务端已覆盖原版 NPS 0.26.10 的全部协议模式（逐项证据见
+[../docs/PHASE2-ACCEPTANCE.md](../docs/PHASE2-ACCEPTANCE.md)）：
 
 | 项目 | 状态 |
 | --- | --- |
-| TCP 隧道（原版 npc `-type=tcp` 接入） | 支持 |
-| UDP / HTTP 域名代理 / SOCKS5 / KCP / P2P / 文件服务 / 配置下发 | **未实现** |
-| 加密、压缩、本地代理选项 | **未实现** |
-| 网页启停、流量统计、连接计数 | 支持，但**只在内存** |
-| 状态持久化 | **没有**：重启后按 `nps.json` 的 `enabled` 恢复，统计清零 |
-
-`nps.json` 里写了 UDP/HTTP 之类的隧道也不会生效——当前只解析 TCP 隧道。
-不要按原版 NPS 的文档配置本程序。
+| TCP / UDP / SOCKS5 / HTTP(S) 域名代理 / 文件 / secret / p2p 会合 | 支持，各有真实 npc 专项联调 |
+| 加密（自签 TLS）、压缩（snappy） | 支持 |
+| 限速、流量上限、IP 白名单、健康检查、多目标轮询 | 支持（**目前只作用于 TCP 隧道**） |
+| tcpTrans 透明代理 | 仅探测层（仅 Linux），**未接入转发路径** |
+| KCP 传输、P2P 客户端侧 | 未实现 |
+| 网页启停、流量统计、连接计数 | 支持；启停只在内存，TCP 流量每 5 分钟落盘 |
+| 状态持久化 | 重启后按 `nps.json` 的 `enabled` 恢复；conf 动态注册的隧道重启即失效 |
 
 ## 目录内容
 
@@ -54,8 +54,9 @@ sudo ./install.sh ./rnps
 5. 安装 `/etc/systemd/system/rnps.service`，`daemon-reload` + `enable` + `restart`，
    启动失败时打印 `journalctl` 尾部并退出非零。
 
-脚本是 `set -euo pipefail`，`bash -n` 已通过；但**未在真实 Linux 上执行过**
-（开发机是 Windows），见文末「未验证项」。
+脚本是 `set -euo pipefail`。**已在 Debian 13 实机执行验证**（安装、启用、
+真实穿透一次通过；过程中修复了 PATH 缺 `/usr/sbin` 与脚本执行位两个问题，
+见 [../LINUX-VERIFY.md](../LINUX-VERIFY.md)）；其它发行版的行为见文末「未验证项」。
 
 已有 `/etc/nps/nps.json` 和已有非空令牌的 `/etc/nps/nps.env` 都不会被覆盖
 （配置文件的属主/权限会被校正为 `0640 root:nps`，环境文件为 `0600 root:root`）。
@@ -98,10 +99,46 @@ openssl rand -base64 32
 | `clients[].id` | 正整数，隧道通过 `client_id` 引用 |
 | `clients[].name` | 展示用名称，不能为空 |
 | `clients[].vkey` | 客户端认证密钥。必须显式配置，不能为空、不能是 `123`/`123456`/`password`/`vkey`，且不能与其它客户端重复 |
+| `web_username` / `web_password` | 管理员账号（两者都非空才生效）。管理令牌只走环境变量 `NPS_ADMIN_TOKEN`，**不写进这个文件** |
+| `clients[].web_username` / `web_password` | 客户端账号（登录管理页只能看自己的隧道）；两者都空时回退 `user` + vkey（对齐原版 `login.go`） |
 | `tunnels[].id` | 正整数，唯一 |
 | `tunnels[].listen_addr` | 服务端对外监听地址（外部入口） |
 | `tunnels[].target_addr` | **npc 所在网络**里的目标地址，如 `127.0.0.1:22` |
+| `tunnels[].target_addrs[]` | 多目标顺序轮询（优先于 `target_addr`），可配 `health_check` 自动摘除 |
 | `tunnels[].enabled` | 随服务启动是否监听；默认 `true`。网页启停不改这个值 |
+| `udp_tunnels[]` | UDP 隧道，字段同 `tunnels[]`（另有 `idle_timeout_secs`、`max_sessions`） |
+| `http_sites[]` | HTTP(S) 域名站点：`domain` / `target_addr` / `routes[]` 前缀分流 / `websocket` / `tls_mode`（`off`/`upload`/`self-signed`/`acme`） |
+| `http_listen_addr` / `https_listen_addr` | 域名代理监听地址（默认都不监听；配了 `http_sites` 至少要配一个） |
+| `socks5_listeners[]` | SOCKS5 服务：`listen_addr` + 可选 `users[]`（RFC 1929 用户名密码） |
+| `secret_tunnels[]` | secret 隧道：无 `listen_addr`，服务端按 `password` 的 md5 配对，密码须唯一 |
+| `file_tunnels[]` | 文件服务隧道（数据面走独立 file 通道） |
+| `conf_register` | 允许老 npc 用 `-config` 动态注册 task（tcp/udp/file）与 host 站点；默认 `false`；注册结果只存内存 |
+| `ip_limit[]` | 来源 IP 白名单（单 IP / CIDR / IPv6；**目前只在 TCP 隧道路径强制**） |
+| `cert_dir` | TLS 证书目录，默认 `<配置目录>/certs` |
+| `acme` | ACME 设置（provider / challenge / auto_renew 等）；**程序绝不擅自申请证书** |
+| `data_dir` | 流量持久化等数据目录 |
+| `flow_store_interval` | TCP 流量落盘间隔（分钟），默认 5 |
+
+完整字段与校验规则以 [../crates/nps-server/src/config.rs](../crates/nps-server/src/config.rs) 为准。非 TCP 模式常用片段（示例值不是密钥，原样使用等于公开）：
+
+```json
+{
+  "udp_tunnels": [
+    { "id": 1, "name": "dns", "client_id": 1,
+      "listen_addr": "0.0.0.0:53", "target_addr": "127.0.0.1:53" }
+  ],
+  "http_listen_addr": "0.0.0.0:8081",
+  "http_sites": [
+    { "id": 1, "name": "home", "client_id": 1,
+      "domain": "home.example.com", "target_addr": "127.0.0.1:80", "websocket": true }
+  ],
+  "socks5_listeners": [
+    { "id": 1, "name": "socks", "client_id": 1,
+      "listen_addr": "0.0.0.0:1080",
+      "users": [{ "username": "alice", "password": "替换成真实密码" }] }
+  ]
+}
+```
 
 生成 vkey：
 
@@ -138,10 +175,12 @@ sudo systemctl enable --now rnps.service
 sudo systemctl status rnps.service
 ```
 
-只支持 TCP 隧道，用原版 npc 接入：
+TCP 隧道用原版 npc 或本仓库 rnpc 接入（其余协议模式见能力边界表；npc 的
+`-config` 动态注册需 `conf_register: true`）：
 
 ```sh
 ./npc -server=<服务器IP>:8024 -vkey='<该客户端的 vkey>' -type=tcp
+# 或：./rnpc -s <服务器IP>:8024 -vkey '<该客户端的 vkey>'
 ```
 
 验证管理 API（令牌从 0600 的环境文件读，不写进 shell 历史）：
@@ -242,16 +281,14 @@ sudo userdel nps
 
 以下内容在本机（Windows，无 Docker / 无 systemd）无法验证，请在目标机确认：
 
-1. `rnps.service` 未经 `systemd-analyze verify` 校验；`ReadWritePaths=` 与
-   `CapabilityBoundingSet=` 的空赋值语义（"重置列表"）需在目标发行版的
-   systemd 版本上确认。
-2. `install.sh` 只做了 `bash -n` 语法检查，未在真实 Linux 上执行；`useradd`/
-   `groupadd` 参数、`install -o/-g`、`systemctl enable --now` 的实际行为
-   依赖发行版，均未实测。
-3. `Dockerfile` 未构建过；`rust:1.100-slim` 与 `debian:bookworm-slim` 标签、
+1. systemd 路径（`rnps.service` + `install.sh`）**已在 Debian 13 实机验证**
+   （systemd 257：`systemd-analyze verify` 无告警、真实穿透、内存 1.7 MB，
+   见 [../LINUX-VERIFY.md](../LINUX-VERIFY.md)）；其它发行版与 systemd 版本的
+   差异（含 `ReadWritePaths=` / `CapabilityBoundingSet=` 空赋值语义）仍请自行核对。
+2. `Dockerfile` 未构建过；`rust:1.100-slim` 与 `debian:bookworm-slim` 标签、
    构建出的 glibc 是否与运行镜像兼容，均未实测（`--version` 冒烟步骤未执行）。
-4. README 中的 `curl` 示例依赖服务实际运行，未在本机跑通。
-5. 各发行版（Debian/Ubuntu 之外的 NAS 系统）的用户名/组名策略差异未覆盖；
+3. 本 README 中的 `curl` 示例依赖服务实际运行，未在本机（Windows 开发机）跑通。
+4. 各发行版（Debian/Ubuntu 之外的 NAS 系统）的用户名/组名策略差异未覆盖；
    非 systemd 系统（OpenWrt 等）需要自己写 init 脚本。
-6. `openssl rand -base64 32` 的输出含 `/` `+` `=`，放进 JSON 与 shell 都安全，
+5. `openssl rand -base64 32` 的输出含 `/` `+` `=`，放进 JSON 与 shell 都安全，
    但若用户把它拼进 URL 查询串需要先做 URL 编码——示例未覆盖该用法。

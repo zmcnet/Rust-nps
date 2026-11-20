@@ -2,7 +2,7 @@
 
 延续 NPS 的自部署体验和可视化管理，用 Rust 逐步替换内核。面向个人和小团队：一个服务端程序，内嵌网页管理端，使用自己的 VPS、NAS 或内网设备。
 
-当前状态：**TCP 兼容预览版，已与真实原版 Go npc 0.26.10 完成端到端联调验证**。它还不是原版 NPS 的全功能替代品。
+当前状态：**原版 8 个协议模式已在服务端实现（`tcpTrans` 仅有探测层），与真实原版 Go npc 0.26.10 / nps 0.26.10 双向完成端到端联调验证**。逐项证据见 [docs/PHASE2-ACCEPTANCE.md](docs/PHASE2-ACCEPTANCE.md)。
 
 已用真实客户端实测通过的项（`../tools/interop/smoke.py`，24/24）：
 
@@ -14,17 +14,16 @@
 - 传输结束后活动连接计数归零，字节计数与实际业务字节一致
 - 所有子进程与套接字在测试结束后清理干净
 
-## 预览版范围
+## 能力范围
 
-- 使用 JSON 文件定义客户端与 TCP 隧道。
-- 原版 npc 以 `-type=tcp` 连接桥端口；过渡期保留原协议。
-- 网页查看客户端状态、隧道状态、活动连接和累计流量，启用或停用隧道。
+- 原版 8 个 mode：tcp / udp / socks5 / httpProxy（域名代理）/ file / secret / p2p（会合信令）/ tcpTrans（探测层，**未接线**）。逐项证据见 [docs/PHASE2-ACCEPTANCE.md](docs/PHASE2-ACCEPTANCE.md)。
+- JSON 配置定义客户端与 tcp / udp / http 站点 / socks5 / secret / file 隧道；老 npc 也可用 `-config` 动态注册 task（tcp/udp/file）与 host 站点。
+- 网页管理：客户端/隧道/连接数/流量总览、隧道启停、站点 CRUD、证书上传/自签/ACME；多用户登录（管理员账号 + 客户端账号 + 超级令牌），权限在服务端强制，不只是前端隐藏。
 - 管理 API 使用独立管理令牌。客户端 vkey 和管理令牌分别设置。
 - 网页资源编入二进制，运行时不需要 Node、CDN 或独立静态目录。
+- 客户端 `rnpc`：直接参数、配置文件或 `--name` 实例模式；install/change/update/list/status 等持久化命令与自启通道见 [docs/rnpc-cli-spec.md](docs/rnpc-cli-spec.md)。
 
-UDP、HTTP 域名代理、SOCKS5、KCP、P2P、文件服务、配置文件动态注册、原版 JSON 数据迁移、Rust 原生客户端暂未实现。旧 npc 使用命令行连接，任务由服务端配置；不支持旧版 npc.conf 的 `WORK_CONFIG` 注册流程。加密、压缩及本地代理选项尚未开放。
-
-网页启停仅改变当前进程状态，重启后按配置恢复。累计流量也会在重启时清零。
+已知边界：网页启停仅改变当前进程状态，重启后按配置恢复；conf 动态注册的隧道不持久化；TCP 流量累计每 5 分钟落盘（`flow_store_interval`），进程被 kill -9 会丢最后一段；限速/流量上限/IP 白名单目前只作用于 TCP 隧道转发路径。
 
 ## 构建
 
@@ -39,13 +38,7 @@ cargo test --workspace
 
 本机开发环境使用 **MSVC 工具链**（`stable-x86_64-pc-windows-msvc`，Visual Studio 2022 Build Tools + Windows SDK），直接用上面的 `cargo` 命令即可，无需额外环境变量。
 
-项目脚本 `scripts/cargo.ps1` 只用于 GNU 目标兜底：它会检测 host 是否为 `*windows-gnu`，是则接入完整 MinGW-w64（`gcc.exe` / `as.exe` / `dlltool.exe`）并关闭 `-C link-self-contained`；MSVC 目标下不做任何改动。若要使用 GNU 目标：
-```powershell
-$env:NPS_MINGW_BIN = 'D:\Tools\w64devkit\bin'   # 可选；脚本也会自动探测
-.\scripts\cargo.ps1 build --workspace
-```
-
-Windows GNU 目标有一个必须知道的坑：Rust 自带 self-contained 链接器里的 `dlltool.exe` 在部分机器上无法执行（`CreateProcess` 失败）。`cargo check` 不触发链接，所以会"假通过"，只有 `build`/`test` 才暴露。这就是脚本要接外部 MinGW 的原因。
+`scripts/cargo.ps1` 是**历史遗留，不要用**（交接文档 26.2）：当年为绕过 Windows GNU 目标的一个坑——Rust 自带 self-contained 链接器里的 `dlltool.exe` 在部分机器上无法执行（`CreateProcess` 失败），而 `cargo check` 不触发链接、会"假通过"——脚本会接入外部 MinGW-w64（`NPS_MINGW_BIN` 或自动发现的 w64devkit）并关闭 `-C link-self-contained`。现在 MSVC 工具链下 `cargo build` / `cargo test` 直接可用，不需要它；只有将来再用 GNU 目标且 `dlltool` 报错时才考虑启用。
 
 下载依赖需要代理时，按本地 Clash 的实际端口设置：
 
@@ -97,6 +90,9 @@ $clientKey
 
 ```powershell
 .\npc.exe -server=127.0.0.1:8024 -vkey='<刚才生成的 clientKey>' -type=tcp
+
+# 或使用本仓库客户端 rnpc（默认即 tcp 类型）：
+.\target\debug\rnpc.exe -s 127.0.0.1:8024 -vkey '<刚才生成的 clientKey>'
 ```
 
 打开 [本机管理端](http://127.0.0.1:8080)，输入刚才的管理令牌。登录信息只保留在当前浏览器会话中；退出会清除它。
@@ -109,12 +105,20 @@ $clientKey
 
 ## 管理 API
 
-请求头：`Authorization: Bearer <NPS_ADMIN_TOKEN>`。
+请求头：`Authorization: Bearer <NPS_ADMIN_TOKEN>`（或登录会话返回的 Bearer 令牌）。
 
-| 方法与路径 | 作用 |
-| --- | --- |
-| `GET /api/status` | 返回客户端、隧道及流量快照，不返回任何密钥 |
-| `POST /api/tunnels/{id}/state` | 请求体 `{"enabled": true}` 或 `{"enabled": false}`，启用或停用隧道 |
+| 方法与路径 | 作用 | 权限 |
+| --- | --- | --- |
+| `GET /api/status` | 客户端、隧道及流量快照，不返回任何密钥 | 登录即可见；客户端账号只看到自己 |
+| `GET /api/listeners` | 各监听面的连接统计 | 登录即可见 |
+| `GET /api/whoami` | 当前身份与是否管理员 | 登录即可见 |
+| `POST /api/tunnels/{id}/state` | 请求体 `{"enabled": true/false}`，启用或停用隧道 | 管理员 |
+| `GET/POST /api/sites`、`DELETE /api/sites/{domain}` | 站点查询 / 增改 / 删除 | 管理员 |
+| `GET /api/certs`、`POST /api/certs/upload`、`POST /api/certs/self-signed`、`POST /api/certs/reload`、`DELETE /api/certs/{domain}` | 证书管理 | 管理员 |
+| `GET /api/acme`、`POST /api/certs/acme-request` | ACME 状态与申请（程序绝不擅自申请） | 管理员 |
+| `POST /api/auth/login`、`POST /api/auth/logout` | 用户名密码登录 / 登出 | 公开 / 登录 |
+
+管理员端点在服务端强制校验（`require_admin_principal`），客户端账号一律 403。
 
 ## 验证
 
@@ -130,11 +134,13 @@ python -I ..\tools\interop\smoke.py --server-bin .\target\debug\rnps.exe --npc-b
 
 ### 当前测试规模
 
-`cargo test --workspace` 共 143 项通过：`nps-legacy` 69（协议字节样例、mux 多流双向 1 MiB、超窗、慢流不阻塞、关闭唤醒、桥生命周期，以及对抗性加固：不可取消写、路由泄漏、长度截断、零长 ping、id 串台）、`nps-proto` 4、`nps-server` 16 单元 + 边界 7 + 转发端到端 2 + 加固 17、`nps-web` 28。
+`cargo test --workspace` 共 **617 项**通过，0 失败（2026-11-20）：`nps-legacy` 69（协议字节样例、mux 多流双向 1 MiB、超窗、慢流不阻塞、关闭唤醒、桥生命周期，以及对抗性加固：不可取消写、路由泄漏、长度截断、零长 ping、id 串台）、`nps-proto` 4、`nps-server`（单元 + 12 个集成测试文件：转发端到端、UDP、SOCKS5、HTTP 站点、conf 注册、加固、边界、target、limit、tls、acme、file）、`nps-web`（路由 + 权限隔离）、`nps-client`（autostart / process / update_feed）。分项计数见 [docs/PHASE2-ACCEPTANCE.md §7](docs/PHASE2-ACCEPTANCE.md)。
 
-### 加固过程中修掉的真实缺陷
+### 第一阶段（mux / 桥）加固修掉的真实缺陷
 
-这些不是理论风险，每一条都有对应测试，其中两条做了"回退即失败"的实证：
+这些不是理论风险，每一条都有对应测试，其中两条做了"回退即失败"的实证。
+第二阶段累计修复的 22 个缺陷（含权限绕过安全漏洞）见
+[docs/PHASE2-ACCEPTANCE.md §8](docs/PHASE2-ACCEPTANCE.md)：
 
 | 缺陷 | 后果 |
 | --- | --- |
@@ -149,13 +155,13 @@ python -I ..\tools\interop\smoke.py --server-bin .\target\debug\rnps.exe --npc-b
 
 ### Windows 说明
 
-默认使用 MSVC 工具链，`cargo build` / `cargo test` 直接可用，无需额外环境变量。若改用 GNU 目标，需要完整 MinGW-w64（`gcc.exe` / `as.exe` / `dlltool.exe`）：Rust 自带的自包含链接器里那个 `dlltool.exe` 在部分机器上无法执行，而 `cargo check` 不触发链接、会"假通过"，只有 `build`/`test` 才暴露。`scripts/cargo.ps1` 只在 host 为 `*windows-gnu` 时接管，接入 `NPS_MINGW_BIN` 或自动发现的 w64devkit，并关闭 `-C link-self-contained`。
+默认使用 MSVC 工具链，`cargo build` / `cargo test` 直接可用，无需额外环境变量。`scripts/cargo.ps1` 是历史遗留，日常不要用——只有 Windows GNU 目标再次出现 `dlltool` 链接错误时才考虑启用（见上文构建一节）。
 
 ## 代码结构
 
 `nps-proto` 定义兼容数据结构；`nps-legacy` 实现旧桥协议和 mux；`nps-server` 管理连接与转发；`nps-web` 提供内嵌界面；`nps-app` 提供 `rnps` 服务端入口；`nps-client` 提供 `rnpc` 客户端。旧协议集中在 `nps-legacy` 中，便于后续引入新协议并逐步移除它。
 
-Linux 部署产物在 [packaging/](packaging/)：systemd 单元、环境变量示例、Dockerfile、安装脚本和部署说明。**这些文件尚未在真实 Linux/systemd/Docker 上验证过**，使用前请自行核对。
+Linux 部署产物在 [packaging/](packaging/)：systemd 单元、环境变量示例、Dockerfile、安装脚本和部署说明。systemd + `install.sh` 已在 Debian 13 实机验证（安装、真实穿透、内存占用 1.7 MB，见 [LINUX-VERIFY.md](LINUX-VERIFY.md)）；Dockerfile 尚未真实构建过。
 
 ## 许可
 

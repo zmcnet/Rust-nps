@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Black-box interop smoke test for the Rust npc client (`npsc`).
+"""Black-box interop smoke test for the Rust npc client (`rnpc`).
 
 Two directions are exercised against the same real echo service:
 
-  A. real Go `nps` server (built read-only from resources/nps)  <->  Rust `npsc`
-  B. Rust `npsd` server (rust/target/debug/rnps.exe)            <->  Rust `npsc`
+  A. real Go `nps` server (built read-only from resources/nps)  <->  Rust `rnpc`
+  B. Rust `rnps` server (rust/target/debug/rnps.exe)            <->  Rust `rnpc`
 
 Checks per direction:
   * wrong vkey is rejected (exit code 4) and the vkey never appears in logs
@@ -21,7 +21,7 @@ Usage (run isolated, no third-party imports):
 
 Optional:
     --nps-bin PATH       real Go nps.exe (default tools/interop/server/nps.exe)
-    --npsc-bin PATH      Rust client (default rust/target/debug/npsc.exe)
+    --npsc-bin PATH      Rust client (default rust/target/debug/rnpc.exe)
     --npsd-bin PATH      Rust server (default rust/target/debug/rnps.exe)
     --skip-go            skip direction A
     --skip-rust-server   skip direction B
@@ -47,7 +47,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_NPS_BIN = REPO / "tools" / "interop" / "server" / "nps.exe"
-DEFAULT_NPSC_BIN = REPO / "rust" / "target" / "debug" / "npsc.exe"
+DEFAULT_NPSC_BIN = REPO / "rust" / "target" / "debug" / "rnpc.exe"
 DEFAULT_NPSD_BIN = REPO / "rust" / "target" / "debug" / "rnps.exe"
 LOG_ROOT = REPO / "tools" / "interop" / "logs"
 

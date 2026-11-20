@@ -1,6 +1,7 @@
 //! 配置文件模式（老 npc `-config`）隧道注册。
 //!
-//! 对齐 Go `bridge/bridge.go:getConfig`，只实现 **TCP 隧道**子集：
+//! 对齐 Go `bridge/bridge.go:getConfig`：`task` 帧（tcp/udp/file）、
+//! `host` 帧（域名站点）与 `stus` 状态查询：
 //!
 //! ```text
 //! 服务端 -> 客户端   1B      isPub（bool，本实现恒为 0/false）
@@ -28,8 +29,8 @@
 //!
 //! ## 限制
 //! - 每个任务段只支持**单个端口**与**单个目标**；多端口/多目标返回 false。
-//! - 只支持 `mode=tcp`（大小写敏感，与 Go 一致）；udp/http/https/socks5/file/
-//!   secret/p2p 一律返回 false。
+//! - `task` 支持 `mode=tcp` / `udp` / `file`（大小写敏感，与 Go 一致）；
+//!   其它 mode（httpProxy / socks5 / secret / p2p 等）返回 false 并写明原因。
 //! - 监听 IP 由服务端配置 `conf_listen_host` 决定，忽略客户端上报的
 //!   `ServerIp`（避免客户端指定绑定网卡）。
 //! - 特权端口（<1024）直接拒绝；端口被占用时返回 false（原因写进日志与

@@ -1,7 +1,7 @@
 # tools/interop — real-Go-npc interop harness
 
 Black-box interop test between the **real Go `npc` client** (built from
-`resources/nps`, read-only) and the **Rust `npsd` server**.
+`resources/nps`, read-only) and the **Rust `rnps` server**.
 
 Write scope: everything here. The Go repo is never modified.
 
@@ -31,28 +31,28 @@ and no file under `resources/nps` was touched (`git status` clean).
 
 ## Running the smoke test
 
-Build the Rust server first (`cargo build -p nps-app --bin npsd`, output
-`rust/target/debug/npsd.exe`), then:
+Build the Rust server first (`cargo build -p nps-app --bin rnps`, output
+`rust/target/debug/rnps.exe`), then:
 
 ```bash
 python -I /d/Developing/NPS/tools/interop/smoke.py \
-    --server-bin /d/Developing/NPS/rust/target/debug/npsd.exe \
+    --server-bin /d/Developing/NPS/rust/target/debug/rnps.exe \
     --npc-bin    /d/Developing/NPS/tools/interop/bin/npc.exe
 ```
 
-`--server-bin` defaults to `<repo>/rust/target/debug/npsd.exe` and `--npc-bin`
+`--server-bin` defaults to `<repo>/rust/target/debug/rnps.exe` and `--npc-bin`
 to `<script dir>/bin/npc.exe`.
 
 Exit codes: `0` all checks passed, `1` a check failed, `2` npc binary missing,
 `3` server binary missing (end-to-end intentionally **not** executed).
 
 Optional browser preview (off by default, max 600 s): after a fully successful
-run, keeps the same real npc/npsd/echo environment alive so the management UI
+run, keeps the same real npc/rnps/echo environment alive so the management UI
 can be checked by hand:
 
 ```bash
 python -I /d/Developing/NPS/tools/interop/smoke.py \
-    --server-bin .../npsd.exe --npc-bin .../npc.exe --preview-seconds 300
+    --server-bin .../rnps.exe --npc-bin .../npc.exe --preview-seconds 300
 ```
 
 The test-only admin token and port map are written to
@@ -61,11 +61,11 @@ the environment is still torn down and all child processes/sockets are
 cleaned up.
 
 Every run gets a fresh temp dir `logs/run-<timestamp>/` containing
-`npsd.json` (ephemeral random vkey/token inputs), `npsd.log`, `npc.log`,
+`rnps.json` (ephemeral random vkey/token inputs), `rnps.log`, `npc.log`,
 `npc-restart.log`, `npc-bad-vkey.log`. Logs are kept on success and failure.
 The admin token and vkey are generated per run, never printed.
 
-The server is started as `npsd --config <json>` with `NPS_ADMIN_TOKEN` in its
+The server is started as `rnps --config <json>` with `NPS_ADMIN_TOKEN` in its
 environment only (the npc environment does not inherit it). The npc is the real
 binary, launched as
 `npc -server=127.0.0.1:<bridge> -vkey=<random> -type=tcp`.
@@ -151,11 +151,9 @@ strict exact-field checks, so those alternate shapes will fail the test.
 
 - The Go core version is `0.26.0` (`GetVersion()`); `0.26.10` is only the full
   `VERSION`. The handshake compares the core version, so the server must expect
-  `0.26.0`. (`nps-proto::CORE_VERSION` already is `0.26.0`; a doc comment in
-  `nps-legacy/src/handshake.rs` still mentions `0.26.10` and is stale.)
+  `0.26.0` (`nps-proto::CORE_VERSION`).
 - `Getverifyval` is plain `md5(vkey)` lower-case hex, 32 chars.
 - The 122550-byte figure is the initial mux receive window; the 4 MiB stream is
   what forces the window-update path to be exercised.
 - Harness self-validation (echo server, streaming transfer, handshake framing)
-  was done locally; it is **not** a substitute for the real `npsd` run, which
-  awaits the parent's build.
+  was done locally; it is **not** a substitute for the real `rnps` run.
