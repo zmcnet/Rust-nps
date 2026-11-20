@@ -264,6 +264,9 @@ pub(crate) struct Tunnel {
     crypt_server: Option<Arc<crate::crypt::CryptServer>>,
     /// 子流包装方式（从**客户端**配置继承，对应原版 `client.Cnf.Crypt/Compress`）
     wrap: crate::crypt::StreamWrap,
+    /// `tcpTrans`（透明代理）模式：目标来自 `SO_ORIGINAL_DST`，不查目标池。
+    /// 其余行为（accept/计数/限速/包装/快照）与普通隧道完全一致。
+    transparent: bool,
 }
 
 impl Tunnel {
@@ -289,6 +292,7 @@ impl Tunnel {
             ip_allow: Arc::new(crate::limit::IpAllowList::default()),
             crypt_server: None,
             wrap: crate::crypt::StreamWrap::Plain,
+            transparent: false,
         }
     }
 
@@ -300,6 +304,32 @@ impl Tunnel {
         flow: Option<Arc<crate::limit::FlowCounter>>,
         ip_allow: Arc<crate::limit::IpAllowList>,
         wrap: crate::crypt::StreamWrap,
+    ) -> Self {
+        Self::build(cfg, targets, rate, flow, ip_allow, wrap, false)
+    }
+
+    /// `tcpTrans`（透明代理）构造：目标不查配置的目标池，而是每条连接
+    /// 通过 `SO_ORIGINAL_DST` 取 iptables REDIRECT 前的原始地址（仅 Linux）。
+    pub(crate) fn with_transparent(
+        cfg: TcpTunnelConfig,
+        rate: Option<Arc<crate::limit::TokenBucket>>,
+        flow: Option<Arc<crate::limit::FlowCounter>>,
+        ip_allow: Arc<crate::limit::IpAllowList>,
+        wrap: crate::crypt::StreamWrap,
+    ) -> Self {
+        // 目标池占位：透明模式不会查询它；`cfg.target_addr` 也只用于快照展示
+        let targets = Arc::new(crate::target::TargetPool::single(&cfg.target_addr));
+        Self::build(cfg, targets, rate, flow, ip_allow, wrap, true)
+    }
+
+    fn build(
+        cfg: TcpTunnelConfig,
+        targets: Arc<crate::target::TargetPool>,
+        rate: Option<Arc<crate::limit::TokenBucket>>,
+        flow: Option<Arc<crate::limit::FlowCounter>>,
+        ip_allow: Arc<crate::limit::IpAllowList>,
+        wrap: crate::crypt::StreamWrap,
+        transparent: bool,
     ) -> Self {
         Self {
             cfg,
@@ -319,6 +349,7 @@ impl Tunnel {
                 None
             },
             wrap,
+            transparent,
         }
     }
 
@@ -328,6 +359,11 @@ impl Tunnel {
 
     /// 记录最近错误（只留文本，不含密钥）
     async fn set_error(&self, msg: impl Into<String>) {
+        *self.last_error.lock().await = Some(msg.into());
+    }
+
+    /// 供 server.rs 标注「平台不支持」之类的启动期原因（快照可见）
+    pub(crate) async fn mark_error(&self, msg: impl Into<String>) {
         *self.last_error.lock().await = Some(msg.into());
     }
 
@@ -370,15 +406,19 @@ impl Tunnel {
             active_connections: self.active_connections.load(Ordering::Relaxed),
             bytes_to_client: self.bytes_to_client.load(Ordering::Relaxed),
             bytes_from_client: self.bytes_from_client.load(Ordering::Relaxed),
-            targets: self
-                .targets
-                .all_targets()
-                .into_iter()
-                .map(|t| {
-                    let healthy = !self.targets.is_offline(&t);
-                    crate::snapshot::TargetHealth { target: t, healthy }
-                })
-                .collect(),
+            // 透明模式没有静态目标表：目标每条连接各不相同
+            targets: if self.transparent {
+                Vec::new()
+            } else {
+                self.targets
+                    .all_targets()
+                    .into_iter()
+                    .map(|t| {
+                        let healthy = !self.targets.is_offline(&t);
+                        crate::snapshot::TargetHealth { target: t, healthy }
+                    })
+                    .collect()
+            },
             last_error: self.last_error.lock().await.clone(),
             bound_addr,
         }
@@ -544,6 +584,24 @@ impl Tunnel {
             }
         }
 
+        // 透明代理（tcpTrans）：目标来自 iptables REDIRECT 前的原始地址，
+        // 必须在向 npc 建流**之前**确定——确定不了就不建流，避免白白消耗
+        // npc 侧的目标连接。语义对齐原版 `transport.go`：直接访问监听端口
+        // （未经 REDIRECT）的连接被关闭，而不是回退到某个默认目标。
+        let transparent_target = if self.transparent {
+            match crate::transparent::original_dst_tokio(&stream) {
+                crate::transparent::OriginalDst::Addr(dst) => Some(dst.to_string()),
+                other => {
+                    let reason = other.describe();
+                    self.set_error(reason.clone()).await;
+                    debug!("tcpTrans 隧道 {}: {} {reason}", self.cfg.id, peer);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
         // 目标客户端离线 → 直接关闭外部连接，记录原因，不 panic
         let mux = match bridge.get_tunnel(self.cfg.client_id).await {
             Some(m) => m,
@@ -577,13 +635,16 @@ impl Tunnel {
         // 因此不会吞掉首帧数据。
         // 多目标轮询：全离线时直接关闭外部连接（对应原版
         // `all inward-bending targets are offline`）
-        let target = match self.targets.next() {
-            Ok(target) => target,
-            Err(e) => {
-                self.set_error(format!("无可用目标: {e}")).await;
-                warn!("隧道 {}: 无可用目标（{e}），拒绝来自 {} 的连接", self.cfg.id, peer);
-                return;
-            }
+        let target = match transparent_target {
+            Some(dst) => dst,
+            None => match self.targets.next() {
+                Ok(target) => target,
+                Err(e) => {
+                    self.set_error(format!("无可用目标: {e}")).await;
+                    warn!("隧道 {}: 无可用目标（{e}），拒绝来自 {} 的连接", self.cfg.id, peer);
+                    return;
+                }
+            },
         };
         let mut link = nps_proto::Link::tcp(target, peer.to_string());
         link.option.timeout = TARGET_DIAL_TIMEOUT_NS;

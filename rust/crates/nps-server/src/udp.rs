@@ -54,6 +54,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 
 use crate::config::UdpTunnelConfig;
+use crate::limit::{ClientControls, Throttle};
 use crate::snapshot::TunnelSnapshot;
 
 /// 子流空闲回收默认值。对齐 Go `SetReadDeadline(time.Now().Add(time.Minute * 10))`。
@@ -170,6 +171,8 @@ pub struct UdpTunnel {
     last_error: Mutex<Option<String>>,
     /// `Some` 即「已启用」，内含实际绑定地址
     runtime: Mutex<Option<UdpRun>>,
+    /// per-client 流控：与同客户端的 TCP / HTTP / SOCKS5 等路径共享配额
+    controls: ClientControls,
 }
 
 impl UdpTunnel {
@@ -198,7 +201,16 @@ impl UdpTunnel {
             bytes_from_client: Arc::new(AtomicU64::new(0)),
             last_error: Mutex::new(None),
             runtime: Mutex::new(None),
+            controls: ClientControls::default(),
         }
+    }
+
+    /// 带上 per-client 流控构造（`server.rs` / `conf.rs` 接线用）。
+    ///
+    /// 未调用时等价于「不限速、不限流量、白名单为空（全部允许）」。
+    pub fn with_client_controls(mut self, controls: ClientControls) -> Self {
+        self.controls = controls;
+        self
     }
 
     pub fn id(&self) -> u32 {
@@ -339,6 +351,17 @@ impl UdpTunnel {
             };
             let data = buf[..n].to_vec();
 
+            // ⓪ 准入：IP 白名单（按客户端配置；空表 = 全部允许）。
+            //    UDP 无连接，拒绝方式只能是静默丢包（不产生 ICMP，避免被用于探测）。
+            if !self.controls.ip_allowed(addr.ip()) {
+                debug!(
+                    "UDP 隧道 {}: 丢弃未授权来源 {} 的数据报",
+                    self.cfg.id,
+                    addr.ip()
+                );
+                continue;
+            }
+
             // ① 命中映射：刷新活跃时间，非阻塞入队
             let existing = flows.lock().await.get(&addr).cloned();
             if let Some(entry) = existing {
@@ -416,6 +439,17 @@ impl UdpTunnel {
             return Ok(());
         }
 
+        // 流量上限：超限后不再新建子流（已有子流继续到自然结束）
+        if self.controls.flow_exceeded() {
+            let msg = format!(
+                "客户端 {} 流量已超限，拒绝新建 UDP 流",
+                self.cfg.client_id
+            );
+            self.set_error(&msg).await;
+            debug!("UDP 隧道 {} {msg}", self.cfg.id);
+            return Ok(());
+        }
+
         // 客户端离线：不建流，记录原因（不 panic、不泄漏名额）
         let mux = match bridge.get_tunnel(self.cfg.client_id).await {
             Some(m) => m,
@@ -484,15 +518,19 @@ impl UdpTunnel {
         // 上行：队列 -> mux。慢子流在这里 await，不阻塞 recv 循环。
         let up_bytes = entry.queued_bytes.clone();
         let up_tunnel = self.clone();
+        let up_throttle = Throttle::new(&self.controls, true);
         let mut up = Pump::new(tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
                 // 无论成功与否都释放排队字节额度（数据已出队）
                 let _ = up_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(data.len() as u64))
                 });
+                // 限速等待落在这里：只阻塞本子流的队列消费，不阻塞 recv 循环
+                up_throttle.gate(data.len()).await;
                 if send.send_data(&data).await.is_err() {
                     break;
                 }
+                up_throttle.count(data.len());
                 // 只统计真正写入 mux 的字节（对齐 Go `Flow.Add(len, 0)` 在 Write 之后）
                 up_tunnel
                     .bytes_to_client
@@ -509,6 +547,7 @@ impl UdpTunnel {
         let this = self.clone();
         let down_last = Arc::new(AtomicU64::new(now_millis()));
         let down_socket = socket.clone();
+        let down_throttle = Throttle::new(&self.controls, false);
         let mut down_cancel = cancel.clone();
         let mut down = Pump::new(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(IDLE_CHECK_INTERVAL);
@@ -520,9 +559,11 @@ impl UdpTunnel {
                             this.bytes_from_client
                                 .fetch_add(data.len() as u64, Ordering::Relaxed);
                             for chunk in data.chunks(UDP_WRITE_CHUNK) {
+                                down_throttle.gate(chunk.len()).await;
                                 if down_socket.send_to(chunk, addr).await.is_err() {
                                     return;
                                 }
+                                down_throttle.count(chunk.len());
                             }
                             touch(&down_last);
                         }

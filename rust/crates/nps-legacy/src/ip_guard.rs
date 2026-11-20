@@ -144,8 +144,10 @@ impl IpGuard {
         }
 
         // 滑动窗口：丢弃窗口外的旧失败
+        // 注意方向：`now.saturating_duration_since(front)` 才是「距今多久」，
+        // 反过来恒为 0（front 永远不晚于 now），会把窗口判定变成永不过期。
         while let Some(front) = r.failures.front() {
-            if front.saturating_duration_since(now) > cfg.window {
+            if now.saturating_duration_since(*front) > cfg.window {
                 r.failures.pop_front();
             } else {
                 break;
@@ -184,7 +186,7 @@ impl IpGuard {
             let recent_failure = r
                 .failures
                 .back()
-                .is_some_and(|f| f.saturating_duration_since(now) <= self.cfg.window);
+                .is_some_and(|f| now.saturating_duration_since(*f) <= self.cfg.window);
             in_cooldown || recent_failure
         });
     }

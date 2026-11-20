@@ -41,9 +41,10 @@
 //! let (addr, task) = http.bind_and_serve(shutdown_rx).await?;
 //! ```
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -60,6 +61,7 @@ use tracing::{debug, info, warn};
 use crate::config::{
     parse_addr, validate_host_port, HttpRoute, HttpSiteConfig as SiteConfig,
 };
+use crate::limit::{ClientControls, Throttle};
 
 /// 请求/响应头允许的最大字节数（含终止空行）
 pub const MAX_HEAD_BYTES: usize = 64 * 1024;
@@ -531,6 +533,9 @@ pub struct HttpSiteServer {
     max_head_bytes: usize,
     active_connections: Arc<AtomicU64>,
     served_requests: AtomicU64,
+    /// per-client 流控表（按站点归属客户端取）。`OnceLock` 让 `new()` 签名
+    /// 保持不变，接线方在启动前调用 [`Self::with_client_controls`] 注入。
+    controls: OnceLock<Arc<HashMap<i32, ClientControls>>>,
 }
 
 impl HttpSiteServer {
@@ -547,7 +552,24 @@ impl HttpSiteServer {
             max_head_bytes: config.max_head_bytes,
             active_connections: Arc::new(AtomicU64::new(0)),
             served_requests: AtomicU64::new(0),
+            controls: OnceLock::new(),
         }))
+    }
+
+    /// 注入 per-client 流控表（启动前调用；重复注入以第一次为准）。
+    ///
+    /// 返回 `Arc<Self>` 以便链式构造：`new(...)?.with_client_controls(map)`。
+    pub fn with_client_controls(
+        self: Arc<Self>,
+        controls: Arc<HashMap<i32, ClientControls>>,
+    ) -> Arc<Self> {
+        let _ = self.controls.set(controls);
+        self
+    }
+
+    /// 取某客户端的流控配置（未注入 / 未配置该客户端时为 `None`）
+    fn controls_for(&self, client_id: i32) -> Option<&ClientControls> {
+        self.controls.get().and_then(|m| m.get(&client_id))
     }
 
     /// 绑定 [`HttpProxyConfig::listen_addr`] 指定的端口。
@@ -711,6 +733,33 @@ impl HttpSiteServer {
                 return;
             };
 
+            // 准入：IP 白名单 → 流量上限（按站点归属客户端配置）。
+            //
+            // 必须放在 resolve 之后——resolve 前不知道 client_id。HTTPS 也走
+            // 本函数（tls.rs 回调），因此一处覆盖 HTTP 与 HTTPS 两条路径。
+            let controls = self.controls_for(site.client_id);
+            if let Some(ctl) = controls {
+                if !ctl.ip_allowed(peer.ip()) {
+                    debug!(
+                        "HTTP 域名代理: 站点 {} 拒绝未授权来源 IP {} ({peer})",
+                        site.domain,
+                        peer.ip()
+                    );
+                    self.served_requests.fetch_add(1, Ordering::Relaxed);
+                    let _ = send_error(&mut write_half, 403, "Forbidden").await;
+                    return;
+                }
+                if ctl.flow_exceeded() {
+                    warn!(
+                        "HTTP 域名代理: 客户端 {} 流量已超限，拒绝站点 {} 的请求 (from {peer})",
+                        site.client_id, site.domain
+                    );
+                    self.served_requests.fetch_add(1, Ordering::Relaxed);
+                    let _ = send_error(&mut write_half, 503, "Service Unavailable").await;
+                    return;
+                }
+            }
+
             let Some(_slot) = site.try_acquire(self.max_connections) else {
                 warn!(
                     "HTTP 域名代理: 站点 {} 并发超限 ({}), 拒绝 {}",
@@ -741,6 +790,7 @@ impl HttpSiteServer {
                     &site,
                     peer,
                     upgrade,
+                    controls,
                 )
                 .await;
 
@@ -780,11 +830,17 @@ impl HttpSiteServer {
         site: &ResolvedSite,
         peer: std::net::SocketAddr,
         upgrade: bool,
+        controls: Option<&ClientControls>,
     ) -> std::result::Result<Outcome, ServeError>
     where
         S: ChunkSource + Send + Unpin,
         W: tokio::io::AsyncWrite + Unpin + Send,
     {
+        // 方向约定与 tunnel.rs 一致：外部客户端 → 目标（写子流）是上行；
+        // 目标 → 外部客户端（写 write_half）是下行。
+        let up = Throttle::optional(controls, true);
+        let down = Throttle::optional(controls, false);
+
         // 升级请求用 tcp 子流：npc 只做 Dial + 双向拷贝，升级后的帧原样透传
         let conn_type = if upgrade { nps_proto::CONN_TCP } else { "http" };
         let (mut send, recv) = self
@@ -796,7 +852,7 @@ impl HttpSiteServer {
             })?;
 
         // 请求头原样写入子流
-        if send.send_data(head_bytes).await.is_err() {
+        if send_counted(&mut send, head_bytes, &up).await.is_err() {
             return Err(ServeError {
                 kind: ServeErrorKind::TargetFailed("写请求头到子流失败".into()),
                 response_started: false,
@@ -810,10 +866,13 @@ impl HttpSiteServer {
         // 那个中间响应会被跳过（客户端已经收到过）。
         let expect_continue = header_contains_token(&request.headers, "expect", "100-continue");
         if expect_continue {
-            if write_half
-                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-                .await
-                .is_err()
+            if write_counted(
+                write_half,
+                b"HTTP/1.1 100 Continue\r\n\r\n",
+                &down,
+            )
+            .await
+            .is_err()
             {
                 return Err(ServeError {
                     kind: ServeErrorKind::ClientGone,
@@ -825,8 +884,8 @@ impl HttpSiteServer {
         let body_framing = request.framing;
         let body_result = match body_framing {
             BodyFraming::None => Ok(()),
-            BodyFraming::Length(n) => forward_length(client, &mut send, n).await,
-            BodyFraming::Chunked => forward_chunked(client, &mut send).await,
+            BodyFraming::Length(n) => forward_length(client, &mut send, n, &up).await,
+            BodyFraming::Chunked => forward_chunked(client, &mut send, &up).await,
         };
         if let Err(e) = body_result {
             debug!("HTTP 域名代理: 转发请求体失败: {e}");
@@ -880,7 +939,7 @@ impl HttpSiteServer {
                 if parsed.status == 100 && expect_continue {
                     continue;
                 }
-                if write_half.write_all(&head).await.is_err() {
+                if write_counted(write_half, &head, &down).await.is_err() {
                     return Err(ServeError {
                         kind: ServeErrorKind::ClientGone,
                         response_started: true,
@@ -894,18 +953,18 @@ impl HttpSiteServer {
 
         // 101：握手完成，转为双向裸字节流
         if resp.status == 101 {
-            if write_half.write_all(&head).await.is_err() {
+            if write_counted(write_half, &head, &down).await.is_err() {
                 return Err(ServeError {
                     kind: ServeErrorKind::ClientGone,
                     response_started: true,
                 });
             }
             let _ = write_half.flush().await;
-            relay_bidirectional(client, write_half, &mut response, &mut send).await;
+            relay_bidirectional(client, write_half, &mut response, &mut send, &up, &down).await;
             return Ok(Outcome { keep_alive: false });
         }
 
-        if write_half.write_all(&head).await.is_err() {
+        if write_counted(write_half, &head, &down).await.is_err() {
             return Err(ServeError {
                 kind: ServeErrorKind::ClientGone,
                 response_started: true,
@@ -915,9 +974,9 @@ impl HttpSiteServer {
         let framing = response_framing(&resp, request.method.as_str());
         let body_ok = match framing {
             ResponseFraming::None => Ok(()),
-            ResponseFraming::Length(n) => copy_exact(&mut response, write_half, n).await,
-            ResponseFraming::Chunked => copy_chunked(&mut response, write_half).await,
-            ResponseFraming::UntilClose => copy_until_eof(&mut response, write_half).await,
+            ResponseFraming::Length(n) => copy_exact(&mut response, write_half, n, &down).await,
+            ResponseFraming::Chunked => copy_chunked(&mut response, write_half, &down).await,
+            ResponseFraming::UntilClose => copy_until_eof(&mut response, write_half, &down).await,
         };
         if let Err(e) = body_ok {
             debug!("HTTP 域名代理: 转发响应体失败: {e}");
@@ -1487,6 +1546,7 @@ async fn forward_length<S>(
     client: &mut Buffered<S>,
     send: &mut MuxSendHalf,
     length: u64,
+    throttle: &Throttle,
 ) -> std::result::Result<(), HttpError>
 where
     S: ChunkSource + Send + Unpin,
@@ -1499,7 +1559,7 @@ where
             return Err(HttpError::Eof);
         }
         remaining -= chunk.len() as u64;
-        if send.send_data(&chunk).await.is_err() {
+        if send_counted(send, &chunk, throttle).await.is_err() {
             return Err(HttpError::Malformed("写子流失败"));
         }
     }
@@ -1510,6 +1570,7 @@ where
 async fn forward_chunked<S>(
     client: &mut Buffered<S>,
     send: &mut MuxSendHalf,
+    throttle: &Throttle,
 ) -> std::result::Result<(), HttpError>
 where
     S: ChunkSource + Send + Unpin,
@@ -1517,7 +1578,7 @@ where
     loop {
         let line = client.read_line(8 * 1024).await?;
         let size = parse_chunk_size(&line)?;
-        if send.send_data(&line).await.is_err() {
+        if send_counted(send, &line, throttle).await.is_err() {
             return Err(HttpError::Malformed("写子流失败"));
         }
         if size == 0 {
@@ -1525,7 +1586,7 @@ where
             loop {
                 let trailer = client.read_line(MAX_HEAD_BYTES).await?;
                 let empty = trailer.iter().all(|b| matches!(b, b'\r' | b'\n'));
-                if send.send_data(&trailer).await.is_err() {
+                if send_counted(send, &trailer, throttle).await.is_err() {
                     return Err(HttpError::Malformed("写子流失败"));
                 }
                 if empty {
@@ -1541,7 +1602,7 @@ where
                 return Err(HttpError::Eof);
             }
             remaining -= chunk.len() as u64;
-            if send.send_data(&chunk).await.is_err() {
+            if send_counted(send, &chunk, throttle).await.is_err() {
                 return Err(HttpError::Malformed("写子流失败"));
             }
         }
@@ -1550,7 +1611,7 @@ where
         if crlf.len() > 2 {
             return Err(HttpError::Malformed("chunk 数据后缺少 CRLF"));
         }
-        if send.send_data(&crlf).await.is_err() {
+        if send_counted(send, &crlf, throttle).await.is_err() {
             return Err(HttpError::Malformed("写子流失败"));
         }
     }
@@ -1572,6 +1633,7 @@ async fn copy_exact<S, W>(
     src: &mut Buffered<S>,
     dst: &mut W,
     length: u64,
+    throttle: &Throttle,
 ) -> std::result::Result<(), HttpError>
 where
     S: ChunkSource + Send + Unpin,
@@ -1585,7 +1647,7 @@ where
             return Err(HttpError::Eof);
         }
         remaining -= chunk.len() as u64;
-        if dst.write_all(&chunk).await.is_err() {
+        if write_counted(dst, &chunk, throttle).await.is_err() {
             return Err(HttpError::Malformed("写客户端失败"));
         }
     }
@@ -1596,6 +1658,7 @@ where
 async fn copy_chunked<S, W>(
     src: &mut Buffered<S>,
     dst: &mut W,
+    throttle: &Throttle,
 ) -> std::result::Result<(), HttpError>
 where
     S: ChunkSource + Send + Unpin,
@@ -1604,14 +1667,14 @@ where
     loop {
         let line = src.read_line(8 * 1024).await?;
         let size = parse_chunk_size(&line)?;
-        if dst.write_all(&line).await.is_err() {
+        if write_counted(dst, &line, throttle).await.is_err() {
             return Err(HttpError::Malformed("写客户端失败"));
         }
         if size == 0 {
             loop {
                 let trailer = src.read_line(MAX_HEAD_BYTES).await?;
                 let empty = trailer.iter().all(|b| matches!(b, b'\r' | b'\n'));
-                if dst.write_all(&trailer).await.is_err() {
+                if write_counted(dst, &trailer, throttle).await.is_err() {
                     return Err(HttpError::Malformed("写客户端失败"));
                 }
                 if empty {
@@ -1627,7 +1690,7 @@ where
                 return Err(HttpError::Eof);
             }
             remaining -= chunk.len() as u64;
-            if dst.write_all(&chunk).await.is_err() {
+            if write_counted(dst, &chunk, throttle).await.is_err() {
                 return Err(HttpError::Malformed("写客户端失败"));
             }
         }
@@ -1635,7 +1698,7 @@ where
         if crlf.len() > 2 {
             return Err(HttpError::Malformed("chunk 数据后缺少 CRLF"));
         }
-        if dst.write_all(&crlf).await.is_err() {
+        if write_counted(dst, &crlf, throttle).await.is_err() {
             return Err(HttpError::Malformed("写客户端失败"));
         }
     }
@@ -1645,6 +1708,7 @@ where
 async fn copy_until_eof<S, W>(
     src: &mut Buffered<S>,
     dst: &mut W,
+    throttle: &Throttle,
 ) -> std::result::Result<(), HttpError>
 where
     S: ChunkSource + Send + Unpin,
@@ -1655,7 +1719,7 @@ where
         if chunk.is_empty() {
             return Ok(());
         }
-        if dst.write_all(&chunk).await.is_err() {
+        if write_counted(dst, &chunk, throttle).await.is_err() {
             return Err(HttpError::Malformed("写客户端失败"));
         }
     }
@@ -1667,13 +1731,15 @@ async fn relay_bidirectional<S, W>(
     client_out: &mut W,
     target: &mut Buffered<MuxRecvHalf>,
     target_out: &mut MuxSendHalf,
+    up: &Throttle,
+    down: &Throttle,
 ) where
     S: ChunkSource + Send + Unpin,
     W: tokio::io::AsyncWrite + Unpin + Send,
 {
-    let up = async {
+    let up_fut = async {
         let buffered = client.take_buffered();
-        if !buffered.is_empty() && target_out.send_data(&buffered).await.is_err() {
+        if !buffered.is_empty() && send_counted(target_out, &buffered, up).await.is_err() {
             return;
         }
         loop {
@@ -1681,14 +1747,14 @@ async fn relay_bidirectional<S, W>(
             if chunk.is_empty() {
                 return;
             }
-            if target_out.send_data(&chunk).await.is_err() {
+            if send_counted(target_out, &chunk, up).await.is_err() {
                 return;
             }
         }
     };
-    let down = async {
+    let down_fut = async {
         let buffered = target.take_buffered();
-        if !buffered.is_empty() && client_out.write_all(&buffered).await.is_err() {
+        if !buffered.is_empty() && write_counted(client_out, &buffered, down).await.is_err() {
             return;
         }
         loop {
@@ -1696,16 +1762,43 @@ async fn relay_bidirectional<S, W>(
             if chunk.is_empty() {
                 return;
             }
-            if client_out.write_all(&chunk).await.is_err() {
+            if write_counted(client_out, &chunk, down).await.is_err() {
                 return;
             }
             let _ = client_out.flush().await;
         }
     };
     tokio::select! {
-        _ = up => {},
-        _ = down => {},
+        _ = up_fut => {},
+        _ = down_fut => {},
     }
+}
+
+/// 写客户端前申请配额、写成功后记账（下行方向）。
+async fn write_counted<W>(
+    dst: &mut W,
+    data: &[u8],
+    throttle: &Throttle,
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    throttle.gate(data.len()).await;
+    dst.write_all(data).await?;
+    throttle.count(data.len());
+    Ok(())
+}
+
+/// 写 mux 子流前申请配额、写成功后记账（上行方向）。
+async fn send_counted(
+    send: &mut MuxSendHalf,
+    data: &[u8],
+    throttle: &Throttle,
+) -> std::result::Result<(), ()> {
+    throttle.gate(data.len()).await;
+    send.send_data(data).await.map_err(|_| ())?;
+    throttle.count(data.len());
+    Ok(())
 }
 
 async fn send_error<W>(w: &mut W, status: u16, reason: &str) -> io::Result<()>

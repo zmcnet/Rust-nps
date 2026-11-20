@@ -141,16 +141,35 @@ impl Server {
             }
             client_wraps.insert(c.id, wrap);
         }
-        let mut client_rates: HashMap<i32, Arc<crate::limit::TokenBucket>> = HashMap::new();
-        let mut client_flows: HashMap<i32, Arc<crate::limit::FlowCounter>> = HashMap::new();
+        // 一张表覆盖全部转发路径：静态 TCP / conf 注册 / UDP / SOCKS5 /
+        // HTTP(S) 站点 / file / secret 都从这里取同一份 per-client 配额。
+        // 空表项 = 该客户端未配流控（Default 为「不限速、不限流量、白名单为空」）。
+        let mut controls_map: HashMap<i32, crate::limit::ClientControls> = HashMap::new();
         for c in &config.clients {
+            let mut ctl = crate::limit::ClientControls {
+                ip_allow: ip_allow.clone(),
+                ..Default::default()
+            };
             if c.rate_limit > 0 {
-                client_rates.insert(c.id, Arc::new(crate::limit::TokenBucket::new(c.rate_limit)));
+                ctl.rate = Some(Arc::new(crate::limit::TokenBucket::new(c.rate_limit)));
             }
             if c.flow_limit > 0 {
-                client_flows.insert(c.id, Arc::new(crate::limit::FlowCounter::new(c.flow_limit)));
+                ctl.flow = Some(Arc::new(crate::limit::FlowCounter::new(c.flow_limit)));
             }
+            controls_map.insert(c.id, ctl);
         }
+        let controls_map = Arc::new(controls_map);
+        // 取某客户端的流控组合；表中没有（理论上不会，vkey 鉴权已限定客户端）
+        // 时退化为「全局白名单 + 不限速」。
+        let ctl_for = |client_id: i32| {
+            controls_map
+                .get(&client_id)
+                .cloned()
+                .unwrap_or_else(|| crate::limit::ClientControls {
+                    ip_allow: ip_allow.clone(),
+                    ..Default::default()
+                })
+        };
         for c in config.clients.iter().filter(|c| c.rate_limit > 0) {
             info!("客户端 {} 限速 {} KB/s", c.id, c.rate_limit);
         }
@@ -218,16 +237,83 @@ impl Server {
                     .get(&cfg.client_id)
                     .copied()
                     .unwrap_or(crate::crypt::StreamWrap::Plain);
+                let ctl = ctl_for(cfg.client_id);
                 Arc::new(Tunnel::with_controls(
                     cfg.clone(),
                     pool,
-                    client_rates.get(&cfg.client_id).cloned(),
-                    client_flows.get(&cfg.client_id).cloned(),
-                    ip_allow.clone(),
+                    ctl.rate,
+                    ctl.flow,
+                    ctl.ip_allow,
                     wrap,
                 ))
             })
             .collect();
+
+        // ---- tcpTrans（透明代理，仅 Linux；原版 Windows 同样是空实现）----
+        //
+        // 与普通隧道共用同一张 Tunnel 表：快照 / 启停 / 流量持久化 / conf 的
+        // id 分配全部一致对待，不引入第二套实现。不支持的平台上配置了该
+        // 隧道时不绑定监听（enabled=false + 明确的 last_error），其余平台
+        // 不受影响。
+        let transparent_supported = crate::transparent::supported();
+        let mut tcp_trans_tunnels: Vec<Arc<Tunnel>> = Vec::new();
+        for cfg in &config.tcp_trans_tunnels {
+            let ctl = ctl_for(cfg.client_id);
+            let wrap = client_wraps
+                .get(&cfg.client_id)
+                .copied()
+                .unwrap_or(crate::crypt::StreamWrap::Plain);
+            let mut tcp_cfg = crate::config::TcpTunnelConfig {
+                id: cfg.id,
+                name: cfg.name.clone(),
+                client_id: cfg.client_id,
+                listen_addr: cfg.listen_addr.clone(),
+                // 透明模式不使用该字段；快照里显示占位说明
+                target_addr: "（原始目标由 SO_ORIGINAL_DST 决定）".into(),
+                enabled: cfg.enabled,
+                target_addrs: Vec::new(),
+                health_check: None,
+            };
+            if !transparent_supported {
+                if cfg.enabled {
+                    warn!(
+                        "tcpTrans 隧道 {} ({}) 无法启用：当前平台不支持 SO_ORIGINAL_DST（tcpTrans 仅 Linux 可用，原版 Windows 同样是空实现）",
+                        cfg.id, cfg.name
+                    );
+                }
+                tcp_cfg.enabled = false;
+                let t = Arc::new(Tunnel::with_transparent(
+                    tcp_cfg,
+                    ctl.rate,
+                    ctl.flow,
+                    ctl.ip_allow,
+                    wrap,
+                ));
+                t.mark_error(crate::transparent::OriginalDst::Unsupported.describe())
+                    .await;
+                tcp_trans_tunnels.push(t);
+                continue;
+            }
+            if cfg.enabled {
+                info!(
+                    "tcpTrans 隧道 {} ({}) 监听 {}（需 iptables REDIRECT 指入）",
+                    cfg.id, cfg.name, cfg.listen_addr
+                );
+            }
+            tcp_trans_tunnels.push(Arc::new(Tunnel::with_transparent(
+                tcp_cfg,
+                ctl.rate,
+                ctl.flow,
+                ctl.ip_allow,
+                wrap,
+            )));
+        }
+        // tcpTrans 与静态隧道共用一张表
+        let static_tunnels: Vec<Arc<Tunnel>> = {
+            let mut all = static_tunnels;
+            all.extend(tcp_trans_tunnels);
+            all
+        };
 
         // 动态隧道 id 从静态隧道最大 id + 1 起分配，避免与管理端可见 id 冲突
         let first_dynamic_id = match static_tunnels.iter().map(|t| t.id()).max() {
@@ -297,6 +383,7 @@ impl Server {
         bridge.set_secret_handler(Arc::new(SecretSink {
             bridge: bridge.clone(),
             registry: secrets.clone(),
+            controls: controls_map.clone(),
         }));
 
         // ---- p2p 会合服务（仅信令；原版需要**三个连续端口**）----
@@ -332,7 +419,8 @@ impl Server {
                 .unwrap_or_else(|| "127.0.0.1:0".to_owned());
             let proxy_cfg =
                 crate::http_site::HttpProxyConfig::from_server_config(&config, &listen_for_cfg);
-            let server = crate::http_site::HttpSiteServer::new(bridge.clone(), proxy_cfg)?;
+            let server = crate::http_site::HttpSiteServer::new(bridge.clone(), proxy_cfg)?
+                .with_client_controls(controls_map.clone());
 
             match config.http_listen_addr.as_deref() {
                 Some(addr) => {
@@ -457,6 +545,7 @@ impl Server {
                 file_tunnels_for_conf.clone(),
                 file_channels.clone(),
                 verify,
+                controls_map.clone(),
                 listen_host,
                 config.conf_max_tunnels,
                 first_dynamic_id,
@@ -491,7 +580,7 @@ impl Server {
         // ---- 6. UDP 隧道：先全部绑定，失败则整体回滚 ----
         let mut udp_bound: Vec<(Arc<crate::udp::UdpTunnel>, tokio::net::UdpSocket)> = Vec::new();
         for cfg in config.udp_tunnels.iter().filter(|t| t.enabled) {
-            let t = Arc::new(crate::udp::UdpTunnel::new(cfg.clone()));
+            let t = Arc::new(crate::udp::UdpTunnel::new(cfg.clone()).with_client_controls(ctl_for(cfg.client_id)));
             match t.bind().await {
                 Ok(socket) => udp_bound.push((t, socket)),
                 Err(e) => {
@@ -522,7 +611,10 @@ impl Server {
             TcpListener,
         )> = Vec::new();
         for cfg in config.socks5_listeners.iter().filter(|s| s.enabled) {
-            let s = Arc::new(crate::socks5::Socks5Server::new(cfg.clone(), bridge.clone()));
+            let s = Arc::new(
+                crate::socks5::Socks5Server::new(cfg.clone(), bridge.clone())
+                    .with_client_controls(ctl_for(cfg.client_id)),
+            );
             match s.bind().await {
                 Ok(listener) => socks5_bound.push((s, listener)),
                 Err(e) => {
@@ -555,9 +647,13 @@ impl Server {
             tokio::net::TcpListener,
         )> = Vec::new();
         for cfg in config.file_tunnels.iter().filter(|t| t.enabled) {
-            let t = Arc::new(crate::file_service::FileTunnel::with_registry(
+            let ctl = ctl_for(cfg.client_id);
+            let t = Arc::new(crate::file_service::FileTunnel::with_controls(
                 cfg.clone(),
                 file_channels.clone(),
+                ctl.rate,
+                ctl.flow,
+                ctl.ip_allow,
             ));
             match t.bind().await {
                 Ok(listener) => file_bound.push((t, listener)),
@@ -961,6 +1057,8 @@ impl nps_legacy::bridge::FileChannelHandler for FileChannelSink {
 struct SecretSink {
     bridge: Bridge,
     registry: Arc<crate::secret::SecretRegistry>,
+    /// per-client 流控（secret 的中转流量同样受 rate/flow 约束）
+    controls: Arc<HashMap<i32, crate::limit::ClientControls>>,
 }
 
 impl nps_legacy::bridge::SecretHandler for SecretSink {
@@ -972,10 +1070,12 @@ impl nps_legacy::bridge::SecretHandler for SecretSink {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         let bridge = self.bridge.clone();
         let registry = self.registry.clone();
+        let controls = self.controls.clone();
         Box::pin(async move {
             crate::secret::handle_secret_connection(
                 bridge,
                 registry,
+                controls,
                 client_id,
                 password_md5,
                 stream,

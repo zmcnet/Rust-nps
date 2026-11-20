@@ -8,11 +8,13 @@
 //!   SOCKS5 / 文件 / secret / p2p 会合信令 / conf 配置注册
 //!
 //! # 能力边界
-//! 原版 8 个 mode 中 7 个已完整实现，逐项证据见 `docs/PHASE2-ACCEPTANCE.md`。
-//! 已知的实现边界：
-//! - `tcpTrans` 仅有 [`transparent::original_dst`] 探测层（仅 Linux），
-//!   **未接入任何转发路径**
-//! - 限速 / 流量上限 / IP 白名单目前只作用于 TCP 隧道转发路径
+//! 原版 8 个 mode 已全部实现（`tcpTrans` 仅 Linux，与原版一致），逐项证据见
+//! `docs/PHASE2-ACCEPTANCE.md`。已知的实现边界：
+//! - 限速 / 流量上限 / IP 白名单作用于全部转发路径（TCP / conf 注册 / UDP /
+//!   SOCKS5 / HTTP(S) 站点 / file / secret），per-client 一份配额
+//! - `SOCKS5` / `UDP` / `HTTP` / `secret` 路径的 Link 帧未携带客户端的
+//!   crypt/compress 标志（数据按明文转发；TCP 隧道会带真值）
+//! - `FlowCounter`（流量上限计数）不持久化：重启后 `flow_limit` 已用量归零
 //! - `conf` 注册支持 `task`（tcp/udp/file）、`host`（站点）与 `stus` 查询；
 //!   `rgst` / `p2pm` 未实现
 //! - 注册隧道只存内存：重启即失效，不做持久化
@@ -45,7 +47,7 @@ pub mod udp;
 
 pub use config::{
     ClientConfig, HttpRoute, HttpSiteConfig, ServerConfig, Socks5Config, Socks5User,
-    TcpTunnelConfig, TlsMode, UdpTunnelConfig,
+    TcpTransTunnelConfig, TcpTunnelConfig, TlsMode, UdpTunnelConfig,
 };
 pub use acme::{
     AcmeClient, AcmeConfig, AcmeError, AcmeErrorKind, AcmeEvent, AcmeEvents, AcmeProvider,
@@ -71,7 +73,7 @@ pub use target::{
     HealthCheckConfig, HealthCheckKind, HealthChecker, HealthState, TargetError, TargetPool,
     DEFAULT_HEALTH_INTERVAL, DEFAULT_HEALTH_MAX_FAILED, DEFAULT_HEALTH_TIMEOUT,
 };
-pub use limit::{FlowCounter, IpAllowList, TokenBucket, BYTES_PER_KB};
+pub use limit::{ClientControls, FlowCounter, IpAllowList, Throttle, TokenBucket, BYTES_PER_KB};
 pub use file_service::{
     target_health_details, FileChannelRegistry, FileTunnel, FileTunnelConfig, TargetHealthDetail,
 };

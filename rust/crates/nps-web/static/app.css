@@ -159,11 +159,6 @@ input[type="radio"] {
   display: block;
 }
 
-.brand-mark span::before,
-.brand-mark span::after {
-  content: none;
-}
-
 .brand-text {
   display: flex;
   flex-direction: column;

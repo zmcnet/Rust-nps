@@ -1,6 +1,237 @@
 {
-  "bridge_addr": "127.0.0.1:8024",
-  "web_addr": "127.0.0.1:8080",
-  "clients": [],
-  "tunnels": []
+  "_notes": {
+    "about": "rnps 服务端配置模板：一份合法 JSON，覆盖 ServerConfig 的全部顶层字段与每种子结构的代表性写法。复制后按需修改；以 \"_\" 开头的键（_notes / _comment）只是说明文字，解析时被忽略，可整段删除。字段权威定义见 rust/crates/nps-server/src/config.rs。",
+    "token_via_env": "ServerConfig 没有 admin_token 字段：管理端令牌只通过环境变量 NPS_ADMIN_TOKEN 传入，不写进配置文件、不落库。",
+    "web_login": "顶层 web_username / web_password 是明文配置项（与原版一致），二者同时非空时可通过 /api/auth/login 登录管理面（权限等同超级管理员）；二者为空则只能用 NPS_ADMIN_TOKEN。客户端级 web_username / web_password 登录后只能看到本客户端自己的隧道，二者都为空时回退为 user + vkey（与原版一致）。",
+    "vkey": "每个客户端的 vkey 必须显式配置：不能为空，不允许 123 / 123456 / password / vkey 这类默认值，客户端之间不得重复。桥握手只比较 md5(vkey)，明文 vkey 不会进入运行态。",
+    "certificates": "产品硬约束：证书绝不自动申请。配置 acme 段或把站点 tls_mode 设为 acme 都不会发起任何证书请求——首次签发必须由用户在管理端显式触发；auto_renew 只影响已签发证书的续期，设为 false 时程序绝不主动连网。",
+    "addresses": "listen_addr / *_listen_addr / p2p_listen_addr 必须是 IP 字面量 + 端口（启动时不做 DNS）；target_addr / target_addrs 允许域名。示例统一用 127.0.0.1 + 6xxxx 高位端口，公网部署时按需改为 0.0.0.0 或内网地址。",
+    "ip_limit": "来源 IP 白名单：条目为单个 IP 或 CIDR（如 192.168.1.0/24），空数组 = 不限制。示例放行本机回环与 192.168.1.0/24 网段。目前只作用于 TCP 隧道转发路径。",
+    "limits": "rate_limit 单位 KB/s（该客户端全部隧道共享一个配额）；flow_limit 单位 KB（累计），0 = 不限。flow_store_interval 是累计流量落盘间隔（分钟），0 = 不落盘。限速 / 流量上限目前只作用于 TCP 隧道转发路径。",
+    "conf_mode": "conf_register 控制是否接受老 npc 的配置文件模式注册（conf 连接）。默认 false——这是攻击面：开启后任意客户端可申请监听端口，受 conf_max_tunnels（1..=4096，含配置内静态隧道）约束，监听 IP 由 conf_listen_host 决定（默认 0.0.0.0，即全部网卡），且注册隧道只存内存、重启即失效。关闭时收到 conf 连接会被立即关闭。"
+  },
+
+  "bridge_addr": "127.0.0.1:61024",
+  "web_addr": "127.0.0.1:61880",
+
+  "clients": [
+    {
+      "_comment": "rate_limit = 该客户端全部隧道共享的总带宽上限（KB/s）；flow_limit = 累计流量上限（KB）。crypt（自签 TLS 加密）优先于 compress：两者同时为 true 时只做 crypt。web_username / web_password 是该客户端的受限 Web 登录账号。",
+      "id": 1,
+      "name": "office-gateway",
+      "vkey": "b7f3c9e2-4d1a-4f6b-9c8e-1a2d3f4b5c6d",
+      "rate_limit": 1024,
+      "flow_limit": 1048576,
+      "crypt": true,
+      "compress": false,
+      "web_username": "office-admin",
+      "web_password": "change-me-office-pw"
+    },
+    {
+      "id": 2,
+      "name": "home-nas",
+      "vkey": "5e9a1d47-8c2b-4e3f-a6d9-7b0c1e2f3a4b",
+      "rate_limit": 0,
+      "flow_limit": 0,
+      "crypt": false,
+      "compress": true,
+      "web_username": null,
+      "web_password": null
+    },
+    {
+      "id": 3,
+      "name": "edge-node",
+      "vkey": "c3d8f1e6-2a7b-4d5c-8e9f-0b1a2c3d4e5f",
+      "rate_limit": 256,
+      "flow_limit": 0,
+      "crypt": false,
+      "compress": false,
+      "web_username": null,
+      "web_password": null
+    }
+  ],
+
+  "tunnels": [
+    {
+      "id": 1,
+      "name": "ssh",
+      "client_id": 1,
+      "listen_addr": "127.0.0.1:61022",
+      "target_addr": "127.0.0.1:22",
+      "enabled": true,
+      "target_addrs": [],
+      "health_check": null
+    },
+    {
+      "_comment": "target_addrs（多目标）优先于 target_addr；health_check 的 timeout_secs / interval_secs / max_failed 必须 > 0，kind 可省略（缺省按 http）或填 tcp / http，http_url 仅 http 检查使用（缺省 /）。",
+      "id": 2,
+      "name": "web-farm",
+      "client_id": 1,
+      "listen_addr": "127.0.0.1:61280",
+      "target_addr": "192.168.1.10:8080",
+      "enabled": true,
+      "target_addrs": ["192.168.1.10:8080", "192.168.1.11:8080", "192.168.1.12:8080"],
+      "health_check": {
+        "timeout_secs": 3,
+        "max_failed": 3,
+        "interval_secs": 10,
+        "kind": "http",
+        "http_url": "/healthz"
+      }
+    },
+    {
+      "_comment": "enabled=false 时不监听（端口不占用），也不参与监听地址冲突检查。",
+      "id": 3,
+      "name": "db-primary",
+      "client_id": 2,
+      "listen_addr": "127.0.0.1:65432",
+      "target_addr": "192.168.1.20:5432",
+      "enabled": false,
+      "target_addrs": [],
+      "health_check": {
+        "timeout_secs": 3,
+        "max_failed": 5,
+        "interval_secs": 15,
+        "kind": "tcp",
+        "http_url": ""
+      }
+    }
+  ],
+
+  "conf_register": false,
+  "conf_max_tunnels": 32,
+  "conf_listen_host": "0.0.0.0",
+
+  "udp_tunnels": [
+    {
+      "_comment": "服务端在 listen_addr 上监听 UDP，每个来源地址 (ip:port) 一条独立子流；idle_timeout_secs（来源空闲回收秒数）与 max_sessions（最大并发来源数）都必须 > 0。",
+      "id": 10,
+      "name": "dns-upstream",
+      "client_id": 2,
+      "listen_addr": "127.0.0.1:61053",
+      "target_addr": "192.168.1.20:53",
+      "enabled": true,
+      "idle_timeout_secs": 600,
+      "max_sessions": 512
+    }
+  ],
+
+  "http_sites": [
+    {
+      "id": 20,
+      "name": "blog",
+      "client_id": 1,
+      "domain": "blog.example.com",
+      "target_addr": "192.168.1.30:3000",
+      "routes": [
+        { "prefix": "/api", "target_addr": "192.168.1.30:3001" }
+      ],
+      "websocket": true,
+      "enabled": true,
+      "tls_mode": "off",
+      "force_https": false
+    },
+    {
+      "_comment": "tls_mode 四个取值：off（默认，纯 HTTP）/ upload（使用管理端上传的证书）/ self-signed（启动时自签，仅测试）/ acme（由用户在管理端显式触发签发，绝不自动申请）。域名不含端口与路径，按 Host 头大小写不敏感匹配；routes 按最长前缀匹配，前缀必须以 / 开头。force_https 仅在 tls_mode != off 时有意义。",
+      "id": 21,
+      "name": "docs",
+      "client_id": 2,
+      "domain": "docs.example.com",
+      "target_addr": "192.168.1.40:4000",
+      "routes": [],
+      "websocket": true,
+      "enabled": true,
+      "tls_mode": "acme",
+      "force_https": true
+    }
+  ],
+
+  "http_listen_addr": "127.0.0.1:61800",
+  "https_listen_addr": "127.0.0.1:61443",
+
+  "web_username": "admin",
+  "web_password": "change-me-web-admin-pw",
+
+  "cert_dir": null,
+
+  "acme": {
+    "_comment": "存在本段绝不等于自动申请证书：首次签发永远由用户在管理端显式触发。provider 可选 letsencrypt（默认）/ letsencrypt-staging / zerossl，或写成 {\"custom\": \"<directory-url>\"}（如 Pebble 测试服）；challenge 可选 http-01（默认）/ tls-alpn-01 / dns-01（通配符证书必须用 dns-01 并配 dns_provider）。http-01 实际签发时必须能从公网访问 80 端口。",
+    "provider": "letsencrypt",
+    "contact_email": "ops@example.com",
+    "challenge": "http-01",
+    "auto_renew": true,
+    "renew_before_days": 30,
+    "public_ip": "203.0.113.7",
+    "http_bind": "0.0.0.0:80",
+    "public_http_port": 80,
+    "tls_bind": "0.0.0.0:443",
+    "public_tls_port": 443,
+    "manage_http_responder": true,
+    "dns_provider": null,
+    "dns_propagation_secs": 30,
+    "use_public_roots": true,
+    "extra_trust_roots": [],
+    "preflight_port_check": true,
+    "preflight_timeout_secs": 5,
+    "challenge_timeout_secs": 300
+  },
+
+  "data_dir": null,
+
+  "ip_limit": ["127.0.0.0/8", "192.168.1.0/24"],
+
+  "flow_store_interval": 5,
+
+  "file_tunnels": [
+    {
+      "_comment": "文件模式：npc 在自己的 local_path 上起 HTTP 文件服务，服务端只在 listen_addr 提供入口。target_addr / local_path / strip_pre 仅用于快照与管理端展示，服务端不访问这些路径。",
+      "id": 30,
+      "name": "share",
+      "client_id": 1,
+      "listen_addr": "127.0.0.1:61900",
+      "enabled": true,
+      "target_addr": "",
+      "local_path": "/srv/share",
+      "strip_pre": "/files"
+    }
+  ],
+
+  "secret_tunnels": [
+    {
+      "_comment": "secret 隧道拓扑与普通隧道相反：客户端在自己侧监听端口，服务端只按 md5(password) 配对，因此没有 listen_addr 字段。password 不能为空且各 secret 隧道之间不得重复。",
+      "id": 40,
+      "name": "secret-ssh",
+      "client_id": 1,
+      "password": "sT9xQ2mV-7wYp-3nRk-4zLc",
+      "target_addr": "127.0.0.1:22",
+      "enabled": true
+    }
+  ],
+
+  "p2p_listen_addr": "127.0.0.1:61901",
+
+  "socks5_listeners": [
+    {
+      "_comment": "users 为空数组 = 只允许无认证连接；配置用户名密码（RFC 1929）时要求非空、不超过 255 字节、同一监听内用户名不重复。",
+      "id": 50,
+      "name": "socks5-out",
+      "client_id": 2,
+      "listen_addr": "127.0.0.1:61080",
+      "users": [
+        { "username": "alice", "password": "change-me-alice-pw" }
+      ],
+      "enabled": true
+    }
+  ],
+
+  "tcp_trans_tunnels": [
+    {
+      "_comment": "tcpTrans 透明代理（对应原版 mode=tcpTrans）：仅 Linux，配合 iptables REDIRECT 使用（--to-ports 指向 listen_addr）。id 不得与 TCP 隧道重复。",
+      "id": 60,
+      "name": "transparent-proxy",
+      "client_id": 1,
+      "listen_addr": "127.0.0.1:61611",
+      "enabled": true
+    }
+  ]
 }

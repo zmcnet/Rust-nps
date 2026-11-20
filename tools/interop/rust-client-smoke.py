@@ -358,9 +358,11 @@ def check_cli_and_unreachable(npsc: Path, checks: Checks, log_dir: Path,
     run_cli(checks,
             [str(npsc), "-vkey=" + secret, "-type=tcp"],
             work_dir, work_dir, "[cli] missing -server", 2)
+    # 无法解析的主机名归为「服务端不可达」类：与关闭端口同一退出码 3
+    # （rnpc cli.rs 的 EXIT_UNREACHABLE，client.rs::exit_code 有单测锁定）
     run_cli(checks,
             [str(npsc), "-server=not-an-address", "-vkey=" + secret],
-            work_dir, work_dir, "[cli] invalid server address", 2)
+            work_dir, work_dir, "[cli] invalid server address", 3)
 
     # Closed loopback port: must fail fast with the dedicated unreachable code.
     closed = free_port()

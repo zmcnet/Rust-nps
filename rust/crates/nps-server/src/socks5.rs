@@ -53,6 +53,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, trace, warn};
 
 use crate::config::Socks5Config;
+use crate::limit::{ClientControls, Throttle};
 
 /// SOCKS 协议版本
 pub const SOCKS_VERSION: u8 = 0x05;
@@ -200,6 +201,8 @@ pub struct Socks5Server {
     /// 保留一个接收端保证 `shutdown()` 任何时刻调用都能生效。
     _close_keepalive: watch::Receiver<bool>,
     accept_task: Mutex<Option<JoinHandle<()>>>,
+    /// per-client 流控：与同客户端的 TCP / UDP / HTTP 等路径共享配额
+    controls: ClientControls,
 }
 
 impl std::fmt::Debug for Socks5Server {
@@ -248,7 +251,16 @@ impl Socks5Server {
             close_tx,
             _close_keepalive: close_keepalive,
             accept_task: Mutex::new(None),
+            controls: ClientControls::default(),
         }
+    }
+
+    /// 带上 per-client 流控构造（`server.rs` 接线用）。
+    ///
+    /// 未调用时等价于「不限速、不限流量、白名单为空（全部允许）」。
+    pub fn with_client_controls(mut self, controls: ClientControls) -> Self {
+        self.controls = controls;
+        self
     }
 
     /// 设置并发连接上限（`0` 会被钳成 1，避免"永远拒绝"的配置）。
@@ -369,6 +381,17 @@ impl Socks5Server {
 
     async fn handle_conn(self: Arc<Self>, mut stream: TcpStream, peer: SocketAddr) {
         if self.is_closing() {
+            return;
+        }
+        // 准入：IP 白名单。在协商之前拒绝，且不写任何应答字节——
+        // 未授权来源不该从握手细节里获得任何信息（与 tunnel.rs 语义一致）。
+        if !self.controls.ip_allowed(peer.ip()) {
+            debug!(
+                "SOCKS5 {}: 拒绝未授权来源 IP {} ({peer})",
+                self.cfg.name,
+                peer.ip()
+            );
+            let _ = stream.shutdown().await;
             return;
         }
         // 并发上限：超限直接关闭（对齐 Go `CheckFlowAndConnNum` 的拒绝语义）
@@ -597,6 +620,17 @@ impl Socks5Server {
         let target = request.target.to_host_port();
         let bnd = local_bnd(&stream);
 
+        // 0. 流量上限：在建流之前拒绝，避免白白消耗 npc 侧的目标连接。
+        //    用 REP=0x02（规则不允许），语义比「一般性失败」准确。
+        if self.controls.flow_exceeded() {
+            warn!(
+                "SOCKS5: 客户端 {} 流量已超限，拒绝 {} -> {}（REP=2）",
+                self.cfg.client_id, peer, target
+            );
+            let _ = write_reply(&mut stream, reply::NOT_ALLOWED, bnd).await;
+            return;
+        }
+
         // 1. 取该客户端的 mux 会话：离线 -> REP=1
         let mux = match self.bridge.get_tunnel(self.cfg.client_id).await {
             Some(mux) => mux,
@@ -657,8 +691,15 @@ impl Socks5Server {
 
         // 5. 双向转发：两个独立泵，任一结束即终止另一侧
         let (rd, wr) = stream.into_split();
-        let mut up = tokio::spawn(pump_client_to_mux(rd, send, close_rx.clone()));
-        let mut down = tokio::spawn(pump_mux_to_client(recv, wr, close_rx));
+        let up_throttle = Throttle::new(&self.controls, true);
+        let down_throttle = Throttle::new(&self.controls, false);
+        let mut up = tokio::spawn(pump_client_to_mux(
+            rd,
+            send,
+            close_rx.clone(),
+            up_throttle,
+        ));
+        let mut down = tokio::spawn(pump_mux_to_client(recv, wr, close_rx, down_throttle));
 
         // 任一方向结束即终止另一方向。注意：`select!` 已经把先完成的那一侧
         // poll 到结束，**不能再 await 它**（JoinHandle 完成后重复 poll 会 panic），
@@ -696,6 +737,17 @@ impl Socks5Server {
         peer: SocketAddr,
         close_rx: watch::Receiver<bool>,
     ) {
+        // 0. 流量上限：在绑定本地 UDP 端口与建流之前拒绝
+        if self.controls.flow_exceeded() {
+            warn!(
+                "SOCKS5 UDP: 客户端 {} 流量已超限，拒绝 {}（REP=2）",
+                self.cfg.client_id, peer
+            );
+            let bnd = local_bnd(&stream);
+            let _ = write_reply(&mut stream, reply::NOT_ALLOWED, bnd).await;
+            return;
+        }
+
         // 1. 本地 UDP socket。BND.ADDR 用 TCP 连接的本端 IP（对齐 Go 的
         //    `common.GetServerIpByClientIp`），端口用系统分配的 UDP 端口。
         let udp = match UdpSocket::bind("0.0.0.0:0").await {
@@ -782,17 +834,21 @@ impl Socks5Server {
         // 5. 三条通路：UDP→mux、mux→UDP、TCP 控制连接存活探测
         let udp = Arc::new(udp);
         let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        let up_throttle = Throttle::new(&self.controls, true);
+        let down_throttle = Throttle::new(&self.controls, false);
         let mut up = tokio::spawn(pump_udp_to_mux(
             udp.clone(),
             client_addr.clone(),
             send,
             close_rx.clone(),
+            up_throttle,
         ));
         let mut down = tokio::spawn(pump_mux_to_udp(
             recv,
             udp,
             client_addr,
             close_rx.clone(),
+            down_throttle,
         ));
 
         // TCP 控制连接：任何数据都丢弃（Go 同样丢弃），EOF/错误即结束关联。
@@ -840,6 +896,7 @@ async fn pump_client_to_mux(
     mut reader: OwnedReadHalf,
     mut send: MuxSendHalf,
     mut close_rx: watch::Receiver<bool>,
+    throttle: Throttle,
 ) {
     let mut buf = vec![0u8; COPY_BUF];
     loop {
@@ -854,9 +911,11 @@ async fn pump_client_to_mux(
                 Err(_) => break,
             },
         };
+        throttle.gate(n).await;
         if send.send_data(&buf[..n]).await.is_err() {
             break;
         }
+        throttle.count(n);
     }
     // 半关闭：只停止本端发送，接收方向仍可继续（对齐 Go `copyConns`）
     send.close();
@@ -867,6 +926,7 @@ async fn pump_mux_to_client(
     mut recv: MuxRecvHalf,
     mut writer: OwnedWriteHalf,
     mut close_rx: watch::Receiver<bool>,
+    throttle: Throttle,
 ) {
     loop {
         if *close_rx.borrow() {
@@ -879,9 +939,11 @@ async fn pump_mux_to_client(
                 None => break,
             },
         };
+        throttle.gate(data.len()).await;
         if writer.write_all(&data).await.is_err() {
             break;
         }
+        throttle.count(data.len());
         let _ = writer.flush().await;
     }
     let _ = writer.shutdown().await;
@@ -893,6 +955,7 @@ async fn pump_udp_to_mux(
     client_addr: Arc<Mutex<Option<SocketAddr>>>,
     mut send: MuxSendHalf,
     mut close_rx: watch::Receiver<bool>,
+    throttle: Throttle,
 ) {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -933,9 +996,11 @@ async fn pump_udp_to_mux(
             debug!("SOCKS5 UDP: 报文 {n} 字节超过上限 {MAX_UDP_PAYLOAD}，丢弃");
             continue;
         }
+        throttle.gate(n).await;
         if send.send_data(&buf[..n]).await.is_err() {
             break;
         }
+        throttle.count(n);
     }
     send.close();
 }
@@ -946,6 +1011,7 @@ async fn pump_mux_to_udp(
     udp: Arc<UdpSocket>,
     client_addr: Arc<Mutex<Option<SocketAddr>>>,
     mut close_rx: watch::Receiver<bool>,
+    throttle: Throttle,
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(4 * 1024);
     loop {
@@ -958,10 +1024,12 @@ async fn pump_mux_to_udp(
                 let dest = *client_addr.lock().await;
                 match dest {
                     Some(dest) => {
+                        throttle.gate(payload.len()).await;
                         if let Err(e) = udp.send_to(&payload, dest).await {
                             debug!("SOCKS5 UDP: 回写客户端失败: {e}");
                             break;
                         }
+                        throttle.count(payload.len());
                     }
                     None => {
                         // 客户端还没发过任何报文，不知道往哪回

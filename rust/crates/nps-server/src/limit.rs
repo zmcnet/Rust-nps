@@ -27,7 +27,7 @@
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -374,6 +374,108 @@ fn parse_entry(entry: &str) -> Result<IpNet> {
                 base: ip,
                 prefix: len,
             })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 客户端流控组合 / 单方向节流视图
+// ---------------------------------------------------------------------------
+
+/// 单个客户端的流控组合。
+///
+/// 原版 NPS 的 `rate_limit` / `flow_limit` 是**客户端级**配额（该客户端名下
+/// 所有隧道共享一份），`ip_limit` 是服务端级白名单。本结构把三者打成一包，
+/// 让每条转发路径只需要接收一个参数，而不是「三个 Option 满天飞」——
+/// 这是覆盖全部转发路径（UDP / SOCKS5 / HTTP / file / secret / conf）
+/// 时最容易出错的地方。
+///
+/// `Default` = 不限速、不限流量、白名单为空（全部允许）。
+#[derive(Clone, Default)]
+pub struct ClientControls {
+    /// 限速（与同客户端其它路径共享）
+    pub rate: Option<Arc<TokenBucket>>,
+    /// 流量上限（与同客户端其它路径共享）
+    pub flow: Option<Arc<FlowCounter>>,
+    /// 来源 IP 白名单（空表 = 全部允许）
+    pub ip_allow: Arc<IpAllowList>,
+}
+
+impl ClientControls {
+    /// 该来源 IP 是否被允许（空表恒为 true）
+    pub fn ip_allowed(&self, ip: IpAddr) -> bool {
+        self.ip_allow.allows(ip)
+    }
+
+    /// 流量是否已超限（`flow_limit == 0` 时恒为 false）
+    pub fn flow_exceeded(&self) -> bool {
+        self.flow.as_ref().is_some_and(|f| f.exceeded())
+    }
+
+    /// 申请 `n` 字节的发送配额（不限速时立即返回）
+    pub async fn throttle(&self, n: usize) {
+        if let Some(rate) = &self.rate {
+            rate.acquire(n).await;
+        }
+    }
+
+    /// 记 `(上行, 下行)` 字节（未配置流量上限时是空操作）
+    pub fn count(&self, up: u64, down: u64) {
+        if let Some(flow) = &self.flow {
+            flow.add(up, down);
+        }
+    }
+}
+
+/// 一条转发方向上的节流视图：把 [`ClientControls`] 绑定到「上行 / 下行」，
+/// 调用点只需 `gate(n)` + `count(n)`，不必每次重复方向判断。
+///
+/// `up = true` 表示「外部 → 客户端」（服务端视角的上行），
+/// `up = false` 表示「客户端 → 外部」。
+#[derive(Clone)]
+pub struct Throttle {
+    rate: Option<Arc<TokenBucket>>,
+    flow: Option<Arc<FlowCounter>>,
+    up: bool,
+}
+
+impl Throttle {
+    /// 没有该客户端的流控配置时退化为「不限速、不记账」。
+    pub fn optional(controls: Option<&ClientControls>, up: bool) -> Self {
+        match controls {
+            Some(c) => Self::new(c, up),
+            None => Self {
+                rate: None,
+                flow: None,
+                up,
+            },
+        }
+    }
+
+    pub fn new(controls: &ClientControls, up: bool) -> Self {
+        Self {
+            rate: controls.rate.clone(),
+            flow: controls.flow.clone(),
+            up,
+        }
+    }
+
+    /// 写数据前申请配额（数据量大时可能等待）
+    pub async fn gate(&self, n: usize) {
+        if let Some(rate) = &self.rate {
+            rate.acquire(n).await;
+        }
+    }
+
+    /// 写成功后记账（按构造时固定的方向）
+    pub fn count(&self, n: usize) {
+        if let Some(flow) = &self.flow {
+            let n = n as u64;
+            if self.up {
+                flow.add(n, 0);
+            } else {
+                flow.add(0, n);
+            }
         }
     }
 }

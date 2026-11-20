@@ -355,7 +355,22 @@ impl Bridge {
         }
 
         // 握手（限时）
-        let verify = |v: &str| (self.shared.verify)(v);
+        //
+        // vkey 校验一通过就立即清零该 IP 的失败记录——清零点在 verify 回调里，
+        // 而不是等整个握手成功。理由：防爆破记账的对象是「猜测 vkey」，vkey
+        // 已被证明正确后的任何后续失败（例如客户端在读 conn_type 前断开）都
+        // 不再具备穷举信号；若等到 `server_handshake` 返回，合法客户端在握手
+        // 末段断开会被继续累计，且成功记录也清不掉。
+        let verify = |v: &str| {
+            let id = (self.shared.verify)(v);
+            if id.is_some() {
+                if let Some(ip) = &peer_ip {
+                    // 同步临界区，不含 await
+                    self.guard().clear(ip);
+                }
+            }
+            id
+        };
         let handshake = tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
             crate::handshake::server_handshake(&mut stream, verify),
@@ -403,11 +418,8 @@ impl Bridge {
             }
         };
 
-        // 校验成功：立即清除该 IP 的失败记录（NAT 场景下同一出口 IP 的
-        // 合法用户共享记账，一次成功即代表整条记录作废）
-        if let Some(ip) = &peer_ip {
-            self.guard().clear(ip);
-        }
+        // 注意：该 IP 的失败记录已在上面 verify 回调里随校验成功清零，
+        // 这里不再重复清理。
 
         let client_id = hs.client_id;
         let conn_type = hs.conn_type;

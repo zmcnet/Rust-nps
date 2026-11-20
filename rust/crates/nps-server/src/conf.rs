@@ -85,6 +85,9 @@ struct Inner {
     file_channels: Arc<crate::file_service::FileChannelRegistry>,
     /// md5(vkey) -> client id，仅用于 `stus` 帧校验归属（不写日志、不进快照）
     verify: Arc<std::collections::HashMap<String, i32>>,
+    /// per-client 流控表（注册的隧道必须继承客户端的限额，否则 conf
+    /// 就成了绕过 rate/flow/ip_limit 的后门）
+    controls: Arc<std::collections::HashMap<i32, crate::limit::ClientControls>>,
     /// 注册隧道的监听 IP（客户端只上报端口）
     listen_host: IpAddr,
     /// 隧道总数上限（含配置内的静态隧道）
@@ -108,6 +111,7 @@ impl ConfRegistry {
         file_tunnels: Arc<Mutex<Vec<Arc<crate::file_service::FileTunnel>>>>,
         file_channels: Arc<crate::file_service::FileChannelRegistry>,
         verify: Arc<std::collections::HashMap<String, i32>>,
+        controls: Arc<std::collections::HashMap<i32, crate::limit::ClientControls>>,
         listen_host: IpAddr,
         max_tunnels: usize,
         first_dynamic_id: u32,
@@ -122,6 +126,7 @@ impl ConfRegistry {
                 file_tunnels,
                 file_channels,
                 verify,
+                controls,
                 listen_host,
                 max_tunnels,
                 next_id: AtomicU32::new(first_dynamic_id),
@@ -414,7 +419,13 @@ impl ConfRegistry {
             .next_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
             .map_err(|_| "隧道 id 已耗尽".to_owned())?;
-        let tunnel = Arc::new(crate::file_service::FileTunnel::with_registry(
+        let ctl = self
+            .inner
+            .controls
+            .get(&client_id)
+            .cloned()
+            .unwrap_or_default();
+        let tunnel = Arc::new(crate::file_service::FileTunnel::with_controls(
             crate::file_service::FileTunnelConfig {
                 id,
                 name: name.clone(),
@@ -426,6 +437,9 @@ impl ConfRegistry {
                 strip_pre: info.strip_pre.clone(),
             },
             self.inner.file_channels.clone(),
+            ctl.rate,
+            ctl.flow,
+            ctl.ip_allow,
         ));
         let bound = tunnel
             .start(bridge.clone())
@@ -528,8 +542,14 @@ impl ConfRegistry {
             .next_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
             .map_err(|_| "隧道 id 已耗尽".to_owned())?;
-        let tunnel = Arc::new(crate::udp::UdpTunnel::new(
-            crate::config::UdpTunnelConfig {
+        let ctl = self
+            .inner
+            .controls
+            .get(&client_id)
+            .cloned()
+            .unwrap_or_default();
+        let tunnel = Arc::new(
+            crate::udp::UdpTunnel::new(crate::config::UdpTunnelConfig {
                 id,
                 name: name.clone(),
                 client_id,
@@ -538,8 +558,9 @@ impl ConfRegistry {
                 enabled: true,
                 idle_timeout_secs: crate::config::DEFAULT_UDP_IDLE_SECS,
                 max_sessions: crate::config::DEFAULT_UDP_MAX_SESSIONS,
-            },
-        ));
+            })
+            .with_client_controls(ctl),
+        );
         let bound = tunnel
             .start(bridge.clone())
             .await
@@ -717,6 +738,14 @@ impl ConfRegistry {
             .copied()
             .unwrap_or(crate::crypt::StreamWrap::Plain);
         let spec = target.clone();
+        // 与静态隧道一致：注册隧道继承该客户端的限额与白名单，
+        // 不能让 conf 注册成为绕过 rate/flow/ip_limit 的后门。
+        let ctl = self
+            .inner
+            .controls
+            .get(&client_id)
+            .cloned()
+            .unwrap_or_default();
         let tunnel = Arc::new(Tunnel::with_controls(
             TcpTunnelConfig {
                 id,
@@ -732,9 +761,9 @@ impl ConfRegistry {
                 crate::target::TargetPool::parse(&spec)
                     .unwrap_or_else(|_| crate::target::TargetPool::single(&spec)),
             ),
-            None,
-            None,
-            Arc::new(crate::limit::IpAllowList::default()),
+            ctl.rate,
+            ctl.flow,
+            ctl.ip_allow,
             wrap,
         ));
         {

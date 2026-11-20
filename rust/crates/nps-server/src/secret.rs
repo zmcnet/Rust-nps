@@ -120,9 +120,12 @@ impl SecretRegistry {
 /// 处理一条已读完 `md5(password)` 的 `sert` 连接。
 ///
 /// 命中隧道 → 开子流并与该连接双向对拷；未命中 → 关闭连接。
+/// `controls` 是服务端维护的 per-client 流控表（与其它转发路径共享同一份
+/// 限速 / 流量配额）；表中缺少该客户端时按「不限速」处理。
 pub async fn handle_secret_connection(
     bridge: Bridge,
     registry: Arc<SecretRegistry>,
+    controls: Arc<HashMap<i32, crate::limit::ClientControls>>,
     client_id: i32,
     password_md5: String,
     stream: TcpStream,
@@ -139,13 +142,25 @@ pub async fn handle_secret_connection(
         target.id, target.name, target.target_addr
     );
 
-    if let Err(e) = relay(bridge, &target, stream).await {
+    let ctl = controls.get(&target.client_id);
+    if let Err(e) = relay(bridge, &target, ctl, stream).await {
         debug!("secret: 隧道 {} 转发结束: {e:#}", target.id);
     }
 }
 
 /// 开子流并把 `sert` 连接与它对接。
-async fn relay(bridge: Bridge, target: &SecretTarget, stream: TcpStream) -> Result<()> {
+async fn relay(
+    bridge: Bridge,
+    target: &SecretTarget,
+    controls: Option<&crate::limit::ClientControls>,
+    stream: TcpStream,
+) -> Result<()> {
+    // 流量已超限：不再建流（否则会白白消耗 npc 侧的目标连接）
+    if let Some(c) = controls {
+        if c.flow_exceeded() {
+            anyhow::bail!("客户端 {} 流量已超限，拒绝 secret 连接", target.client_id);
+        }
+    }
     let mux = bridge
         .get_tunnel(target.client_id)
         .await
@@ -168,6 +183,9 @@ async fn relay(bridge: Bridge, target: &SecretTarget, stream: TcpStream) -> Resu
     let mut ext_open = true;
     let mut mux_open = true;
     let mut recv = recv;
+    // 方向与 tunnel.rs 一致：外部 → 客户端是上行
+    let up = crate::limit::Throttle::optional(controls, true);
+    let down = crate::limit::Throttle::optional(controls, false);
 
     loop {
         tokio::select! {
@@ -180,7 +198,9 @@ async fn relay(bridge: Bridge, target: &SecretTarget, stream: TcpStream) -> Resu
                         if !mux_open { break; }
                     }
                     Ok(n) => {
+                        up.gate(n).await;
                         if send.send_data(&ext_buf[..n]).await.is_err() { break; }
+                        up.count(n);
                     }
                     Err(_) => {
                         ext_open = false;
@@ -196,7 +216,9 @@ async fn relay(bridge: Bridge, target: &SecretTarget, stream: TcpStream) -> Resu
                     }
                     Some(data) => {
                         use tokio::io::AsyncWriteExt;
+                        down.gate(data.len()).await;
                         if ext_w.write_all(&data).await.is_err() { break; }
+                        down.count(data.len());
                         let _ = ext_w.flush().await;
                     }
                 }

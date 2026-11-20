@@ -161,6 +161,27 @@ pub fn original_dst(_stream: &std::net::TcpStream) -> OriginalDst {
     OriginalDst::Unsupported
 }
 
+/// 从一条已 accept 的 **tokio** 连接取原始目标（平台分发）。
+///
+/// 转发路径拿到的是 `tokio::net::TcpStream`，为了取 fd 不必 `into_std()`
+/// 把连接所有权换出去（那会让后续转发拿不回 async 流），这里直接读 fd。
+#[cfg(target_os = "linux")]
+pub fn original_dst_tokio(stream: &tokio::net::TcpStream) -> OriginalDst {
+    use std::os::fd::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    match stream.local_addr() {
+        Ok(SocketAddr::V6(_)) => imp::original_dst_v6(fd),
+        _ => imp::original_dst_v4(fd),
+    }
+}
+
+/// 非 Linux：恒为 Unsupported（原版 Windows 同样是空实现）。
+#[cfg(not(target_os = "linux"))]
+pub fn original_dst_tokio(_stream: &tokio::net::TcpStream) -> OriginalDst {
+    OriginalDst::Unsupported
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

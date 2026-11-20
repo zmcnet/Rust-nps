@@ -134,6 +134,9 @@ pub struct ServerConfig {
     /// SOCKS5 代理监听（对应 Go 版 `mode=socks5`）
     #[serde(default)]
     pub socks5_listeners: Vec<Socks5Config>,
+    /// tcpTrans 透明代理隧道（对应原版 `mode=tcpTrans`；**仅 Linux**）
+    #[serde(default)]
+    pub tcp_trans_tunnels: Vec<TcpTransTunnelConfig>,
 }
 
 fn default_bridge_addr() -> String {
@@ -185,6 +188,7 @@ impl Default for ServerConfig {
             p2p_listen_addr: None,
             flow_store_interval: default_flow_store_interval(),
             socks5_listeners: Vec::new(),
+            tcp_trans_tunnels: Vec::new(),
         }
     }
 }
@@ -357,6 +361,28 @@ impl std::fmt::Debug for Socks5User {
             .field("password", &"<redacted>")
             .finish()
     }
+}
+
+/// 一条 tcpTrans 透明代理隧道（对应原版 `mode=tcpTrans`，**仅 Linux**）。
+///
+/// 与普通 TCP 隧道的区别：**没有 target_addr** —— 目标来自每条连接上
+/// `SO_ORIGINAL_DST` 反查的 iptables REDIRECT 前原始地址。用法是在本机用
+/// `iptables -t nat -A PREROUTING/OUTPUT -p tcp --dport N -j REDIRECT --to-ports <本端口>`
+/// 把流量指进来，程序再把「用户本来想连哪里」交给对应客户端去拨号。
+///
+/// 原版 Windows 上是空实现（`transport_windows.go` 直接 return nil）；
+/// 本实现同样仅 Linux 生效，其它平台会在启动时警告并拒绝连接。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpTransTunnelConfig {
+    pub id: u32,
+    pub name: String,
+    /// 归属客户端
+    pub client_id: i32,
+    /// 服务端监听地址（iptables REDIRECT 的 `--to-ports` 指向它）
+    pub listen_addr: String,
+    /// 是否随 server 启动而监听；默认 true
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
 }
 
 /// 一个客户端（对应 Go 版 `file.Client` 的最小可用字段）
@@ -540,6 +566,7 @@ impl ServerConfig {
         }
 
         self.validate_file_tunnels(&client_ids, &tunnel_ids, &mut listen_addrs)?;
+        self.validate_tcp_trans_tunnels(&client_ids, &tunnel_ids, &mut listen_addrs)?;
         self.validate_secret_tunnels(&client_ids)?;
         if let Some(addr) = self.p2p_listen_addr.as_deref() {
             parse_addr(addr.trim())
@@ -600,6 +627,41 @@ impl ServerConfig {
             if t.enabled && listen.port() != 0 {
                 if let Some(other) = listen_addrs.insert(listen, t.id) {
                     bail!("文件隧道 {} 与隧道 {} 监听了同一地址 {}", t.id, other, listen);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 校验 tcpTrans 隧道（监听端口与 TCP / 文件隧道共享同一命名空间）
+    fn validate_tcp_trans_tunnels(
+        &self,
+        client_ids: &HashSet<i32>,
+        tunnel_ids: &HashSet<u32>,
+        listen_addrs: &mut HashMap<SocketAddr, u32>,
+    ) -> Result<()> {
+        let mut ids = HashSet::new();
+        for t in &self.tcp_trans_tunnels {
+            if !ids.insert(t.id) || tunnel_ids.contains(&t.id) {
+                bail!("tcpTrans 隧道 id {} 重复（或与 TCP 隧道冲突）", t.id);
+            }
+            if !client_ids.contains(&t.client_id) {
+                bail!("tcpTrans 隧道 {} 引用了不存在的客户端 {}", t.id, t.client_id);
+            }
+            if t.name.trim().is_empty() {
+                bail!("tcpTrans 隧道 {} 的 name 不能为空", t.id);
+            }
+            let listen = parse_addr(&t.listen_addr).with_context(|| {
+                format!("tcpTrans 隧道 {} 的 listen_addr 非法: {:?}", t.id, t.listen_addr)
+            })?;
+            if t.enabled && listen.port() != 0 {
+                if let Some(other) = listen_addrs.insert(listen, t.id) {
+                    bail!(
+                        "tcpTrans 隧道 {} 与隧道 {} 监听了同一地址 {}",
+                        t.id,
+                        other,
+                        listen
+                    );
                 }
             }
         }
