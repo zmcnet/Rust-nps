@@ -10,6 +10,7 @@
 //!     [`Bridge::set_conf_handler`] 注入（本 crate 不依赖 `nps-server`）；
 //!     **未注入时立即关闭连接**（默认关闭，不挂起）
 //!   - 其他 → P0 仅记录日志
+//! - 按来源 IP 的 vkey 防爆破：握手失败记账 + 冷却期拒绝（见 [`crate::ip_guard`]）
 //!
 //! ## 相对原型的修复
 //! 1. **signal 生命周期**：不再用 `readable()` 当断开信号。改为持续读取
@@ -32,14 +33,15 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch, Mutex};
 use tracing::{debug, info, trace, warn};
 
-use crate::handshake::HandshakeResult;
+use crate::handshake::{HandshakeError, HandshakeResult};
+use crate::ip_guard::{normalize_peer_ip, FailureOutcome, GuardConfig, IpGuard};
 use crate::mux::MuxSession;
 
 /// 握手超时。Go 在写完服务端版本后 `SetReadDeadlineBySecond(5)`，
@@ -180,6 +182,11 @@ struct BridgeShared {
     file_handler: std::sync::OnceLock<std::sync::Arc<dyn FileChannelHandler>>,
     /// `secret` 通道处理器（加密隧道用）。未设置时收到 `sert` 连接直接关闭。
     secret_handler: std::sync::OnceLock<std::sync::Arc<dyn SecretHandler>>,
+    /// vkey 防爆破：按来源 IP 的握手失败记账（策略见 [`crate::ip_guard`]）。
+    ///
+    /// 用 std `Mutex` 而非 tokio `Mutex`：临界区内没有任何 await，纯内存
+    /// 读写，std 锁更轻量。
+    ip_guard: std::sync::Mutex<IpGuard>,
     /// 只在启动阶段由上层设置一次，因此用 `OnceLock` 而不是 `Mutex`。
     conf_handler: OnceLock<Arc<dyn ConfSessionHandler>>,
     /// 常驻接收端。
@@ -201,7 +208,18 @@ pub struct Bridge {
 
 impl Bridge {
     /// 新建桥。`verify` 由上层注入（读取配置/数据库）。
+    ///
+    /// vkey 防爆破默认开启：握手失败按来源 IP 记账，滑动窗口内失败达到
+    /// 阈值即进入冷却期（新连接直接关闭、不再进握手）。默认参数与理由见
+    /// [`crate::ip_guard::GuardConfig`]。
     pub fn new(verify: impl Fn(&str) -> Option<i32> + Send + Sync + 'static) -> Self {
+        Self::build(verify, GuardConfig::default())
+    }
+
+    fn build(
+        verify: impl Fn(&str) -> Option<i32> + Send + Sync + 'static,
+        guard_cfg: GuardConfig,
+    ) -> Self {
         let (close_tx, close_keepalive) = watch::channel(false);
         Self {
             shared: Arc::new(BridgeShared {
@@ -213,9 +231,20 @@ impl Bridge {
                 conf_handler: OnceLock::new(),
                 file_handler: OnceLock::new(),
                 secret_handler: OnceLock::new(),
+                ip_guard: std::sync::Mutex::new(IpGuard::new(guard_cfg)),
                 _close_keepalive: close_keepalive,
             }),
         }
+    }
+
+    /// 测试专用构造：自定义防爆破参数（阈值/窗口/冷却/上限）。
+    /// 生产路径一律走 [`Bridge::new`]（默认参数、防护开启）。
+    #[cfg(test)]
+    fn with_guard_config(
+        verify: impl Fn(&str) -> Option<i32> + Send + Sync + 'static,
+        guard_cfg: GuardConfig,
+    ) -> Self {
+        Self::build(verify, guard_cfg)
     }
 
     fn next_gen(&self) -> u64 {
@@ -253,12 +282,77 @@ impl Bridge {
         self.shared.conf_handler.get().is_some()
     }
 
-    /// 处理一条已完成握手的桥连接。
+    /// 锁住防爆破账本。
+    ///
+    /// 毒化时直接取走内部数据继续工作：账本只影响防护强度，不能因某次
+    /// panic 让整座桥拒绝服务。
+    fn guard(&self) -> std::sync::MutexGuard<'_, IpGuard> {
+        self.shared
+            .ip_guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 握手失败是否记入防爆破账本。
+    ///
+    /// 记：vkey 校验不过、探测字节/版本/摘要格式等协议错——都是主动的
+    /// 异常行为，是 vkey 穷举的直接信号；超时同理（对端故意拖慢/半开
+    /// 连接试探）。不记：对端主动断开与 IO 错误——负载均衡健康检查、
+    /// 随机端口扫描都会「连上就断」，计入会把无辜来源误伤进冷却期，
+    /// 且这类行为推进不了 vkey 穷举。
+    fn count_handshake_failure(e: &HandshakeError) -> bool {
+        !matches!(e, HandshakeError::Closed | HandshakeError::Io(_))
+    }
+
+    /// 握手失败的日志类别。只记类别，绝不记 vkey / md5(vkey) 的值。
+    fn failure_category(e: &HandshakeError) -> &'static str {
+        match e {
+            HandshakeError::Closed => "对端关闭",
+            HandshakeError::Io(_) => "io 错误",
+            HandshakeError::BadTestFlag => "探测字节非法",
+            HandshakeError::VersionMismatch { .. } => "核心版本不匹配",
+            HandshakeError::BadVersionLength(_) => "版本长度非法",
+            HandshakeError::VerifyFailed => "vkey 校验失败",
+            HandshakeError::BadVkeyHex(_) => "vkey 摘要格式非法",
+        }
+    }
+
+    /// 处理一条新接入的桥连接：防爆破闸门 → 握手 → 按 flag 分发。
     async fn handle_conn(&self, mut stream: tokio::net::TcpStream) {
         let peer = stream
             .peer_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "<unknown>".into());
+        // 防爆破按 IP 归因；取不到对端地址时无法记账，只能放行
+        let peer_ip = stream.peer_addr().ok().map(|a| normalize_peer_ip(a.ip()));
+
+        // 防爆破第一道闸：冷却期内的来源直接关闭，不进握手、不写任何
+        // 响应字节（正常客户端永远走不到这条分支，原版协议字节序不受
+        // 影响）。被拒的尝试本身也记一次失败：冷却期顺延，持续重试者
+        // 出不了冷却期。
+        if let Some(ip) = &peer_ip {
+            // 账本锁只在同步决策的内层块里存活：rustc 对 async 生成器的存活
+            // 分析在「guard 作用域覆盖 await 点」时按类型整体判非 Send——
+            // 即使 await 前已显式 drop 也不行。锁出块、await 留在块外。
+            let blocked = {
+                let mut g = self.guard();
+                if !g.is_blocked(Instant::now(), ip) {
+                    false
+                } else {
+                    if matches!(
+                        g.record_failure(Instant::now(), ip),
+                        FailureOutcome::CooldownExtended
+                    ) {
+                        debug!("来源 {ip} 冷却期内重试，直接关闭并顺延冷却期");
+                    }
+                    true
+                }
+            };
+            if blocked {
+                let _ = stream.shutdown().await;
+                return;
+            }
+        }
 
         // 握手（限时）
         let verify = |v: &str| (self.shared.verify)(v);
@@ -272,13 +366,48 @@ impl Bridge {
             Ok(Ok(h)) => h,
             Ok(Err(e)) => {
                 debug!("握手失败 (from {peer}): {e}");
+                // 记账与日志只含来源 IP 与失败类别，不含 vkey / md5(vkey)
+                if Self::count_handshake_failure(&e) {
+                    if let Some(ip) = &peer_ip {
+                        let mut g = self.guard();
+                        match g.record_failure(Instant::now(), ip) {
+                            FailureOutcome::CooldownStarted => {
+                                warn!("来源 {ip} 滑动窗口内握手失败达到阈值，进入冷却期");
+                            }
+                            FailureOutcome::CooldownExtended => {
+                                debug!("来源 {ip} 冷却期内再次失败，冷却期顺延");
+                            }
+                            FailureOutcome::Counted => {
+                                debug!(
+                                    "来源 {ip} 握手失败已记账 ({})",
+                                    Self::failure_category(&e)
+                                );
+                            }
+                        }
+                    }
+                }
                 return;
             }
             Err(_) => {
                 debug!("握手超时 (from {peer})");
+                if let Some(ip) = &peer_ip {
+                    let mut g = self.guard();
+                    if matches!(
+                        g.record_failure(Instant::now(), ip),
+                        FailureOutcome::CooldownStarted
+                    ) {
+                        warn!("来源 {ip} 滑动窗口内握手失败达到阈值，进入冷却期");
+                    }
+                }
                 return;
             }
         };
+
+        // 校验成功：立即清除该 IP 的失败记录（NAT 场景下同一出口 IP 的
+        // 合法用户共享记账，一次成功即代表整条记录作废）
+        if let Some(ip) = &peer_ip {
+            self.guard().clear(ip);
+        }
 
         let client_id = hs.client_id;
         let conn_type = hs.conn_type;
@@ -784,6 +913,161 @@ mod tests {
         match r {
             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {}
             Ok(Ok(n)) => panic!("握手超时后仍可读: {n}"),
+        }
+        bridge.shutdown().await;
+    }
+
+    // ---- vkey 防爆破（集成）----
+
+    /// 防爆破测试桥：3 次失败 / 60s 窗口 / 1s 冷却 / 上限 100。
+    /// 冷却取 1s 而非更短：给「冷却期内被拒」的断言留出足够时间余量，
+    /// 避免慢机器上测试窗口滑出冷却期造成偶发失败。
+    fn guard_test_bridge() -> Arc<Bridge> {
+        Arc::new(Bridge::with_guard_config(
+            |v| {
+                if v == md5_hex("vkey-test") {
+                    Some(1)
+                } else {
+                    None
+                }
+            },
+            crate::ip_guard::GuardConfig {
+                window: Duration::from_secs(60),
+                max_failures: 3,
+                cooldown: Duration::from_secs(1),
+                max_ips: 100,
+            },
+        ))
+    }
+
+    /// 模拟老 npc：connect + 握手前半段（发到 md5(vkey) 为止），
+    /// 校验结果由调用方自行读取（"sucs"=通过 / "vkey"=拒绝）。
+    async fn npc_handshake_to_verify(addr: std::net::SocketAddr, vkey: &str) -> TcpStream {
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"TST").await.unwrap();
+        write_len_content(&mut c, nps_proto::CORE_VERSION.as_bytes())
+            .await
+            .unwrap();
+        write_len_content(&mut c, b"0.26.10").await.unwrap();
+        let mut digest = [0u8; 32];
+        c.read_exact(&mut digest).await.unwrap();
+        assert_eq!(&digest, md5_hex(nps_proto::CORE_VERSION).as_bytes());
+        c.write_all(md5_hex(vkey).as_bytes()).await.unwrap();
+        c
+    }
+
+    /// 读服务端对 md5(vkey) 的 4 字节校验响应
+    async fn read_verify_result(c: &mut TcpStream) -> [u8; 4] {
+        let mut res = [0u8; 4];
+        c.read_exact(&mut res).await.unwrap();
+        res
+    }
+
+    /// 达到失败阈值后：冷却期内即使 vkey 正确的新连接也被直接关闭
+    /// （不进握手、无响应字节）；冷却结束后重新放行。
+    #[tokio::test]
+    async fn brute_force_threshold_blocks_then_cooldown_releases() {
+        let bridge = guard_test_bridge();
+        let addr = start_bridge(&bridge).await;
+
+        // 3 次错误 vkey：原版兼容行为不变——每次都收到 "vkey" 拒绝响应
+        for _ in 0..3 {
+            let mut c = npc_handshake_to_verify(addr, "wrong").await;
+            assert_eq!(
+                read_verify_result(&mut c).await,
+                nps_proto::VERIFY_EER.as_bytes()
+            );
+            drop(c);
+        }
+        // 等服务端完成 3 次失败记账（记账在校验响应写出之后）
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 第 4 条连接：服务端不回任何握手字节，直接关闭 → 读到 EOF/错误
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(2), c.read(&mut [0u8; 1])).await;
+        match r {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            other => panic!("冷却期内的连接未被直接关闭: {other:?}"),
+        }
+
+        // 被拒的连接顺延了冷却期；等 1.2s 让冷却彻底结束后重新放行
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let mut c = npc_handshake_to_verify(addr, "vkey-test").await;
+        assert_eq!(
+            read_verify_result(&mut c).await,
+            nps_proto::VERIFY_SUCCESS.as_bytes()
+        );
+        drop(c);
+        bridge.shutdown().await;
+    }
+
+    /// 校验成功立即清零失败记录：失败 + 成功 + 失败的累计不触发冷却。
+    #[tokio::test]
+    async fn successful_handshake_clears_failure_record() {
+        let bridge = guard_test_bridge();
+        let addr = start_bridge(&bridge).await;
+
+        // 2 次失败
+        for _ in 0..2 {
+            let mut c = npc_handshake_to_verify(addr, "wrong").await;
+            assert_eq!(
+                read_verify_result(&mut c).await,
+                nps_proto::VERIFY_EER.as_bytes()
+            );
+            drop(c);
+        }
+        // 成功登录（清零）
+        let mut c = npc_handshake_to_verify(addr, "vkey-test").await;
+        assert_eq!(
+            read_verify_result(&mut c).await,
+            nps_proto::VERIFY_SUCCESS.as_bytes()
+        );
+        drop(c);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 清零后再失败 2 次：不到阈值，正确 vkey 依然可用
+        for _ in 0..2 {
+            let mut c = npc_handshake_to_verify(addr, "wrong").await;
+            assert_eq!(
+                read_verify_result(&mut c).await,
+                nps_proto::VERIFY_EER.as_bytes()
+            );
+            drop(c);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut c = npc_handshake_to_verify(addr, "vkey-test").await;
+        assert_eq!(
+            read_verify_result(&mut c).await,
+            nps_proto::VERIFY_SUCCESS.as_bytes()
+        );
+        drop(c);
+        bridge.shutdown().await;
+    }
+
+    /// 协议错（探测字节非法）同样计入失败，达到阈值后进入冷却期。
+    #[tokio::test]
+    async fn protocol_errors_count_toward_cooldown() {
+        let bridge = guard_test_bridge();
+        let addr = start_bridge(&bridge).await;
+
+        // 3 次「连上就发非 TST 字节」：服务端无响应、直接关闭
+        for _ in 0..3 {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(b"XXX").await.unwrap();
+            let r = tokio::time::timeout(Duration::from_secs(2), c.read(&mut [0u8; 1])).await;
+            match r {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                other => panic!("协议错连接未被关闭: {other:?}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 达到阈值：正确 vkey 的新连接也被拒（EOF，无握手字节）
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(2), c.read(&mut [0u8; 1])).await;
+        match r {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            other => panic!("达到阈值后的连接未被直接关闭: {other:?}"),
         }
         bridge.shutdown().await;
     }

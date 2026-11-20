@@ -16,6 +16,9 @@ pub mod codec;
 pub mod handshake;
 pub mod mux;
 
+/// 桥端口 vkey 防爆破（按来源 IP 记账）——`bridge` 的内部组件，不对外导出。
+mod ip_guard;
+
 pub use bridge::{Bridge, ClientState};
 pub use codec::*;
 pub use handshake::{md5_hex, server_handshake, HandshakeError, HandshakeResult};

@@ -74,8 +74,9 @@
 
       <div class="notice-grid">
         <div class="notice">
-          <h2>仅支持 TCP 桥接</h2>
-          <p>当前版本提供 TCP 端口转发；UDP 与 P2P 模式尚未实现，界面不会展示相关入口。</p>
+          <h2>支持的隧道类型</h2>
+          <p>TCP、UDP、SOCKS5、HTTP 域名代理、文件服务、secret、p2p 会合、
+             tcpTrans（仅 Linux）。隧道类型在服务端配置文件中定义，本页只做展示与启停。</p>
         </div>
         <div class="notice">
           <h2>启停暂在内存中生效</h2>
@@ -338,7 +339,7 @@
 
   <footer class="footer">
     <span>NPS · Rust</span>
-    <span>单二进制内嵌管理界面 · 仅支持 TCP 桥接</span>
+    <span>单二进制内嵌管理界面 · 无 CDN · 无外部依赖</span>
   </footer>
 
   <noscript>
