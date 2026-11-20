@@ -2,7 +2,10 @@
  * NPS · Rust 管理台前端。
  *
  * 约束（与后端约定一致）：
- * - 令牌只存 sessionStorage，关闭标签页即失效；不写入 Cookie / localStorage；
+ * - 用户名密码登录优先使用 HttpOnly 会话 Cookie（fetch 一律 credentials: 'same-origin'）；
+ *   若后端在登录响应里返回会话令牌（当前实现），则存 sessionStorage 并以 Bearer 发送；
+ * - 超级管理员令牌（NPS_ADMIN_TOKEN）只存 sessionStorage，关闭标签页即失效；
+ * - 任何 API 返回 401 都立刻回到登录页并清空本地状态，绝不停留在半加载界面；
  * - 只请求当前站点的 /api，不加载任何外部资源；
  * - 所有服务端数据都用 textContent 写入 DOM，避免 XSS；
  * - 每 3 秒轮询一次状态，轮询期间不叠加请求。
@@ -10,19 +13,28 @@
 (function () {
   'use strict';
 
-  var TOKEN_KEY = 'nps.admin.token';
+  /** 登录会话令牌（后端在登录响应里返回时使用）。 */
+  var SESSION_KEY = 'nps.session.token';
+  /** 超级管理员令牌。 */
+  var ADMIN_KEY = 'nps.admin.token';
   var POLL_INTERVAL = 3000;
   var MIN_TOKEN_LEN = 24;
 
   var dom = {
+    bootView: document.getElementById('boot-view'),
     nav: document.getElementById('main-nav'),
     main: document.getElementById('app-main'),
     loginView: document.getElementById('login-view'),
     loginForm: document.getElementById('login-form'),
     loginBtn: document.getElementById('login-btn'),
     loginError: document.getElementById('login-error'),
+    loginUsername: document.getElementById('login-username'),
+    loginPassword: document.getElementById('login-password'),
+    tokenForm: document.getElementById('token-form'),
+    tokenBtn: document.getElementById('token-btn'),
+    tokenError: document.getElementById('token-error'),
     tokenInput: document.getElementById('token-input'),
-    tokenHint: document.getElementById('token-hint'),
+    currentUser: document.getElementById('current-user'),
     logoutBtn: document.getElementById('logout-btn'),
     connStatus: document.getElementById('conn-status'),
     lastUpdated: document.getElementById('last-updated'),
@@ -41,7 +53,16 @@
   };
 
   var state = {
-    token: '',
+    /** 后端登录接口返回的会话令牌（无 Cookie 时使用）。 */
+    sessionToken: '',
+    /** 超级管理员令牌。 */
+    adminToken: '',
+    /** 是否已通过 whoami 确认身份。 */
+    authenticated: false,
+    /** whoami 原始返回。 */
+    identity: null,
+    isAdmin: false,
+    displayName: '',
     snapshot: null,
     /** 正在执行启停请求的隧道 ID，用于禁用按钮防重复提交。 */
     busyTunnels: Object.create(null),
@@ -125,25 +146,182 @@
     dom.connStatus.textContent = label;
   }
 
+  /// sessionStorage 在隐私模式下可能抛异常，所有访问都必须包好。
+  function readSession(key) {
+    try {
+      return window.sessionStorage.getItem(key) || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function writeSession(key, value) {
+    try {
+      if (value) window.sessionStorage.setItem(key, value);
+      else window.sessionStorage.removeItem(key);
+    } catch (e) {
+      /* 隐私模式：忽略，登录状态仅本次页面内有效 */
+    }
+  }
+
+  function clearCredentials() {
+    state.sessionToken = '';
+    state.adminToken = '';
+    writeSession(SESSION_KEY, '');
+    writeSession(ADMIN_KEY, '');
+  }
+
+  function credentialToken() {
+    return state.sessionToken || state.adminToken;
+  }
+
+  function tokenByteLength(value) {
+    if (typeof TextEncoder === 'function') {
+      return new TextEncoder().encode(value).length;
+    }
+    return value.length;
+  }
+
+  // -------------------------------------------------------------------------
+  // 视图切换
+  // -------------------------------------------------------------------------
+
+  /// 把主界面的数据区域重置为占位内容，避免退出/失效后残留上一位用户的数据。
+  function resetDataView() {
+    state.snapshot = null;
+    state.hasLoaded = false;
+    if (dom.bridgeAddr) dom.bridgeAddr.textContent = '—';
+    setStat(dom.statClientsOnline, '—');
+    if (dom.statClientsHint) dom.statClientsHint.textContent = '共 — 个';
+    setStat(dom.statTunnelsEnabled, '—');
+    if (dom.statTunnelsHint) dom.statTunnelsHint.textContent = '共 — 条';
+    setStat(dom.statActiveConns, '—');
+    setStat(dom.statTraffic, '—');
+    if (dom.clientsCount) dom.clientsCount.textContent = '';
+    if (dom.tunnelsCount) dom.tunnelsCount.textContent = '';
+    fillPlaceholder(dom.clientsBody, 4, '登录后显示客户端。');
+    fillPlaceholder(dom.tunnelsBody, 8, '登录后显示隧道。');
+    if (siteDom.body) {
+      fillPlaceholder(siteDom.body, 7, '登录后显示站点。');
+      if (siteDom.count) siteDom.count.textContent = '';
+    }
+    if (certDom.body) {
+      fillPlaceholder(certDom.body, 7, '登录后显示证书。');
+      if (certDom.count) certDom.count.textContent = '';
+    }
+    acmeState = null;
+    if (certDom.acmeWarn) certDom.acmeWarn.textContent = '';
+    if (certDom.acmeSteps) certDom.acmeSteps.replaceChildren();
+    if (certDom.acmeStatus) setFormStatus(certDom.acmeStatus, '', '');
+    Object.keys(state.busyTunnels).forEach(function (key) {
+      delete state.busyTunnels[key];
+    });
+  }
+
+  function setStat(node, text) {
+    if (node) node.textContent = text;
+  }
+
+  function fillPlaceholder(body, colspan, text) {
+    if (!body) return;
+    body.replaceChildren(
+      el('tr', { className: 'empty-row' }, [el('td', { colspan: String(colspan), text: text })])
+    );
+  }
+
   function showLogin(message) {
     stopPolling();
-    dom.loginView.hidden = false;
+    state.authenticated = false;
+    state.loading = false;
+    setBanner('');
+    resetDataView();
+
+    if (dom.bootView) dom.bootView.hidden = true;
     dom.main.hidden = true;
     dom.nav.hidden = true;
     dom.logoutBtn.hidden = true;
+    dom.logoutBtn.disabled = false;
+    dom.currentUser.hidden = true;
+    dom.currentUser.textContent = '';
+    dom.loginView.hidden = false;
     dom.lastUpdated.textContent = '';
     setConnStatus('idle', '未登录');
+
+    // 切换视图时清空所有错误与凭据输入，避免把上一次的内容留在页面上。
+    dom.loginError.textContent = '';
+    dom.loginError.hidden = true;
+    dom.tokenError.textContent = '';
+    dom.tokenError.hidden = true;
+    dom.loginBtn.disabled = false;
+    dom.loginBtn.textContent = '登录';
+    dom.tokenBtn.disabled = false;
+    dom.tokenBtn.textContent = '使用令牌进入';
+    dom.loginPassword.value = '';
+    dom.tokenInput.value = '';
+
     if (message) {
       dom.loginError.textContent = message;
       dom.loginError.hidden = false;
     }
   }
 
-  function showApp() {
+  function applyPermissions() {
+    var nodes = document.querySelectorAll('.admin-only');
+    for (var i = 0; i < nodes.length; i += 1) {
+      nodes[i].hidden = !state.isAdmin;
+    }
+  }
+
+  /// 兼容 cookie 模式（display/username）与当前 Bearer 模式（principal）。
+  function identityDisplay(info) {
+    if (!info || typeof info !== 'object') return '已登录';
+    if (typeof info.display === 'string' && info.display.trim()) return info.display.trim();
+    if (typeof info.username === 'string' && info.username.trim()) return info.username.trim();
+    var principal = typeof info.principal === 'string' ? info.principal : '';
+    if (principal === 'admin(token)') return '超级管理员（令牌）';
+    if (principal) return principal;
+    return '已登录';
+  }
+
+  function applyIdentity(info) {
+    state.identity = info || null;
+    state.isAdmin = !!(info && info.is_admin);
+    state.displayName = identityDisplay(info);
+    state.authenticated = true;
+  }
+
+  function enterApp(info) {
+    applyIdentity(info);
+
+    if (dom.bootView) dom.bootView.hidden = true;
     dom.loginView.hidden = true;
     dom.main.hidden = false;
     dom.nav.hidden = false;
     dom.logoutBtn.hidden = false;
+    dom.logoutBtn.disabled = false;
+    dom.currentUser.textContent = state.displayName;
+    dom.currentUser.hidden = false;
+    // 非敏感的角色提示，便于客户端账号理解界面差异。
+    dom.currentUser.title = state.isAdmin ? '管理员' : '客户端账号';
+
+    dom.loginError.textContent = '';
+    dom.loginError.hidden = true;
+    dom.tokenError.textContent = '';
+    dom.tokenError.hidden = true;
+    dom.loginPassword.value = '';
+    dom.tokenInput.value = '';
+    dom.loginBtn.disabled = false;
+    dom.loginBtn.textContent = '登录';
+    dom.tokenBtn.disabled = false;
+    dom.tokenBtn.textContent = '使用令牌进入';
+
+    applyPermissions();
+    setConnStatus('ok', '已连接');
+    dom.lastUpdated.textContent = '更新于 ' + formatTime(new Date());
+    setBanner('');
+
+    refresh();
+    startPolling();
   }
 
   // -------------------------------------------------------------------------
@@ -153,14 +331,36 @@
   function AuthError(message) {
     this.name = 'AuthError';
     this.message = message || 'not authorized';
+    this.status = 401;
   }
   AuthError.prototype = Object.create(Error.prototype);
   AuthError.prototype.constructor = AuthError;
 
+  function defaultErrorMessage(status) {
+    if (status === 403) return '没有权限执行此操作';
+    if (status === 404) return '接口不存在';
+    if (status === 429) return '尝试次数过多，请稍后再试';
+    return '请求失败（HTTP ' + status + '）';
+  }
+
+  /**
+   * 统一的 API 请求。
+   *
+   * opts:
+   * - method / body：常规选项
+   * - token：显式指定 Bearer 令牌（'' 表示不携带）
+   * - noAuth：true 时不携带 Authorization（登录接口）
+   * - handle401：false 时不把 401 抛成 AuthError（登录 / 令牌校验自处理）
+   */
   function request(path, options) {
     var opts = options || {};
     var headers = { Accept: 'application/json' };
-    headers.Authorization = 'Bearer ' + state.token;
+    var token = opts.noAuth
+      ? ''
+      : opts.token !== undefined
+        ? opts.token
+        : credentialToken();
+    if (token) headers.Authorization = 'Bearer ' + token;
     if (opts.body !== undefined) {
       headers['Content-Type'] = 'application/json';
     }
@@ -168,60 +368,51 @@
       method: opts.method || 'GET',
       headers: headers,
       body: opts.body,
-      credentials: 'omit',
+      // 后端可能用 HttpOnly 会话 Cookie，必须带上同源凭据；
+      // 纯 Bearer 时该选项无副作用。
+      credentials: 'same-origin',
       cache: 'no-store',
       redirect: 'error'
     }).then(function (response) {
-      if (response.status === 401) {
-        throw new AuthError('unauthorized');
-      }
       return response
         .json()
         .catch(function () {
           return null;
         })
         .then(function (payload) {
-          if (!response.ok) {
-            var message =
-              payload && typeof payload.error === 'string'
-                ? payload.error
-                : '请求失败（HTTP ' + response.status + '）';
-            var error = new Error(message);
-            error.status = response.status;
-            throw error;
+          if (response.ok) return payload;
+          var message =
+            payload && typeof payload.error === 'string' && payload.error
+              ? payload.error
+              : defaultErrorMessage(response.status);
+          if (response.status === 401 && opts.handle401 !== false) {
+            throw new AuthError(message);
           }
-          return payload;
+          var error = new Error(message);
+          error.status = response.status;
+          error.payload = payload;
+          throw error;
         });
     });
   }
 
-  function handleAuthFailure() {
-    state.token = '';
-    state.snapshot = null;
-    state.hasLoaded = false;
-    try {
-      window.sessionStorage.removeItem(TOKEN_KEY);
-    } catch (e) {
-      /* 隐私模式下 sessionStorage 不可用，忽略 */
-    }
-    showLogin('登录已失效，请重新输入管理令牌。');
+  function fetchWhoami(token) {
+    return request('/api/whoami', { token: token, handle401: false });
   }
 
-  function logout(silent) {
-    state.token = '';
-    state.snapshot = null;
-    state.hasLoaded = false;
-    Object.keys(state.busyTunnels).forEach(function (key) {
-      delete state.busyTunnels[key];
-    });
-    try {
-      window.sessionStorage.removeItem(TOKEN_KEY);
-    } catch (e) {
-      /* ignore */
+  /// 所有 401 的唯一出口：清空凭据与数据，回到登录页。
+  function handleAuthFailure() {
+    clearCredentials();
+    showLogin('登录已失效，请重新登录。');
+  }
+
+  /// 业务操作失败时的统一处理：401 回登录页，其余交给调用方渲染。
+  function handleActionError(error, render) {
+    if (error instanceof AuthError) {
+      handleAuthFailure();
+      return;
     }
-    setBanner('');
-    if (dom.tokenInput) dom.tokenInput.value = '';
-    showLogin(silent ? '' : '已退出登录。');
+    if (render) render(error);
   }
 
   // -------------------------------------------------------------------------
@@ -230,6 +421,7 @@
 
   function startPolling() {
     stopPolling();
+    if (!state.authenticated) return;
     state.pollTimer = window.setInterval(refresh, POLL_INTERVAL);
   }
 
@@ -241,7 +433,7 @@
   }
 
   function refresh() {
-    if (!state.token || state.loading) return;
+    if (!state.authenticated || state.loading) return;
     state.loading = true;
     if (!state.hasLoaded) setConnStatus('loading', '连接中');
 
@@ -253,9 +445,12 @@
         setConnStatus('ok', '已连接');
         dom.lastUpdated.textContent = '更新于 ' + formatTime(new Date());
         render();
-        refreshSites();
-        refreshCerts();
-        refreshAcmeSummary();
+        // 客户端账号看不到站点/证书，也不应发起这些请求（避免 403/401 噪音）。
+        if (state.isAdmin) {
+          refreshSites();
+          refreshCerts();
+          refreshAcmeSummary();
+        }
       })
       .catch(function (error) {
         if (error instanceof AuthError) {
@@ -411,19 +606,26 @@
       })
     );
 
-    var buttonLabel = busy ? (enabled ? '停用中…' : '启用中…') : enabled ? '停用' : '启用';
-    var button = el(
-      'button',
-      {
-        type: 'button',
-        className: 'btn btn-small ' + (enabled ? 'btn-stop' : 'btn-start'),
-        disabled: busy
-      },
-      [buttonLabel]
-    );
-    button.addEventListener('click', function () {
-      toggleTunnel(id, !enabled, button);
-    });
+    // 客户端账号只读：不提供启停入口（后端也只按其可见客户端返回数据）。
+    var actionsCell;
+    if (state.isAdmin) {
+      var buttonLabel = busy ? (enabled ? '停用中…' : '启用中…') : enabled ? '停用' : '启用';
+      var button = el(
+        'button',
+        {
+          type: 'button',
+          className: 'btn btn-small ' + (enabled ? 'btn-stop' : 'btn-start'),
+          disabled: busy
+        },
+        [buttonLabel]
+      );
+      button.addEventListener('click', function () {
+        toggleTunnel(id, !enabled, button);
+      });
+      actionsCell = el('td', { className: 'actions' }, [button]);
+    } else {
+      actionsCell = el('td', { className: 'actions muted-cell', text: '—' });
+    }
 
     return el('tr', null, [
       el('td', null, nameCellChildren),
@@ -444,7 +646,7 @@
           el('span', { text: '接收 ' + formatBytes(tunnel.bytes_from_client) })
         ])
       ]),
-      el('td', { className: 'actions' }, [button])
+      actionsCell
     ]);
   }
 
@@ -487,67 +689,177 @@
   }
 
   // -------------------------------------------------------------------------
-  // 登录 / 导航
+  // 登录 / 退出
   // -------------------------------------------------------------------------
 
-  function tokenByteLength(value) {
-    if (typeof TextEncoder === 'function') {
-      return new TextEncoder().encode(value).length;
-    }
-    return value.length;
+  function showLoginError(text) {
+    dom.loginError.textContent = text;
+    dom.loginError.hidden = false;
   }
 
-  function attemptLogin(token) {
-    var candidate = String(token || '').trim();
-    // 按 UTF-8 字节长度校验，与后端的字节数要求一致。
-    if (tokenByteLength(candidate) < MIN_TOKEN_LEN) {
-      dom.loginError.textContent = '令牌至少需要 ' + MIN_TOKEN_LEN + ' 字节。';
-      dom.loginError.hidden = false;
+  function showTokenError(text) {
+    dom.tokenError.textContent = text;
+    dom.tokenError.hidden = false;
+  }
+
+  function loginWithPassword() {
+    if (dom.loginBtn.disabled) return;
+    var username = (dom.loginUsername.value || '').trim();
+    var password = dom.loginPassword.value || '';
+
+    dom.loginError.textContent = '';
+    dom.loginError.hidden = true;
+    dom.tokenError.textContent = '';
+    dom.tokenError.hidden = true;
+
+    if (!username || !password) {
+      showLoginError('请输入用户名和密码。');
       return;
     }
 
     dom.loginBtn.disabled = true;
-    dom.loginBtn.textContent = '验证中…';
-    dom.loginError.hidden = true;
+    dom.loginBtn.textContent = '登录中…';
+    setConnStatus('loading', '登录中');
 
-    state.token = candidate;
-    request('/api/status')
-      .then(function (snapshot) {
-        try {
-          window.sessionStorage.setItem(TOKEN_KEY, candidate);
-          dom.tokenHint.textContent = '令牌仅保存在当前浏览器会话（sessionStorage），关闭标签页后自动清除。';
-        } catch (e) {
-          dom.tokenHint.textContent = '当前浏览器会话存储不可用，登录状态仅在本次页面内有效。';
+    request('/api/auth/login', {
+      method: 'POST',
+      noAuth: true,
+      handle401: false,
+      body: JSON.stringify({ username: username, password: password })
+    })
+      .then(function (payload) {
+        // 当前后端在响应体返回会话令牌；若后端改为纯 Cookie，这里 token 为空，
+        // 后续请求靠 credentials: 'same-origin' 携带 Cookie。
+        var token = payload && typeof payload.token === 'string' ? payload.token : '';
+        if (token) {
+          state.sessionToken = token;
+          writeSession(SESSION_KEY, token);
+        } else {
+          // 纯 Cookie 模式：不残留上一条会话令牌，避免用陈旧 Bearer 覆盖 Cookie。
+          state.sessionToken = '';
+          writeSession(SESSION_KEY, '');
         }
-        state.snapshot = snapshot;
-        state.hasLoaded = true;
-        showApp();
-        setConnStatus('ok', '已连接');
-        dom.lastUpdated.textContent = '更新于 ' + formatTime(new Date());
-        render();
-        startPolling();
+        state.adminToken = '';
+        writeSession(ADMIN_KEY, '');
+        return fetchWhoami(token).catch(function (error) {
+          if (error) error.stage = 'whoami';
+          throw error;
+        });
+      })
+      .then(function (info) {
+        enterApp(info);
       })
       .catch(function (error) {
-        state.token = '';
-        state.snapshot = null;
-        state.hasLoaded = false;
-        if (error instanceof AuthError) {
-          try {
-            window.sessionStorage.removeItem(TOKEN_KEY);
-          } catch (e) {
-            /* 隐私模式下不可用，忽略 */
-          }
-          dom.loginError.textContent = '令牌无效，请检查服务端 NPS_ADMIN_TOKEN 配置。';
-        } else {
-          dom.loginError.textContent =
-            '无法连接管理服务：' + (error && error.message ? error.message : '网络错误');
-        }
-        dom.loginError.hidden = false;
-      })
-      .then(function () {
-        dom.loginBtn.disabled = false;
-        dom.loginBtn.textContent = '进入管理台';
+        failLogin(error);
       });
+  }
+
+  function failLogin(error) {
+    var message;
+    if (error && error.status === 429) {
+      message = '尝试次数过多，请稍后再试';
+    } else if (error instanceof AuthError || (error && error.status === 401)) {
+      if (error && error.stage === 'whoami') {
+        message = '登录状态未能建立，请重试。';
+      } else {
+        message = (error && error.message) || '用户名或密码错误';
+      }
+    } else {
+      message = (error && error.message) || '登录失败，请稍后重试。';
+    }
+
+    // 登录未完成：不保留任何会话令牌。
+    state.sessionToken = '';
+    writeSession(SESSION_KEY, '');
+    state.authenticated = false;
+
+    showLoginError(message);
+    dom.loginPassword.value = '';
+    dom.loginBtn.disabled = false;
+    dom.loginBtn.textContent = '登录';
+    setConnStatus('idle', '未登录');
+  }
+
+  function loginWithToken() {
+    if (dom.tokenBtn.disabled) return;
+    var candidate = (dom.tokenInput.value || '').trim();
+
+    dom.loginError.textContent = '';
+    dom.loginError.hidden = true;
+    dom.tokenError.textContent = '';
+    dom.tokenError.hidden = true;
+
+    // 按 UTF-8 字节长度校验，与后端要求一致。
+    if (tokenByteLength(candidate) < MIN_TOKEN_LEN) {
+      showTokenError('令牌至少需要 ' + MIN_TOKEN_LEN + ' 字节。');
+      return;
+    }
+
+    dom.tokenBtn.disabled = true;
+    dom.tokenBtn.textContent = '验证中…';
+    setConnStatus('loading', '验证中');
+
+    state.adminToken = candidate;
+    fetchWhoami(candidate)
+      .then(function (info) {
+        state.sessionToken = '';
+        writeSession(SESSION_KEY, '');
+        writeSession(ADMIN_KEY, candidate);
+        enterApp(info);
+      })
+      .catch(function (error) {
+        state.adminToken = '';
+        writeSession(ADMIN_KEY, '');
+        var message;
+        if (error && error.status === 401) {
+          message = '令牌无效，请检查服务端 NPS_ADMIN_TOKEN 配置。';
+        } else {
+          message = '无法连接管理服务：' + ((error && error.message) || '网络错误');
+        }
+        showTokenError(message);
+        dom.tokenBtn.disabled = false;
+        dom.tokenBtn.textContent = '使用令牌进入';
+        setConnStatus('idle', '未登录');
+      });
+  }
+
+  function logout(showMessage) {
+    var token = credentialToken();
+    stopPolling();
+    dom.logoutBtn.disabled = true;
+
+    if (!state.authenticated) {
+      clearCredentials();
+      dom.logoutBtn.disabled = false;
+      showLogin('');
+      return;
+    }
+
+    var finish = function () {
+      dom.logoutBtn.disabled = false;
+      clearCredentials();
+      showLogin(showMessage ? '已退出登录。' : '');
+    };
+
+    // 即使服务端登出失败，也要清理本地状态（Cookie 由服务端负责清除）。
+    request('/api/auth/logout', {
+      method: 'POST',
+      token: token,
+      handle401: false
+    })
+      .catch(function () {})
+      .then(function () {
+        // 若同时存在 Cookie 会话（后端返回过令牌的场景），再发一次不带
+        // Authorization 的登出，确保 Cookie 会话也被清除。纯 Bearer 后端
+        // 对这个请求同样返回 200，无副作用。
+        if (!token) return null;
+        return request('/api/auth/logout', {
+          method: 'POST',
+          token: '',
+          handle401: false
+        }).catch(function () {});
+      })
+      .then(finish);
   }
 
   function bindNav() {
@@ -565,46 +877,67 @@
     activate(window.location.hash || '#overview');
   }
 
+  function restoreSession() {
+    state.sessionToken = readSession(SESSION_KEY);
+    state.adminToken = readSession(ADMIN_KEY);
+    var token = credentialToken();
+    setConnStatus('loading', '检查中');
+
+    // 页面加载时先问后端「我是谁」：有 Cookie/Bearer 就进主界面，否则显示登录页。
+    fetchWhoami(token)
+      .then(function (info) {
+        enterApp(info);
+      })
+      .catch(function (error) {
+        var hadCredential = !!token;
+        clearCredentials();
+        var message = '';
+        if (error && error.status === 401) {
+          if (hadCredential) message = '登录已失效，请重新登录。';
+        } else if (error) {
+          message = '无法连接管理服务：' + ((error && error.message) || '网络错误');
+        }
+        showLogin(message);
+      });
+  }
+
+  // -------------------------------------------------------------------------
+  // 初始化
+  // -------------------------------------------------------------------------
+
   function init() {
     dom.loginForm.addEventListener('submit', function (event) {
       event.preventDefault();
-      if (dom.loginBtn.disabled) return;
-      attemptLogin(dom.tokenInput.value);
+      loginWithPassword();
+    });
+
+    dom.tokenForm.addEventListener('submit', function (event) {
+      event.preventDefault();
+      loginWithToken();
     });
 
     dom.logoutBtn.addEventListener('click', function () {
-      logout(false);
+      logout(true);
     });
 
     document.addEventListener('visibilitychange', function () {
       if (document.hidden) {
         stopPolling();
-      } else if (state.token) {
+      } else if (state.authenticated) {
         refresh();
         startPolling();
       }
     });
 
     window.addEventListener('online', function () {
-      if (state.token) refresh();
+      if (state.authenticated) refresh();
     });
 
     bindNav();
     bindSites();
     bindCerts();
 
-    var saved = '';
-    try {
-      saved = window.sessionStorage.getItem(TOKEN_KEY) || '';
-    } catch (e) {
-      saved = '';
-    }
-    if (tokenByteLength(saved) >= MIN_TOKEN_LEN) {
-      attemptLogin(saved);
-    } else {
-      showLogin('');
-      dom.tokenInput.focus();
-    }
+    restoreSession();
   }
 
   // -------------------------------------------------------------------------
@@ -652,19 +985,22 @@
           refreshSites();
         })
         .catch(function (error) {
-          setFormStatus(siteDom.status, 'err', describeError(error));
+          handleActionError(error, function (err) {
+            setFormStatus(siteDom.status, 'err', describeError(err));
+          });
         });
     });
   }
 
   function refreshSites() {
-    if (!siteDom.body) return;
+    if (!siteDom.body || !state.authenticated || !state.isAdmin) return;
     request('/api/sites')
       .then(function (sites) {
         renderSites(Array.isArray(sites) ? sites : []);
       })
-      .catch(function () {
-        /* 轮询失败不打断主界面 */
+      .catch(function (error) {
+        // 轮询失败不打断主界面，但 401 必须回登录页。
+        if (error instanceof AuthError) handleAuthFailure();
       });
   }
 
@@ -703,7 +1039,9 @@
             refreshSites();
           })
           .catch(function (error) {
-            setFormStatus(siteDom.status, 'err', describeError(error));
+            handleActionError(error, function (err) {
+              setFormStatus(siteDom.status, 'err', describeError(err));
+            });
           });
       });
       actions.appendChild(del);
@@ -762,7 +1100,9 @@
             refreshCerts();
           })
           .catch(function (error) {
-            setFormStatus(certDom.status, 'err', describeError(error));
+            handleActionError(error, function (err) {
+              setFormStatus(certDom.status, 'err', describeError(err));
+            });
           });
       });
     }
@@ -783,7 +1123,9 @@
             refreshCerts();
           })
           .catch(function (error) {
-            setFormStatus(certDom.status, 'err', describeError(error));
+            handleActionError(error, function (err) {
+              setFormStatus(certDom.status, 'err', describeError(err));
+            });
           });
       });
     }
@@ -835,7 +1177,9 @@
             }
           })
           .catch(function (error) {
-            setFormStatus(certDom.acmeStatus, 'err', describeError(error));
+            handleActionError(error, function (err) {
+              setFormStatus(certDom.acmeStatus, 'err', describeError(err));
+            });
           });
       });
     }
@@ -848,20 +1192,22 @@
             refreshCerts();
           })
           .catch(function (error) {
-            setFormStatus(certDom.status, 'err', describeError(error));
+            handleActionError(error, function (err) {
+              setFormStatus(certDom.status, 'err', describeError(err));
+            });
           });
       });
     }
 
     // 注意：这里**不**发 /api/acme 请求。
-    // bindCerts() 在登录前就执行，此时没有令牌，请求会 401 且被静默吞掉，
+    // bindCerts() 在登录前就执行，此时没有凭据，请求会 401 且被静默吞掉，
     // 导致 acmeState 永远为 null、ACME 申请入口 100% 不可用。
     // 改为登录成功后由 refreshAcmeSummary() 拉取。
   }
 
-  /// 拉取 ACME 摘要并填充面板提示（必须已有令牌）。
+  /// 拉取 ACME 摘要并填充面板提示（必须已登录且是管理员）。
   function refreshAcmeSummary() {
-    if (!state.token || !certDom.acmeWarn) return;
+    if (!state.authenticated || !state.isAdmin || !certDom.acmeWarn) return;
     request('/api/acme')
       .then(function (summary) {
         acmeState = summary;
@@ -880,6 +1226,10 @@
         }
       })
       .catch(function (error) {
+        if (error instanceof AuthError) {
+          handleAuthFailure();
+          return;
+        }
         certDom.acmeWarn.textContent = '无法获取 ACME 状态：' + describeError(error);
       });
   }
@@ -893,12 +1243,14 @@
   }
 
   function refreshCerts() {
-    if (!certDom.body) return;
+    if (!certDom.body || !state.authenticated || !state.isAdmin) return;
     request('/api/certs')
       .then(function (certs) {
         renderCerts(Array.isArray(certs) ? certs : []);
       })
-      .catch(function () {});
+      .catch(function (error) {
+        if (error instanceof AuthError) handleAuthFailure();
+      });
   }
 
   function renderCerts(certs) {
@@ -944,7 +1296,9 @@
             refreshCerts();
           })
           .catch(function (error) {
-            setFormStatus(certDom.status, 'err', describeError(error));
+            handleActionError(error, function (err) {
+              setFormStatus(certDom.status, 'err', describeError(err));
+            });
           });
       });
       actions.appendChild(del);
@@ -978,7 +1332,7 @@
 
   function describeError(error) {
     if (!error) return '操作失败';
-    if (error.message === 'unauthorized') return '登录已失效，请重新登录';
+    if (error instanceof AuthError || error.status === 401) return '登录已失效，请重新登录';
     return error.message || '操作失败';
   }
 

@@ -33,6 +33,8 @@ pub mod registration;
 pub mod socks5;
 pub mod tunnel;
 pub mod udp;
+pub mod update_feed;
+pub mod process;
 
 pub use autostart::{Channel, ChannelStatus};
 pub use cli::{

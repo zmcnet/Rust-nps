@@ -91,7 +91,74 @@ pub async fn run(config: RunConfig, shutdown: watch::Receiver<bool>) -> Result<(
             run_loop(server, vkey, true, shutdown).await
         }
         Target::ConfigFile { path } => run_config_file(path, shutdown).await,
+        Target::Instance { name } => run_instance(name, shutdown).await,
     }
+}
+
+/// 实例模式：从 `<data_root>/instances/<name>/config.json` 读取并连接。
+///
+/// 这是 `install` 注册的自启项实际走的路径（`rnpc run --name <name>`）。
+/// 与配置文件模式的区别：
+/// - 配置是 rnpc 自己的 `config.json`（含 server/port/vkey），不是原版 npc.conf
+/// - 启动时写运行时记录，正常退出时清除（供 `rnpc stop` / `rnpc list` 使用）
+async fn run_instance(
+    name: String,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), ClientError> {
+    use crate::instance::{InstancePaths, read_config};
+
+    crate::instance::validate_instance_name(&name).map_err(|e| {
+        ClientError::Config(crate::config::ConfigError::Invalid {
+            field: "instance".to_owned(),
+            reason: e.to_string(),
+        })
+    })?;
+    let root = crate::instance::data_root();
+    let paths = InstancePaths::new(&root, &name);
+    if !paths.is_installed() {
+        return Err(ClientError::Config(crate::config::ConfigError::Invalid {
+            field: "instance".to_owned(),
+            reason: format!("实例 {name} 未安装；请先运行 rnpc install --name {name}"),
+        }));
+    }
+    let cfg = read_config(&paths.config_path()).map_err(|e| {
+        ClientError::Config(crate::config::ConfigError::Read {
+            path: paths.config_path().display().to_string(),
+            error: e.to_string(),
+        })
+    })?;
+    let server = cfg.server_addr();
+    let vkey = if cfg.vkey.is_empty() {
+        info!(instance = %name, server = %server, "实例未设置 vkey，进入注册流程");
+        let key = registration::negotiate_vkey(&server)
+            .await
+            .map_err(ClientError::Registration)?;
+        // 把服务端下发的 vkey 落盘，避免每次重启都重新注册
+        if let Ok(mut updated) = read_config(&paths.config_path()) {
+            updated.vkey = key.clone();
+            if let Err(e) = crate::instance::write_config(&paths.config_path(), &updated) {
+                warn!(instance = %name, error = %e, "回写下发的 vkey 失败（不影响本次运行）");
+            }
+        }
+        key
+    } else {
+        cfg.vkey.clone()
+    };
+
+    info!(instance = %name, server = %server, "实例启动");
+
+    // 写运行时记录（供 stop/list 使用）。失败不阻断启动。
+    if let Err(e) = crate::instance::record_runtime(&paths.runtime_path(), &name) {
+        warn!(instance = %name, error = %e, "写运行时记录失败（rnpc stop 可能不可用）");
+    }
+
+    let result = run_loop(server, vkey, true, shutdown).await;
+
+    // 无论成功失败都清除运行时记录
+    if let Err(e) = crate::instance::clear_runtime(&paths.runtime_path()) {
+        warn!(instance = %name, error = %e, "清除运行时记录失败");
+    }
+    result
 }
 
 /// 模式 3：读取配置文件 → `conf` 上传 → main+chan 主循环。

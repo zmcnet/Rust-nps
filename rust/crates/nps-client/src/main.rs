@@ -109,9 +109,14 @@ async fn main() -> ExitCode {
                     println!("发现新版本 {version}（--check-only，未更新）");
                     ExitCode::SUCCESS
                 }
-                Ok(nps_client::commands::UpdateOutcome::Updated { version }) => {
+                Ok(nps_client::commands::UpdateOutcome::Updated { version, backup }) => {
                     println!("已更新到 {version}");
+                    println!("旧版本备份: {}", backup.display());
                     ExitCode::SUCCESS
+                }
+                Ok(nps_client::commands::UpdateOutcome::Blocked { reason }) => {
+                    eprintln!("拒绝更新：{reason}");
+                    ExitCode::from(nps_client::commands::EXIT_CONFIG)
                 }
                 Err(e) => {
                     eprintln!("rnpc: 更新失败: {e:#}");
@@ -134,7 +139,7 @@ async fn main() -> ExitCode {
                             r.name,
                             r.server,
                             r.channel,
-                            if r.running { "运行中" } else { "未知" },
+                            if r.running { "运行中" } else { "已停止" },
                             r.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_owned())
                         );
                     }
@@ -156,6 +161,63 @@ async fn main() -> ExitCode {
                 Err(e) => {
                     eprintln!("rnpc: {e:#}");
                     ExitCode::from(nps_client::commands::EXIT_NO_INSTANCE)
+                }
+            }
+        }
+        Command::Logs { name, lines, follow } => {
+            let root = nps_client::instance::data_root();
+            match nps_client::commands::cmd_logs(&root, &name, lines, follow) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("rnpc: {e:#}");
+                    ExitCode::from(nps_client::commands::EXIT_NO_INSTANCE)
+                }
+            }
+        }
+        Command::Channel {
+            action,
+            name,
+            channel,
+        } => {
+            let root = nps_client::instance::data_root();
+            let result = match action {
+                nps_client::cli::ChannelAction::List => {
+                    nps_client::commands::cmd_channel_list(&root, &name).map(|t| print!("{t}"))
+                }
+                other => {
+                    let Some(cname) = channel.as_deref() else {
+                        eprintln!("rnpc: channel {} 需要 --channel <名字>", match other {
+                            nps_client::cli::ChannelAction::Install => "install",
+                            nps_client::cli::ChannelAction::Remove => "remove",
+                            nps_client::cli::ChannelAction::List => "list",
+                        });
+                        return ExitCode::from(nps_client::commands::EXIT_CONFIG);
+                    };
+                    let Some(ch) = nps_client::autostart::Channel::parse(cname) else {
+                        eprintln!("rnpc: 未知通道 {cname:?}（可选 service/task-start/task-logon/run-key）");
+                        return ExitCode::from(nps_client::commands::EXIT_CONFIG);
+                    };
+                    match other {
+                        nps_client::cli::ChannelAction::Install => {
+                            nps_client::commands::cmd_channel_install(&root, &name, ch)
+                        }
+                        nps_client::cli::ChannelAction::Remove => {
+                            nps_client::commands::cmd_channel_remove(&name, ch)
+                        }
+                        nps_client::cli::ChannelAction::List => unreachable!(),
+                    }
+                }
+            };
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    let text = format!("{e:#}");
+                    eprintln!("rnpc: {text}");
+                    if text.contains("管理员权限") {
+                        ExitCode::from(nps_client::commands::EXIT_PERMISSION)
+                    } else {
+                        ExitCode::from(nps_client::commands::EXIT_RUNTIME)
+                    }
                 }
             }
         }

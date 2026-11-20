@@ -24,12 +24,13 @@
         <a href="#overview">总览</a>
         <a href="#clients">客户端</a>
         <a href="#tunnels">隧道</a>
-        <a href="#sites">站点</a>
-        <a href="#certs">证书</a>
+        <a class="admin-only" href="#sites">站点</a>
+        <a class="admin-only" href="#certs">证书</a>
         <a href="#about">说明</a>
       </nav>
 
       <div class="top-actions">
+        <span class="user-chip" id="current-user" hidden></span>
         <span class="pill" id="conn-status" data-state="idle" role="status" aria-live="polite">未登录</span>
         <span class="muted last-updated" id="last-updated"></span>
         <button class="btn btn-ghost" id="logout-btn" type="button" hidden>退出</button>
@@ -132,7 +133,7 @@
       <p class="table-note">流量列的「发送」指发送至客户端，「接收」指接收自客户端，均为该隧道的累计值。</p>
     </section>
 
-    <section class="section" id="sites" aria-labelledby="sites-title">
+    <section class="section admin-only" id="sites" aria-labelledby="sites-title" hidden>
       <div class="section-head">
         <h2 id="sites-title">域名站点</h2>
         <span class="muted" id="sites-count"></span>
@@ -174,7 +175,7 @@
       </form>
     </section>
 
-    <section class="section" id="certs" aria-labelledby="certs-title">
+    <section class="section admin-only" id="certs" aria-labelledby="certs-title" hidden>
       <div class="section-head">
         <h2 id="certs-title">SSL 证书</h2>
         <span class="muted" id="certs-count"></span>
@@ -263,45 +264,75 @@
       </div>
       <div class="notice-grid">
         <div class="notice">
-          <h2>管理令牌</h2>
-          <p>首次部署时，在启动服务前设置环境变量 <code>NPS_ADMIN_TOKEN</code>（至少 24 字节，可见 ASCII，不含空格）。本页面不提供默认密码，令牌只保存在当前浏览器会话（sessionStorage），关闭标签页即清除。</p>
+          <h2>登录方式</h2>
+          <p>可使用管理员分配的用户名与密码登录；仅查看自己隧道的客户端账号看不到站点与证书入口。也可展开登录页下方的「使用管理员令牌」，输入服务端环境变量 <code>NPS_ADMIN_TOKEN</code>。令牌只保存在当前浏览器会话（sessionStorage），关闭标签页即清除。</p>
         </div>
         <div class="notice">
           <h2>数据与安全</h2>
-          <p>页面不加载任何 CDN、外部字体或统计脚本，所有请求只发往当前管理服务；所有 API 都需要 Bearer 令牌，且不接收 Cookie。页面每 3 秒自动刷新一次状态。</p>
+          <p>页面不加载任何 CDN、外部字体或统计脚本，所有请求只发往当前管理服务；登录凭据只提交给当前管理服务，不会写入页面或日志。页面每 3 秒自动刷新一次状态。</p>
         </div>
       </div>
     </section>
   </main>
 
-  <div class="login-wrap" id="login-view">
+  <div class="login-wrap" id="boot-view">
+    <p class="muted boot-text" role="status">正在检查登录状态…</p>
+  </div>
+
+  <div class="login-wrap" id="login-view" hidden>
     <div class="login-card">
       <div class="login-brand">
         <span class="brand-mark" aria-hidden="true"><span></span></span>
         <span class="brand-name">NPS · Rust</span>
       </div>
-      <h1>管理登录</h1>
-      <p class="muted login-lead">输入服务端环境变量 <code>NPS_ADMIN_TOKEN</code> 中配置的管理令牌。</p>
+      <h1>登录管理台</h1>
+      <p class="muted login-lead">使用分配给你的用户名与密码登录。客户端账号只能查看自己的隧道。</p>
 
-      <form id="login-form" novalidate>
-        <label for="token-input">管理令牌</label>
+      <form id="login-form" novalidate autocomplete="on">
+        <label for="login-username">用户名</label>
         <input
-          id="token-input"
-          name="token"
-          type="password"
-          autocomplete="off"
+          id="login-username"
+          name="username"
+          type="text"
+          autocomplete="username"
           autocapitalize="off"
           spellcheck="false"
-          minlength="24"
-          placeholder="至少 24 字节"
           required
         >
-        <p class="hint" id="token-hint">令牌仅保存在当前浏览器会话（sessionStorage），关闭标签页后自动清除。</p>
+        <label for="login-password">密码</label>
+        <input
+          id="login-password"
+          name="password"
+          type="password"
+          autocomplete="current-password"
+          required
+        >
         <p class="form-error" id="login-error" role="alert" hidden></p>
-        <button class="btn btn-primary btn-block" id="login-btn" type="submit">进入管理台</button>
+        <button class="btn btn-primary btn-block" id="login-btn" type="submit">登录</button>
       </form>
 
-      <p class="footnote">首次部署：启动服务前设置环境变量 <code>NPS_ADMIN_TOKEN</code>（至少 24 字节，可见 ASCII，无空格）。页面不会把令牌发送到本服务以外的任何地址。</p>
+      <details class="token-fallback" id="token-fallback">
+        <summary>使用管理员令牌</summary>
+        <form id="token-form" novalidate>
+          <label for="token-input">管理令牌</label>
+          <input
+            id="token-input"
+            name="token"
+            type="password"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            minlength="24"
+            placeholder="至少 24 字节"
+            required
+          >
+          <p class="hint">令牌仅存于本次会话，关闭标签页即失效。</p>
+          <p class="form-error" id="token-error" role="alert" hidden></p>
+          <button class="btn btn-block" id="token-btn" type="submit">使用令牌进入</button>
+        </form>
+      </details>
+
+      <p class="footnote">首次部署：启动服务前设置环境变量 <code>NPS_ADMIN_TOKEN</code>（至少 24 字节，可见 ASCII，无空格）。页面不会把凭据发送到本服务以外的任何地址。</p>
     </div>
   </div>
 

@@ -222,6 +222,20 @@ button {
   white-space: nowrap;
 }
 
+.user-chip {
+  max-width: 168px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 550;
+}
+
 /* ---------------- 状态胶囊 ---------------- */
 
 .pill {
@@ -593,6 +607,10 @@ button {
   padding: 40px 20px 56px;
 }
 
+.boot-text {
+  font-size: 13px;
+}
+
 .login-card {
   width: 100%;
   max-width: 420px;
@@ -624,23 +642,24 @@ button {
   white-space: normal;
 }
 
-#login-form {
+.login-card form {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-#login-form label {
+.login-card label {
   font-size: 12.5px;
   font-weight: 550;
   color: var(--muted);
+  margin-top: 4px;
 }
 
-#token-input {
+.login-card input[type='text'],
+.login-card input[type='password'] {
   width: 100%;
   font: inherit;
-  font-family: var(--mono);
-  font-size: 13px;
+  font-size: 13.5px;
   padding: 10px 12px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
@@ -649,11 +668,38 @@ button {
   transition: border-color 0.12s ease, background-color 0.12s ease;
 }
 
-#token-input:focus {
+.login-card input[type='password'] {
+  font-family: var(--mono);
+}
+
+.login-card input[type='text']:focus,
+.login-card input[type='password']:focus {
   outline: none;
   border-color: var(--accent);
   background: var(--surface);
   box-shadow: 0 0 0 3px rgba(23, 99, 90, 0.12);
+}
+
+.token-fallback {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.token-fallback summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 550;
+  color: var(--muted);
+  list-style-position: inside;
+}
+
+.token-fallback summary:hover {
+  color: var(--text);
+}
+
+.token-fallback form {
+  margin-top: 12px;
 }
 
 .hint {
@@ -668,6 +714,10 @@ button {
 
 #login-btn {
   margin-top: 8px;
+}
+
+#token-btn {
+  margin-top: 6px;
 }
 
 .footnote {
@@ -726,6 +776,10 @@ button {
   .last-updated {
     display: none;
   }
+
+  .user-chip {
+    max-width: 140px;
+  }
 }
 
 @media (max-width: 720px) {
@@ -746,6 +800,10 @@ button {
 
   .top-actions {
     gap: 8px;
+  }
+
+  .user-chip {
+    max-width: 118px;
   }
 
   .page {

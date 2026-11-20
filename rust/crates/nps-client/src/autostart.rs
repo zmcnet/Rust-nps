@@ -19,8 +19,9 @@
 //! - `task-start` / `task-logon`：调用 `schtasks.exe`（不引入 Task Scheduler COM）。
 //!   查询走 `schtasks /query /xml`：XML 标签名不随系统语言变化，`/fo list`
 //!   的字段名会随系统语言本地化，无法可靠解析。
-//! - `service`：调用 `sc.exe` 创建 / 改配 / 删除；读取配置直接读注册表
-//!   `HKLM\SYSTEM\CurrentControlSet\Services\<名>\ImagePath`（同样避开本地化输出）。
+//! - `service`：用 `windows-service` crate 的 typed API（`CreateServiceW` /
+//!   `ChangeServiceConfigW` / `DeleteService`），拿到 Win32 错误码而不是
+//!   解析 `sc.exe` 的本地化文本。
 //! - 提权检测：`OpenProcessToken` + `GetTokenInformation(TokenElevation)`，
 //!   失败时回退到 `net session`（慢但可靠）。
 //!
@@ -367,8 +368,8 @@ fn ensure_elevated(channel: Channel) -> Result<()> {
 mod win {
     use std::ffi::c_void;
     use std::io;
-    use std::ptr;
     use std::process::{Command, Output};
+    use std::ptr;
 
     use anyhow::{anyhow, bail, Context, Result};
 
@@ -379,8 +380,8 @@ mod win {
 
     // -- Win32 手写 FFI ----------------------------------------------------
     //
-    // 只用到少数几个极其稳定的接口。刻意不引入 `winreg` / `windows-sys`：
-    // 依赖图与 `Cargo.lock` 保持不动，避免与并行开发的其他 crate 冲突。
+    // 注册表读写与提权检测只用少数几个极其稳定的接口，直接手写 FFI，
+    // 不额外引入 `winreg` / `windows-sys`。服务通道才用 `windows-service`。
 
     type Handle = *mut c_void;
     type Hkey = *mut c_void;
@@ -388,7 +389,6 @@ mod win {
     type Bool = i32;
 
     const HKEY_CURRENT_USER: Hkey = 0x8000_0001usize as Hkey;
-    const HKEY_LOCAL_MACHINE: Hkey = 0x8000_0002usize as Hkey;
 
     const KEY_QUERY_VALUE: u32 = 0x0001;
     const KEY_SET_VALUE: u32 = 0x0002;
@@ -684,7 +684,9 @@ mod win {
             return String::from_utf8_lossy(&bytes[3..]).into_owned();
         }
         // 无 BOM 的 UTF-16LE：ASCII 文本的高字节全为 0。
-        if bytes.len() >= 4 && bytes.chunks_exact(2).filter(|p| p[1] == 0).count() * 4 >= bytes.len() {
+        if bytes.len() >= 4
+            && bytes.chunks_exact(2).filter(|p| p[1] == 0).count() * 4 >= bytes.len()
+        {
             let units: Vec<u16> = bytes
                 .chunks_exact(2)
                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
@@ -769,8 +771,9 @@ mod win {
     pub(super) fn run_key_install(name: &str, exe: &str) -> Result<()> {
         let value_name = item_name(name);
         let command = run_command(exe, name);
-        write_string_value(HKEY_CURRENT_USER, RUN_KEY_PATH, &value_name, &command)
-            .with_context(|| format!("写入注册表 Run 键失败：HKCU\\{RUN_KEY_PATH}\\{value_name}"))?;
+        write_string_value(HKEY_CURRENT_USER, RUN_KEY_PATH, &value_name, &command).with_context(
+            || format!("写入注册表 Run 键失败：HKCU\\{RUN_KEY_PATH}\\{value_name}"),
+        )?;
 
         // 回读校验：拿到的内容不是我们写的那条，说明写入被拦截/覆盖。
         let stored = read_string_value(HKEY_CURRENT_USER, RUN_KEY_PATH, &value_name)
@@ -902,9 +905,9 @@ mod win {
         // 回读校验：任务里存的命令行必须指向同一个可执行文件、同一个实例。
         match task_registered_command(channel, &task)? {
             Some(stored) if registered_as(&stored, exe, name) => Ok(()),
-            Some(stored) => bail!(
-                "计划任务 {task} 写入后命令行不一致（期望 {command:?}，实际 {stored:?}）"
-            ),
+            Some(stored) => {
+                bail!("计划任务 {task} 写入后命令行不一致（期望 {command:?}，实际 {stored:?}）")
+            }
             None => bail!("计划任务 {task} 创建后查询不到，请检查系统策略"),
         }
     }
@@ -948,123 +951,165 @@ mod win {
     }
 
     // -- service ----------------------------------------------------------
+    //
+    // 服务通道用 `windows-service` crate（typed Win32 错误码 + 正确的
+    // `CreateServiceW` 转义），不解析 `sc.exe` 的本地化输出。
 
-    /// 服务配置在注册表里的位置（`ImagePath` 就是 SCM 记录的真实命令行）。
-    fn service_registry_path(service: &str) -> String {
-        format!(r"SYSTEM\CurrentControlSet\Services\{service}")
-    }
+    use windows_service::service::{
+        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
+    };
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-    fn service_image_path(service: &str) -> Result<Option<String>> {
-        read_string_value(
-            HKEY_LOCAL_MACHINE,
-            &service_registry_path(service),
-            "ImagePath",
+    /// 服务不存在（SCM 返回码）
+    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+
+    fn sc_manager(access: ServiceManagerAccess) -> Result<ServiceManager> {
+        ServiceManager::local_computer(None::<&str>, access).map_err(
+            |error| match scm_access_denied(&error) {
+                true => admin_hint(Channel::Service, &error.to_string()),
+                false => anyhow!("连接服务控制管理器失败：{error}"),
+            },
         )
-        .with_context(|| {
-            format!(
-                "读取服务注册表项失败：HKLM\\{}",
-                service_registry_path(service)
-            )
-        })
     }
 
-    fn sc_run(args: &[&str]) -> Result<Output> {
-        hidden_command("sc.exe")
-            .args(args)
-            .output()
-            .context("无法执行 sc.exe")
+    /// 错误是否为「权限不足」（Windows 错误码 5）。
+    fn scm_access_denied(error: &windows_service::Error) -> bool {
+        match error {
+            windows_service::Error::Winapi(io) => io.raw_os_error() == Some(5),
+            _ => false,
+        }
+    }
+
+    fn service_info(service: &str, name: &str, exe: &str) -> ServiceInfo {
+        ServiceInfo {
+            name: service.into(),
+            display_name: format!("rnpc {name} (Rust-nps client)").into(),
+            service_type: ServiceType::OWN_PROCESS,
+            start_type: ServiceStartType::AutoStart,
+            error_control: ServiceErrorControl::Normal,
+            executable_path: exe.into(),
+            // SCM 从 System32 启动，因此命令行只有内部子命令 + 实例名。
+            launch_arguments: vec!["service-host".into(), "--name".into(), name.into()],
+            dependencies: vec![],
+            account_name: None, // LocalSystem
+            account_password: None,
+        }
+    }
+
+    /// SCM 实际记录的二进制命令行（含参数串）。
+    fn service_configured_command(service: &str) -> Result<Option<String>> {
+        let manager = sc_manager(ServiceManagerAccess::CONNECT)?;
+        match manager.open_service(service, ServiceAccess::QUERY_CONFIG) {
+            Ok(handle) => {
+                let config = handle
+                    .query_config()
+                    .map_err(|error| anyhow!("查询服务 {service} 配置失败：{error}"))?;
+                Ok(Some(config.executable_path.to_string_lossy().into_owned()))
+            }
+            Err(windows_service::Error::Winapi(io))
+                if io.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
+            {
+                Ok(None)
+            }
+            Err(error) if scm_access_denied(&error) => {
+                Err(admin_hint(Channel::Service, &error.to_string()))
+            }
+            Err(error) => Err(anyhow!("打开服务 {service} 失败：{error}")),
+        }
     }
 
     pub(super) fn service_install(name: &str, exe: &str) -> Result<()> {
         let service = service_name(name);
-        let command = service_command(exe, name);
-        let display = format!("rnpc {name} (Rust-nps client)");
+        let info = service_info(&service, name, exe);
+        let expected = service_command(exe, name);
 
-        match service_image_path(&service)? {
-            // 已存在：只允许改自己那一项，改完再回读校验。
+        let manager =
+            sc_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
+
+        match service_configured_command(&service)? {
+            // 已存在：只允许改自己那一项（幂等），改完再回读校验。
             Some(existing) => {
                 if !owned_by_instance(&existing, name) {
                     bail!(
                         "服务 {service} 已存在且不是本程序创建的（现命令行 {existing:?}），拒绝覆盖"
                     );
                 }
-                let output = sc_run(&[
-                    "config",
-                    &service,
-                    "binPath=",
-                    &command,
-                    "start=",
-                    "auto",
-                    "displayname=",
-                    &display,
-                ])?;
-                if !output.status.success() {
-                    let text = output_text(&output);
-                    if looks_like_access_denied(&text) {
-                        return Err(admin_hint(Channel::Service, &text));
+                let handle = manager
+                    .open_service(service.as_str(), ServiceAccess::CHANGE_CONFIG)
+                    .map_err(|error| {
+                        if scm_access_denied(&error) {
+                            admin_hint(Channel::Service, &error.to_string())
+                        } else {
+                            anyhow!("打开服务 {service} 失败：{error}")
+                        }
+                    })?;
+                handle.change_config(&info).map_err(|error| {
+                    if scm_access_denied(&error) {
+                        admin_hint(Channel::Service, &error.to_string())
+                    } else {
+                        anyhow!("更新服务 {service} 配置失败：{error}")
                     }
-                    bail!("更新服务 {service} 配置失败：{text}");
-                }
+                })?;
             }
             None => {
-                let output = sc_run(&[
-                    "create",
-                    &service,
-                    "binPath=",
-                    &command,
-                    "start=",
-                    "auto",
-                    "DisplayName=",
-                    &display,
-                ])?;
-                if !output.status.success() {
-                    let text = output_text(&output);
-                    if looks_like_access_denied(&text) {
-                        return Err(admin_hint(Channel::Service, &text));
-                    }
-                    bail!("创建服务 {service} 失败：{text}");
-                }
+                manager
+                    .create_service(&info, ServiceAccess::QUERY_CONFIG)
+                    .map_err(|error| {
+                        if scm_access_denied(&error) {
+                            admin_hint(Channel::Service, &error.to_string())
+                        } else {
+                            anyhow!("创建服务 {service} 失败：{error}")
+                        }
+                    })?;
             }
         }
 
-        match service_image_path(&service)? {
+        match service_configured_command(&service)? {
             Some(stored) if registered_as(&stored, exe, name) => Ok(()),
-            Some(stored) => bail!(
-                "服务 {service} 写入后命令行不一致（期望 {command:?}，实际 {stored:?}）"
-            ),
-            None => bail!("服务 {service} 创建后读不到注册表配置，请检查系统策略"),
+            Some(stored) => {
+                bail!("服务 {service} 写入后命令行不一致（期望 {expected:?}，实际 {stored:?}）")
+            }
+            None => bail!("服务 {service} 创建后读不到配置，请检查系统策略"),
         }
     }
 
     pub(super) fn service_remove(name: &str) -> Result<bool> {
         let service = service_name(name);
-        let Some(stored) = service_image_path(&service)? else {
+        let Some(stored) = service_configured_command(&service)? else {
             return Ok(false);
         };
         if !owned_by_instance(&stored, name) {
             bail!("拒绝删除服务 {service}：现有命令行 {stored:?} 不是本程序为实例 {name:?} 创建的");
         }
 
-        // 先尝试停止（失败不影响删除：未运行 / 已在停止中都算正常）。
-        let _ = sc_run(&["stop", &service]);
+        let manager = sc_manager(ServiceManagerAccess::CONNECT)?;
+        let access = ServiceAccess::DELETE | ServiceAccess::QUERY_CONFIG | ServiceAccess::STOP;
+        let handle = manager
+            .open_service(service.as_str(), access)
+            .map_err(|error| {
+                if scm_access_denied(&error) {
+                    admin_hint(Channel::Service, &error.to_string())
+                } else {
+                    anyhow!("打开服务 {service} 失败：{error}")
+                }
+            })?;
 
-        let output = sc_run(&["delete", &service])?;
-        if !output.status.success() {
-            let text = output_text(&output);
-            if looks_like_access_denied(&text) {
-                return Err(admin_hint(Channel::Service, &text));
+        // 先尝试停止（失败不影响删除：未运行 / 已在停止中都算正常）。
+        let _ = handle.stop();
+
+        handle.delete().map_err(|error| {
+            if scm_access_denied(&error) {
+                admin_hint(Channel::Service, &error.to_string())
+            } else {
+                anyhow!("删除服务 {service} 失败：{error}")
             }
-            if looks_like_not_found(&text) {
-                return Ok(false);
-            }
-            bail!("删除服务 {service} 失败：{text}");
-        }
+        })?;
         Ok(true)
     }
 
     pub(super) fn service_status(name: &str) -> Result<ChannelStatus> {
         let service = service_name(name);
-        let stored = service_image_path(&service)?;
+        let stored = service_configured_command(&service)?;
         let installed = stored
             .as_deref()
             .is_some_and(|value| owned_by_instance(value, name));
@@ -1155,7 +1200,10 @@ mod tests {
         assert!(!cmd.contains("vkey"), "自启项不得包含 vkey: {cmd}");
         assert!(!cmd.contains("-vkey"));
         assert_eq!(run_args("web"), "run --name web");
-        assert_eq!(service_command(r"C:\rnpc\rnpc.exe", "web").contains("vkey"), false);
+        assert_eq!(
+            service_command(r"C:\rnpc\rnpc.exe", "web").contains("vkey"),
+            false
+        );
     }
 
     #[test]
@@ -1174,7 +1222,10 @@ mod tests {
         // 实例名不匹配 → 不是自己的
         assert!(!owned_by_instance(web, "db"));
         // 不是本程序写的
-        assert!(!owned_by_instance(r#""C:\other\app.exe" run --name web"#, "web"));
+        assert!(!owned_by_instance(
+            r#""C:\other\app.exe" run --name web"#,
+            "web"
+        ));
         assert!(!owned_by_instance("notepad.exe", "web"));
         // 子串陷阱：rnpc 出现但 --name 不符
         assert!(!owned_by_instance(
@@ -1246,7 +1297,15 @@ mod tests {
 
     #[test]
     fn invalid_instance_names_are_rejected_before_touching_system() {
-        for bad in ["", "A", "a b", "a/b", "all", "rnpc", "x".repeat(33).as_str()] {
+        for bad in [
+            "",
+            "A",
+            "a b",
+            "a/b",
+            "all",
+            "rnpc",
+            "x".repeat(33).as_str(),
+        ] {
             assert!(validate(bad).is_err(), "{bad:?} 应被拒绝");
             // status/remove 必须先校验名字，不能带着非法名去碰系统
             assert!(status(Channel::RunKey, bad).is_err());

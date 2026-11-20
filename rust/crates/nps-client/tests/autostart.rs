@@ -58,16 +58,33 @@ fn reg_query(name: &str) -> (bool, String) {
 }
 
 /// 整个 Run 键里出现我们值名的行数（用于验证幂等：只能是 1）。
-fn count_value_lines(name: &str) -> usize {
-    let output = Command::new("reg")
-        .args(["query", RUN_KEY])
-        .output()
-        .expect("无法执行 reg.exe");
-    let text = String::from_utf8_lossy(&output.stdout);
+///
+/// 并行测试会同时读写这个键，`reg query` 可能偶发拿到空输出；这里带重试，
+/// 并在断言失败时带上原始输出便于定位。
+fn count_value_lines(name: &str) -> (usize, String) {
     let needle = value_name(name);
-    text.lines()
-        .filter(|line| line.split_whitespace().next() == Some(needle.as_str()))
-        .count()
+    let mut last = String::new();
+    for _ in 0..20 {
+        let output = Command::new("reg")
+            .args(["query", RUN_KEY])
+            .output()
+            .expect("无法执行 reg.exe");
+        last = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            continue;
+        }
+        let count = last
+            .lines()
+            .filter(|line| line.split_whitespace().next() == Some(needle.as_str()))
+            .count();
+        if count > 0 {
+            return (count, last);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    (0, last)
 }
 
 /// 直接在注册表里写一个「不是本程序创建」的值，用于验证拒绝删除。
@@ -161,21 +178,28 @@ fn run_key_install_status_remove_roundtrip() {
         "值必须是带引号的绝对路径 + run --name：{raw_after}"
     );
     assert!(raw_after.contains(&format!("--name {name}")));
-    assert!(!raw_after.contains("vkey"), "自启项不得包含 vkey：{raw_after}");
+    assert!(
+        !raw_after.contains("vkey"),
+        "自启项不得包含 vkey：{raw_after}"
+    );
 
     // 4. 幂等重装：不产生重复项
     autostart::install(Channel::RunKey, &name, &exe).expect("重复安装应成功");
-    assert_eq!(count_value_lines(&name), 1, "重复安装后 Run 键应只有一项");
+    let (rows, raw_rows) = count_value_lines(&name);
+    assert_eq!(
+        rows, 1,
+        "重复安装后 Run 键应只有一项，实际 {rows} 项；reg query 输出：{raw_rows:?}"
+    );
 
     // 5. 状态查询
     let status = autostart::status(Channel::RunKey, &name).unwrap();
-    eprintln!("[status] installed={}, command={:?}", status.installed, status.command);
+    eprintln!(
+        "[status] installed={}, command={:?}",
+        status.installed, status.command
+    );
     assert!(status.installed);
     let command = status.command.expect("应有注册的命令行");
-    assert_eq!(
-        command,
-        format!(r#""{}" run --name {name}"#, exe.display())
-    );
+    assert_eq!(command, format!(r#""{}" run --name {name}"#, exe.display()));
 
     // 6. 移除 → 确认删除
     assert!(autostart::remove(Channel::RunKey, &name).unwrap());
@@ -200,7 +224,10 @@ fn remove_refuses_value_not_created_by_us() {
         .expect_err("不是本程序创建的值必须拒绝删除")
         .to_string();
     eprintln!("[拒绝删除] {error}");
-    assert!(error.contains("拒绝删除"), "错误信息应说明拒绝原因：{error}");
+    assert!(
+        error.contains("拒绝删除"),
+        "错误信息应说明拒绝原因：{error}"
+    );
 
     // 值必须还在（没被误删）
     assert!(reg_query(&name).0, "拒绝删除后值应原样保留");
@@ -223,7 +250,10 @@ fn install_rejects_relative_executable_path() {
         .expect_err("相对路径必须被拒绝")
         .to_string();
     eprintln!("[相对路径] {error}");
-    assert!(error.contains("绝对路径"), "错误信息应说明要求绝对路径：{error}");
+    assert!(
+        error.contains("绝对路径"),
+        "错误信息应说明要求绝对路径：{error}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -296,9 +326,11 @@ fn admin_channels_report_permission_error_when_not_elevated() {
                 !error.contains("无效参数") && !error.contains("Invalid argument"),
                 "/tr 命令行引号构造有误（schtasks 拒绝了解析）：{error}"
             );
-            assert!(!autostart::status(Channel::TaskLogon, &name)
-                .unwrap()
-                .installed);
+            assert!(
+                !autostart::status(Channel::TaskLogon, &name)
+                    .unwrap()
+                    .installed
+            );
         }
     }
 }
@@ -311,5 +343,113 @@ fn status_of_unknown_instance_is_not_an_error() {
             .unwrap_or_else(|e| panic!("{channel} 查询未安装的实例不应报错: {e}"));
         assert!(!status.installed, "{channel} 应报告未安装");
         assert_eq!(status.command, None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// task-* 的引号构造：用非管理员可建的 `once` 任务做真实验证
+// ---------------------------------------------------------------------------
+
+/// `/sc onstart` / `onlogon` 需要管理员，本机无法验证成功路径。
+///
+/// 但「`/tr` 的引号能否穿过 Rust 的 `Command` 参数转义并被 schtasks 正确
+/// 拆成 `<Command>` + `<Arguments>`」是**同一套代码路径**。这里用非管理员
+/// 可以创建的 `/sc once` 任务复现完全相同的 `/tr` 取值，真实验证引号构造。
+#[test]
+fn task_tr_quoting_survives_schtasks() {
+    let name = unique_name("tr");
+    let task = value_name(&name);
+    let exe = exe_with_spaces();
+    // 与 autostart::run_command 的输出保持一致（单测已锁定该格式）
+    let command = format!(r#""{}" run --name {name}"#, exe.display());
+
+    let cleanup = TaskCleanup { task: task.clone() };
+
+    let created = Command::new("schtasks")
+        .args([
+            "/create", "/tn", &task, "/tr", &command,
+            // `onstart` / `onlogon` 需要管理员；`monthly /d 1` 是普通用户可建、
+            // 且不需要本地化日期的等价触发器，用来验证同一套 /tr 构造。
+            "/sc", "monthly", "/d", "1", "/st", "23:59", "/f",
+        ])
+        .output()
+        .expect("无法执行 schtasks.exe");
+    let created_text = String::from_utf8_lossy(&created.stdout).into_owned()
+        + &String::from_utf8_lossy(&created.stderr);
+    eprintln!(
+        "[create once] status={:?}, output={created_text:?}",
+        created.status
+    );
+    assert!(
+        created.status.success(),
+        "用与 task 通道相同的 /tr 构造创建 once 任务失败（引号构造有问题）：{created_text}"
+    );
+
+    // 回读 XML，确认路径带引号、参数分开存放
+    let queried = Command::new("schtasks")
+        .args(["/query", "/tn", &task, "/xml", "ONE"])
+        .output()
+        .expect("无法执行 schtasks.exe");
+    assert!(queried.status.success());
+    let xml = decode_oem(&queried.stdout);
+    eprintln!("[xml] {xml}");
+    assert!(
+        xml.contains(&format!("<Command>\"{}\"</Command>", exe.display())),
+        "schtasks 应把带引号的绝对路径整体存进 <Command>：{xml}"
+    );
+    assert!(
+        xml.contains(&format!("<Arguments>run --name {name}</Arguments>")),
+        "参数应独立存进 <Arguments>：{xml}"
+    );
+    assert!(!xml.contains("vkey"));
+
+    drop(cleanup);
+    assert!(
+        !Command::new("schtasks")
+            .args(["/query", "/tn", &task, "/fo", "list"])
+            .output()
+            .expect("无法执行 schtasks.exe")
+            .status
+            .success(),
+        "清理后任务应已删除"
+    );
+}
+
+/// 把控制台 OEM 输出转成可读文本（中文系统是 GBK）。
+fn decode_oem(bytes: &[u8]) -> String {
+    let path = std::env::temp_dir().join(format!("rnpc-oem-{}.bin", std::process::id()));
+    if std::fs::write(&path, bytes).is_ok() {
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "[Console]::OutputEncoding=[Text.Encoding]::GetEncoding(936);\
+                     [IO.File]::ReadAllText('{}',[Text.Encoding]::GetEncoding(936))",
+                    path.display()
+                ),
+            ])
+            .output();
+        let _ = std::fs::remove_file(&path);
+        if let Ok(output) = output {
+            if output.status.success() {
+                return String::from_utf8_lossy(&output.stdout).into_owned();
+            }
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+struct TaskCleanup {
+    task: String,
+}
+
+impl Drop for TaskCleanup {
+    fn drop(&mut self) {
+        let _ = Command::new("schtasks")
+            .args(["/delete", "/tn", &self.task, "/f"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }

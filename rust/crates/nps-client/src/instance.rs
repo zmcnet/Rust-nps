@@ -343,6 +343,178 @@ pub fn list_instances(root: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// 运行时记录（`instances/<name>/runtime.json`）。
+///
+/// 规格禁止「固定路径的 PID 文件」——但按**实例名隔离**的运行时记录是允许的，
+/// 因为 key 就是实例名，多实例天然不会碰撞。
+///
+/// 记录里的 PID 可能因进程退出后被系统复用，**读取方必须校验归属**
+/// （见 `process::state`），不能盲信。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeRecord {
+    /// 进程 ID
+    pub pid: u32,
+    /// 启动时间（RFC3339），用于辅助判断是否陈旧
+    pub started_at: String,
+    /// 可执行文件绝对路径
+    pub exe: String,
+    /// 实例名（冗余存一份，便于校验）
+    pub name: String,
+}
+
+impl InstancePaths {
+    /// 运行时记录路径
+    pub fn runtime_path(&self) -> PathBuf {
+        self.instance_dir().join("runtime.json")
+    }
+}
+
+/// 读运行时记录（不存在返回 None；格式损坏视为陈旧并删除）
+pub fn read_runtime(path: &Path) -> Option<RuntimeRecord> {
+    let bytes = std::fs::read(path).ok()?;
+    match serde_json::from_slice::<RuntimeRecord>(&bytes) {
+        Ok(record) => Some(record),
+        Err(_) => {
+            // 损坏的记录直接删掉，避免永远读不到状态
+            let _ = std::fs::remove_file(path);
+            None
+        }
+    }
+}
+
+/// 记录当前进程（供 `rnpc run --name` 调用）。
+///
+/// 用独占创建 + 先读后写的方式，避免两个进程同时写坏文件。
+pub fn record_runtime(path: &Path, name: &str) -> Result<()> {
+    let exe = std::env::current_exe().context("无法获取自身可执行文件路径")?;
+    let record = RuntimeRecord {
+        pid: std::process::id(),
+        started_at: now_rfc3339(),
+        exe: exe.display().to_string(),
+        name: name.to_owned(),
+    };
+    let bytes = serde_json::to_vec_pretty(&record).context("序列化运行时记录失败")?;
+    write_atomic(path, &bytes)
+}
+
+/// 清除运行时记录（只清除属于自己的那条，避免误删后继进程的记录）
+pub fn clear_runtime(path: &Path) -> Result<bool> {
+    let Some(record) = read_runtime(path) else {
+        return Ok(false);
+    };
+    if record.pid != std::process::id() {
+        // 记录已被另一个进程覆盖，不要动
+        return Ok(false);
+    }
+    std::fs::remove_file(path).context("删除运行时记录失败")?;
+    Ok(true)
+}
+
+/// RFC3339 时间戳（UTC，秒精度）
+pub fn now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let mut year = 1970i64;
+    let mut d = days as i64;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let year_days = if leap { 366 } else { 365 };
+        if d < year_days {
+            break;
+        }
+        d -= year_days;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 0usize;
+    while month < 12 && d >= month_days[month] {
+        d -= month_days[month];
+        month += 1;
+    }
+    format!(
+        "{year:04}-{:02}-{:02}T{h:02}:{m:02}:{s:02}Z",
+        month + 1,
+        d + 1
+    )
+}
+
+/// 枚举系统中正在运行的进程：`(pid, 映像名小写)`。
+///
+/// 一次性调用 `tasklist`，避免为每个实例各 spawn 一次。
+/// 非 Windows 返回空集合（调用方按「未知」处理）。
+pub fn running_processes() -> Vec<(u32, String)> {
+    #[cfg(windows)]
+    {
+        let Ok(output) = std::process::Command::new("tasklist")
+            .args(["/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return Vec::new();
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut out = Vec::new();
+        for line in text.lines() {
+            // 形如: "rnpc.exe","13304","Console","1","5,120 K"
+            let mut parts = line.splitn(3, ',');
+            let (Some(name), Some(pid)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let name = name.trim().trim_matches('"').to_ascii_lowercase();
+            let Ok(pid) = pid.trim().trim_matches('"').parse::<u32>() else {
+                continue;
+            };
+            out.push((pid, name));
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// 判断运行时记录是否仍然有效。
+///
+/// 三个条件同时满足才算「在运行」：
+/// 1. PID 存在于当前进程表
+/// 2. 映像名与记录里的 exe 文件名一致（防 PID 复用）
+/// 3. 记录里的实例名与查询的实例名一致
+pub fn runtime_is_live(
+    record: &RuntimeRecord,
+    instance: &str,
+    processes: &[(u32, String)],
+) -> bool {
+    if record.name != instance {
+        return false;
+    }
+    let exe_name = std::path::Path::new(&record.exe)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    processes
+        .iter()
+        .any(|(pid, name)| *pid == record.pid && *name == exe_name)
+}
+
 /// 删除实例目录（uninstall 用）
 pub fn remove_instance_dir(root: &Path, name: &str) -> Result<bool> {
     let dir = root.join("instances").join(name);

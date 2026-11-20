@@ -17,10 +17,11 @@ use anyhow::{bail, Context, Result};
 
 use crate::autostart::{self, Channel};
 use crate::instance::{
-    list_instances, read_config, read_meta, remove_instance_dir, validate_instance_name,
+    self, list_instances, read_config, read_meta, remove_instance_dir, validate_instance_name,
     write_config, write_meta, InstanceConfig, InstanceMeta, InstancePaths,
 };
 use crate::path_env;
+use crate::update_feed;
 
 /// 退出码（与 spec 一致）
 pub const EXIT_OK: u8 = 0;
@@ -177,7 +178,7 @@ pub fn cmd_install(root: &Path, opts: &InstallOptions, self_exe: &Path) -> Resul
     let meta = InstanceMeta {
         name: opts.name.clone(),
         channel: channel_name,
-        installed_at: now_rfc3339(),
+        installed_at: instance::now_rfc3339(),
         binary_version: env!("CARGO_PKG_VERSION").to_owned(),
         path_registered,
     };
@@ -301,19 +302,35 @@ pub struct InstanceRow {
 /// 执行 `list`
 pub fn cmd_list(root: &Path) -> Result<Vec<InstanceRow>> {
     let names = list_instances(root)?;
+    // 一次性取进程表，避免每实例各 spawn 一次 tasklist
+    let processes = instance::running_processes();
     let mut rows = Vec::with_capacity(names.len());
     for name in names {
         let paths = InstancePaths::new(root, &name);
         let cfg = read_config(&paths.config_path()).ok();
         let meta = read_meta(&paths.meta_path()).ok();
+
+        // 运行状态来自按实例隔离的 runtime.json（不是固定 PID 文件）
+        let runtime = instance::read_runtime(&paths.runtime_path());
+        let (running, pid) = match &runtime {
+            Some(record) if instance::runtime_is_live(record, &name, &processes) => {
+                (true, Some(record.pid))
+            }
+            Some(record) => {
+                // 记录存在但进程已不在：判定为陈旧，顺手清理
+                let _ = std::fs::remove_file(paths.runtime_path());
+                let _ = record;
+                (false, None)
+            }
+            None => (false, None),
+        };
+
         rows.push(InstanceRow {
             name: name.clone(),
             server: cfg.map(|c| c.server_addr()).unwrap_or_else(|| "-".to_owned()),
             channel: meta.map(|m| m.channel).unwrap_or_else(|| "-".to_owned()),
-            // 运行状态需要 PID 探测；当前未实现 PID 文件（spec 禁止固定 PID 文件），
-            // 如实报告「未知」
-            running: false,
-            pid: None,
+            running,
+            pid,
         });
     }
     Ok(rows)
@@ -410,12 +427,17 @@ pub enum UpdateOutcome {
     /// 发现新版本（check-only）
     NewVersionAvailable { version: String },
     /// 已更新
-    Updated { version: String },
+    Updated { version: String, backup: std::path::PathBuf },
+    /// 清单要求先手动升级
+    Blocked { reason: String },
 }
 
 /// 执行 `update`
 ///
 /// 诚实实现：未配置更新源时**明确跳过**，不伪造「已是最新」。
+///
+/// 更新源当前只支持**本地目录**（含 `manifest.json` + 二进制）。
+/// HTTP 更新源需要先定义签名机制，模块会明确拒绝而不是假装支持。
 pub fn cmd_update(
     root: &Path,
     name: &str,
@@ -433,58 +455,199 @@ pub fn cmd_update(
         return Ok(UpdateOutcome::NoFeed);
     };
 
-    // 更新源可以是本地目录（含 rnpc.exe + version.txt）或 HTTP URL。
-    // 本实现只支持本地目录（HTTP 需额外依赖，且签名机制未定义）。
-    let dir = PathBuf::from(feed);
-    if !dir.is_dir() {
-        bail!(
-            "更新源 {feed:?} 不是本地目录。当前只支持本地目录形式的更新源；\
-             HTTP 更新需先定义签名机制"
-        );
-    }
-    let version_file = dir.join("version.txt");
-    let remote_version = std::fs::read_to_string(&version_file)
-        .ok()
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_default();
-    let local_version = env!("CARGO_PKG_VERSION").to_owned();
+    // 「当前版本」应以**已安装实例的二进制**为准，而不是正在运行的 rnpc。
+    // 否则从不同位置运行 rnpc（如开发构建）会反复判断"有新版本"。
+    let mut meta = read_meta(&paths.meta_path()).ok();
+    let current_version = meta
+        .as_ref()
+        .map(|m| m.binary_version.clone())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
 
-    if remote_version.is_empty() {
-        bail!("更新源缺少 version.txt，无法判断版本");
+    let dir = PathBuf::from(feed);
+    let plan = update_feed::plan(&dir, &current_version)?;
+
+    if let Some(reason) = &plan.blocked {
+        return Ok(UpdateOutcome::Blocked {
+            reason: reason.clone(),
+        });
     }
-    if remote_version == local_version {
-        return Ok(UpdateOutcome::UpToDate);
+    // plan.order 描述「当前版本相对清单版本」：
+    // - Older：清单更新 → 需要更新
+    // - Same / Newer：已是同版或本地更新 → 不更新
+    match plan.order {
+        update_feed::VersionOrder::Older => {}
+        update_feed::VersionOrder::Same | update_feed::VersionOrder::Newer => {
+            return Ok(UpdateOutcome::UpToDate);
+        }
+    }
+    if !plan.binary_present {
+        bail!(
+            "更新源缺少二进制文件（清单指向的路径不存在）；             请确认已把 rnpc 放进 {}",
+            dir.display()
+        );
     }
     if check_only {
         return Ok(UpdateOutcome::NewVersionAvailable {
-            version: remote_version,
+            version: plan.target,
         });
     }
 
-    let new_exe = dir.join(if cfg!(windows) { "rnpc.exe" } else { "rnpc" });
-    if !new_exe.is_file() {
-        bail!("更新源缺少二进制 {}", new_exe.display());
-    }
-
-    // 备份旧版 → 替换 → 失败还原
+    // 替换前先停实例（替换运行中的 exe 在 Windows 上会失败）
     let dest = paths.exe_path();
-    let backup = dest.with_extension("exe.bak");
-    if dest.exists() {
-        std::fs::copy(&dest, &backup)
-            .with_context(|| format!("备份旧二进制失败: {}", backup.display()))?;
-    }
-    if let Err(e) = std::fs::copy(&new_exe, &dest) {
-        // 还原
-        if backup.exists() {
-            let _ = std::fs::copy(&backup, &dest);
+    let backup = update_feed::apply(&dir, &plan, &dest, || {
+        // 进程管理模块尚未交付时，这里只做尽力而为的检查：
+        // 若实例正在运行，提示用户先 stop，而不是静默替换失败。
+        let processes = instance::running_processes();
+        if let Some(record) = instance::read_runtime(&paths.runtime_path()) {
+            if instance::runtime_is_live(&record, name, &processes) {
+                bail!(
+                    "实例 {name} 正在运行（PID {}），请先停止后再更新",
+                    record.pid
+                );
+            }
         }
-        return Err(e).with_context(|| {
-            format!("替换二进制失败（已尝试还原备份）；若实例正在运行请先 rnpc stop {name}")
-        });
+        Ok(())
+    })?;
+
+    // 回写实例元数据里的二进制版本，避免下次又判定"有新版本"
+    if let Some(m) = meta.as_mut() {
+        m.binary_version = plan.target.clone();
+        if let Err(e) = write_meta(&paths.meta_path(), m) {
+            println!("警告：回写实例版本失败（{e}）；下次 update 可能重复判断");
+        }
     }
+
     Ok(UpdateOutcome::Updated {
-        version: remote_version,
+        version: plan.target,
+        backup,
     })
+}
+
+/// `logs`：读取实例日志
+///
+/// 日志按实例分文件（`<root>\logs\<name>.log`），避免多实例交叉写入。
+pub fn cmd_logs(root: &Path, name: &str, lines: usize, follow: bool) -> Result<()> {
+    validate_instance_name(name)?;
+    let paths = InstancePaths::new(root, name);
+    if !paths.is_installed() {
+        bail!("实例 {name} 未安装");
+    }
+    let log_path = paths.log_path();
+    if !log_path.exists() {
+        println!("实例 {name} 还没有日志（{}）", log_path.display());
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&log_path)
+        .with_context(|| format!("无法读取日志 {}", log_path.display()))?;
+    let all: Vec<&str> = content.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    for line in &all[start..] {
+        println!("{line}");
+    }
+
+    if follow {
+        // 跟随：记录当前文件长度，之后只输出新增部分
+        let mut offset = content.len() as u64;
+        println!("--- 跟随 {}（Ctrl+C 退出）---", log_path.display());
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let Ok(meta) = std::fs::metadata(&log_path) else {
+                break;
+            };
+            if meta.len() < offset {
+                // 日志被轮转/截断，从头读
+                offset = 0;
+            }
+            if meta.len() > offset {
+                use std::io::{Read, Seek, SeekFrom};
+                if let Ok(mut f) = std::fs::File::open(&log_path) {
+                    if f.seek(SeekFrom::Start(offset)).is_ok() {
+                        let mut buf = String::new();
+                        if f.read_to_string(&mut buf).is_ok() {
+                            print!("{buf}");
+                            use std::io::Write as _;
+                            let _ = std::io::stdout().flush();
+                            offset += buf.len() as u64;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `channel list`：列出四个通道的注册状态
+pub fn cmd_channel_list(root: &Path, name: &str) -> Result<String> {
+    validate_instance_name(name)?;
+    let mut out = String::new();
+    out.push_str(&format!("实例 {name} 的自启通道：
+"));
+    for channel in autostart::Channel::all() {
+        match autostart::status(channel, name) {
+            Ok(st) => {
+                let mark = if st.installed { "已注册" } else { "未注册" };
+                out.push_str(&format!(
+                    "  {:<11} {:<10} {}（{}）
+",
+                    st.channel.as_str(),
+                    mark,
+                    st.channel.trigger_desc(),
+                    if st.channel.needs_admin() { "需管理员" } else { "无需管理员" }
+                ));
+                if let Some(cmd) = st.command {
+                    out.push_str(&format!("              命令行: {cmd}
+"));
+                }
+            }
+            Err(e) => out.push_str(&format!(
+                "  {:<11} 查询失败（{e}）
+",
+                channel.as_str()
+            )),
+        }
+    }
+    // 提示 meta 里记录的实际通道
+    if let Ok(meta) = read_meta(&InstancePaths::new(root, name).meta_path()) {
+        out.push_str(&format!("
+安装时使用的通道: {}
+", meta.channel));
+    }
+    Ok(out)
+}
+
+/// `channel install`：手动安装某个通道
+pub fn cmd_channel_install(root: &Path, name: &str, channel: Channel) -> Result<()> {
+    validate_instance_name(name)?;
+    let paths = InstancePaths::new(root, name);
+    if !paths.is_installed() {
+        bail!("实例 {name} 未安装；请先运行 rnpc install");
+    }
+    if channel.needs_admin() && !autostart::is_elevated() {
+        bail!(
+            "通道 {} 需要管理员权限。请右键「以管理员身份运行」，或改用 --channel run-key（用户登录后启动，无需管理员）",
+            channel.as_str()
+        );
+    }
+    autostart::install(channel, name, &paths.exe_path())?;
+    println!(
+        "已注册 {}（{}）",
+        channel.as_str(),
+        channel.trigger_desc()
+    );
+    Ok(())
+}
+
+/// `channel remove`：手动移除某个通道
+pub fn cmd_channel_remove(name: &str, channel: Channel) -> Result<()> {
+    validate_instance_name(name)?;
+    match autostart::remove(channel, name)? {
+        true => println!("已移除 {}（{}）", channel.as_str(), channel.trigger_desc()),
+        false => println!("{} 本就没有注册，无需移除", channel.as_str()),
+    }
+    Ok(())
 }
 
 /// `doctor`：环境自检
@@ -509,55 +672,6 @@ pub fn cmd_doctor(root: &Path) -> String {
     out
 }
 
-/// 生成 RFC3339 时间戳（不引入 chrono，手算）
-fn now_rfc3339() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // 简化：只到秒，用 UTC
-    let days = secs / 86400;
-    let rem = secs % 86400;
-    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    // 从 1970-01-01 起算日期
-    let mut year = 1970i64;
-    let mut d = days as i64;
-    loop {
-        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-        let year_days = if leap { 366 } else { 365 };
-        if d < year_days {
-            break;
-        }
-        d -= year_days;
-        year += 1;
-    }
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    let month_days = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut month = 0usize;
-    while month < 12 && d >= month_days[month] {
-        d -= month_days[month];
-        month += 1;
-    }
-    format!(
-        "{year:04}-{:02}-{:02}T{h:02}:{m:02}:{s:02}Z",
-        month + 1,
-        d + 1
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,7 +689,7 @@ mod tests {
 
     #[test]
     fn rfc3339_is_well_formed() {
-        let ts = now_rfc3339();
+        let ts = instance::now_rfc3339();
         assert_eq!(ts.len(), 20, "应为 YYYY-MM-DDTHH:MM:SSZ: {ts}");
         assert!(ts.ends_with('Z'));
         assert_eq!(&ts[4..5], "-");

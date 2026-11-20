@@ -101,6 +101,11 @@ pub enum Target {
     Direct { server: String, vkey: Option<String> },
     /// 读取 JSON 配置文件后再决定连接参数。
     ConfigFile { path: PathBuf },
+    /// 按已安装实例名运行（`install` 注册的自启项用的就是这条路径）。
+    ///
+    /// 配置从 `<data_root>/instances/<name>/config.json` 读取；
+    /// 这是 `rnpc run --name <name>` 的实现基础。
+    Instance { name: String },
 }
 
 /// 解析后的运行配置。`Debug` 手写以隐藏 vkey。
@@ -124,6 +129,9 @@ impl std::fmt::Debug for RunConfig {
             Target::ConfigFile { path } => {
                 debug.field("config", path);
             }
+            Target::Instance { name } => {
+                debug.field("instance", name);
+            }
         }
         debug
             .field("conn_type", &self.conn_type)
@@ -138,6 +146,7 @@ impl RunConfig {
         match &self.target {
             Target::Direct { server, .. } => server.clone(),
             Target::ConfigFile { path } => format!("config:{}", path.display()),
+            Target::Instance { name } => format!("instance:{name}"),
         }
     }
 }
@@ -161,6 +170,18 @@ pub enum Command {
     Status { name: String },
     /// `doctor`
     Doctor,
+    /// `logs`
+    Logs {
+        name: String,
+        lines: usize,
+        follow: bool,
+    },
+    /// `channel list|install|remove`
+    Channel {
+        action: ChannelAction,
+        name: String,
+        channel: Option<String>,
+    },
     /// `path add|remove|status`
     Path { action: PathAction },
     /// 扩展预留：已识别但本阶段不实现的子命令。
@@ -198,6 +219,14 @@ pub struct UpdateArgs {
     pub name: String,
     pub feed: Option<String>,
     pub check_only: bool,
+}
+
+/// `channel` 子命令动作
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelAction {
+    List,
+    Install,
+    Remove,
 }
 
 /// `path` 子命令动作
@@ -286,6 +315,8 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, C
         Some("status") => return parse_status(args),
         Some("doctor") => return Ok(Command::Doctor),
         Some("path") => return parse_path(args),
+        Some("logs") => return parse_logs(args),
+        Some("channel") => return parse_channel(args),
         Some(name) if RESERVED_SUBCOMMANDS.contains(&name) => {
             return Ok(Command::UnsupportedSubcommand(name.to_owned()));
         }
@@ -299,6 +330,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, C
     let mut config_path: Option<PathBuf> = None;
     let mut conn_type: Option<ConnType> = None;
     let mut log_level = "info".to_owned();
+    let mut instance_name: Option<String> = None;
 
     let mut iter = args.into_iter();
     while let Some(raw) = iter.next() {
@@ -350,11 +382,24 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, C
             "config" => config_path = Some(PathBuf::from(value)),
             "type" => conn_type = Some(ConnType::parse(&value)?),
             "log_level" | "log-level" => log_level = normalize_log_level(&value)?,
+            "name" => instance_name = Some(value),
             other => return Err(CliError::UnknownOption(format!("-{other}"))),
         }
     }
 
     let conn_type = conn_type.unwrap_or(ConnType::Tcp);
+
+    // ---- 实例模式（自启项使用的路径）----
+    if let Some(name) = instance_name {
+        if server.is_some() || port.is_some() || vkey.is_some() || config_path.is_some() {
+            return Err(CliError::ConfigConflictsWithDirect);
+        }
+        return Ok(Command::Run(RunConfig {
+            target: Target::Instance { name },
+            conn_type,
+            log_level,
+        }));
+    }
 
     // ---- 配置文件模式 ----
     if let Some(path) = config_path {
@@ -558,6 +603,63 @@ fn parse_update(args: Vec<OsString>) -> Result<Command, CliError> {
         feed,
         check_only,
     }))
+}
+
+fn parse_logs(args: Vec<OsString>) -> Result<Command, CliError> {
+    let mut name = "default".to_owned();
+    let mut lines = 50usize;
+    let mut follow = false;
+    let mut iter = args.into_iter();
+    while let Some((opt, inline)) = next_option(&mut iter)? {
+        match opt.as_str() {
+            "name" => name = take_value(&mut iter, &opt, inline)?,
+            "lines" | "n" => {
+                let raw = take_value(&mut iter, &opt, inline)?;
+                lines = raw
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| CliError::InvalidArgument("--lines 必须是正整数"))?;
+            }
+            "follow" | "f" => follow = true,
+            other => return Err(CliError::UnknownOption(format!("-{other}"))),
+        }
+    }
+    Ok(Command::Logs {
+        name,
+        lines,
+        follow,
+    })
+}
+
+fn parse_channel(args: Vec<OsString>) -> Result<Command, CliError> {
+    let mut iter = args.into_iter();
+    let Some(raw) = iter.next() else {
+        return Err(CliError::MissingOption("channel list|install|remove"));
+    };
+    let action = match raw.to_str().ok_or(CliError::NonUtf8)? {
+        "list" => ChannelAction::List,
+        "install" => ChannelAction::Install,
+        "remove" => ChannelAction::Remove,
+        _ => {
+            return Err(CliError::InvalidArgument(
+                "channel 只支持 list / install / remove",
+            ))
+        }
+    };
+    let mut name = "default".to_owned();
+    let mut channel = None;
+    while let Some((opt, inline)) = next_option(&mut iter)? {
+        match opt.as_str() {
+            "name" => name = take_value(&mut iter, &opt, inline)?,
+            "channel" => channel = Some(take_value(&mut iter, &opt, inline)?),
+            other => return Err(CliError::UnknownOption(format!("-{other}"))),
+        }
+    }
+    Ok(Command::Channel {
+        action,
+        name,
+        channel,
+    })
 }
 
 fn parse_status(args: Vec<OsString>) -> Result<Command, CliError> {
